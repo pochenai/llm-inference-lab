@@ -1,0 +1,42 @@
+[project]
+name = "llm-inference-lab"
+version = "0.1.0"
+description = "Small, inspectable experiments for learning model inference"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "torch>=2.6",
+    "safetensors>=0.5",
+    "gguf>=0.17",
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "cffi>=1.17,<2",
+    "pycparser>=2.22,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pyright>=1.1.411"]
+
+[tool.uv]
+python-downloads = "never"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["w1_model_formats/tests"]
+pythonpath = ["."]
+
+[tool.pyright]
+include = ["w1_model_formats/src", "w1_model_formats/tests"]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+reportMissingParameterType = "error"
+reportUnknownParameterType = "error"
