@@ -1,33 +1,35 @@
-# 大模型推理文件格式GGUF、Safetensors 与 ONNX对比及工作原理
+# GGUF、Safetensors 与 ONNX：大模型文件的加载与执行机制
 
 # 1. Motivation
 
-看到一个Hugging face上的开源模型时，我们经常会遇到 `model.safetensors`、`model.gguf` 与 `model.onnx`。它们看起来都像“模型文件”，却服务于不同问题：训练/微调、跨框架交换、本地 CPU 推理、高吞吐 GPU serving，乃至浏览器与移动端部署。
+查看 Hugging Face 上的开源模型时，经常会遇到 `model.safetensors`、`model.gguf` 与 `model.onnx`。它们看起来都像“模型文件”，却服务于不同目标：训练或微调、跨框架交换、本地 CPU 推理、高吞吐 GPU serving，以及浏览器、移动端部署。
 
-要理解差异，不能只看扩展名，而要追问：给定输入 `x` 和磁盘上的模型文件，系统还缺少什么信息，才能算出最终的 `predict`？
+仅看扩展名无法解释这种差异。更根本的问题是：给定输入 $x$ 和磁盘上的模型文件，系统还需要哪些信息，才能计算出最终的预测？
 
-本文以最简单的两层前馈网络（FFN）为统一例子，沿着“文件字节格式 → 内存 tensor → 模型函数 → 硬件 kernel → `predict`”的路径，理解三种常见推理文件格式的边界，以及它们如何接入 PyTorch、llama.cpp、vLLM、SGLang 和 ONNX Runtime。
+本文以一个两层前馈网络（FFN）为例，沿着“文件字节格式 → 内存 tensor → 模型函数 → 硬件 kernel（算子实现）→ 预测”的路径，说明三种常见推理文件格式的边界，以及它们如何接入 PyTorch、llama.cpp、vLLM、SGLang 和 ONNX Runtime。
 
 
-# 2. 从第一性原理推导：运行一个模型究竟需要什么？
+# 2. 推理所需信息的第一性原理推导
 
-一个模型可以抽象为参数化函数：
+模型可抽象为参数化函数：
 
-```text
-y = f_θ(x)
-```
+$$
+y = f_{\theta}(x).
+$$
 
-以一个分类用 FFN 为例：
+以分类 FFN 为例：
 
-```text
-h       = ReLU(x @ W1ᵀ + b1)
-logits  =       h @ W2ᵀ + b2
-predict = argmax(logits)
-```
+$$
+\begin{aligned}
+h &= \operatorname{ReLU}(x W_1^{\mathsf{T}} + b_1), \\
+\operatorname{logits} &= h W_2^{\mathsf{T}} + b_2, \\
+\operatorname{predicted\_class} &= \operatorname*{arg\,max}(\operatorname{logits}).
+\end{aligned}
+$$
 
-`W1`、`b1`、`W2`、`b2` 是持久参数 `θ`；`x`、`h`、`logits` 是本次请求的临时 activation。LLM 的 `logits` 通常还会经过 temperature、top-k/top-p 等采样策略，生成 next token；这些策略通常属于 serving/runtime 配置，而非权重文件。
+$W_1$、$b_1$、$W_2$、$b_2$ 是持久参数 $\theta$；$x$、$h$、$\operatorname{logits}$ 是本次请求的临时 activation。LLM 的 logits 通常还会经过 temperature、top-$k$/top-$p$ 等采样策略以生成 next token；这些策略通常属于 serving/runtime 配置，而非权重文件。
 
-对于用户实际使用的文本模型，$x$ 并不是原始字符串，而是 tokenizer 编码得到的 token IDs。tokenizer 负责将文本切分并映射为词表中的整数 ID；模型输出的 token ID 再由 tokenizer 解码回文本。因此，端到端过程应写作：
+对实际使用的文本模型，$x$ 并不是原始字符串，而是 tokenizer 编码得到的 token IDs。tokenizer 负责将文本切分并映射为词表中的整数 ID；模型输出的 token ID 再由 tokenizer 解码为文本。端到端过程为：
 
 $$
 \text{text prompt}
@@ -43,19 +45,19 @@ $$
 
 本文用 FFN 讨论文件格式时暂时忽略 tokenizer 的内部算法（BPE、SentencePiece 等），但在真实 LLM 部署中，词表、special tokens、chat template 与 tokenizer 配置必须随模型一同提供；否则即使权重和 $f_{\theta}$ 都正确，文本输入/输出的语义也可能错误。
 
-## 2.1 最小存储单元的分层
+## 2.1 推理包由数值、语义与执行三层信息组成
 
-根据上述 FFN 的参数与计算过程，可运行模型至少需要下面三层信息：
+上述 FFN 同时给出了参数与计算过程。由此可知，可运行模型至少需要三层信息：
 
 | 层 | 内容 | FFN 示例 |
 | --- | --- | --- |
-| 数值层 | 参数 tensors `θ` | `W1`、`b1`、`W2`、`b2` |
-| 语义/结构层 | 如何将参数组成 `f` | 两次 MatMul、中间 ReLU、张量连接关系 |
+| 数值层 | 参数 tensors $\theta$ | $W_1$、$b_1$、$W_2$、$b_2$ |
+| 语义/结构层 | 如何将参数组成 $f$ | 两次 MatMul、中间 ReLU、张量连接关系 |
 | 执行层 | 如何在目标硬件跑算子 | CPU BLAS、CUDA kernel、Metal kernel 等 |
 
-其中，数值层以 tensor 为基本组织单位。tensor 的元素可以用 `fp16`、`bf16`、`int8` 等格式表示，也可以采用量化后的 bit-packed 编码；块量化通常还需要配套的 scale 等信息。读取时，除了原始数值，还需要 dtype、shape 和布局约定，才能将文件字节还原为可参与计算的 tensor。
+数值层以 tensor 为基本组织单位。tensor 的元素可用 `fp16`、`bf16`、`int8` 等格式表示，也可采用量化后的 bit-packed 编码；块量化通常还需要配套的 scale 等信息。读取时，除原始数值外，还需要 dtype、shape 和布局约定，才能将文件字节还原为可参与计算的 tensor。
 
-文本 LLM 还需要 tokenizer、词表、特殊 token、chat template、上下文长度与 RoPE 等推理配置。decoder-only LLM 运行时还维护 KV cache；它是动态状态，而不是随模型发布的固定权重。
+文本 LLM 还需要 tokenizer、词表、特殊 token、chat template、上下文长度与 RoPE 等推理配置。decoder-only LLM 运行时还维护 KV cache；它是动态状态，不属于随模型发布的固定权重。
 
 因此，一个可用推理包可概括为：
 
@@ -69,7 +71,7 @@ Inference package = weights + model semantics + tokenizer + inference metadata
 - 如果目标是本地推理和低内存运行，那么文件还应带足够的模型 metadata，并能高效量化与按 offset 读取权重。
 - 如果目标是跨框架、跨设备地携带函数语义，那么计算图本身也应成为文件数据。
 
-这三种取舍分别对应 Safetensors、GGUF 与 ONNX。它们并不是三种互相竞争的“同一件东西”，而是针对“权重、函数语义与运行时”三层信息的三种封装边界。
+这三种取舍分别对应 Safetensors、GGUF 与 ONNX。它们对“权重、函数语义与运行时”三层信息设定了不同的封装边界。
 
 > 说明：训练恢复则还要加入 optimizer state、可能暂存的 gradients、scheduler/trainer state、随机数状态与数据进度。训练 checkpoint 解决的是“如何无缝继续学习”，推理部署包解决的是“如何回答”。本文不考虑训练相关存储。
 
@@ -83,7 +85,7 @@ Inference package = weights + model semantics + tokenizer + inference metadata
 
 **ONNX 将计算关系也封装为图。** 对同一个 FFN，权重可以作为图中的 initializer，线性变换、ReLU 及它们的连接关系则由算子节点描述。加载端不必拥有原来的 `TinyFFN.forward()`，但必须能够执行图中使用的算子；图的算子语义不等于 CPU/GPU kernel 实现。[ONNX IR 规范](https://onnx.ai/onnx/repo-docs/IR.html)
 
-对应到上一节的三层信息，三种格式的分工如下：
+对应到上一节的三层信息，三种格式的封装范围如下：
 
 | 格式 | 数值层：参数 $\theta$ | 语义/结构层：参数如何组成 $f$ | 执行层：算子如何运行 |
 | --- | --- | --- | --- |
@@ -91,7 +93,7 @@ Inference package = weights + model semantics + tokenizer + inference metadata
 | GGUF | 文件保存 tensor、类型及相关量化信息 | 文件内 metadata 选择和配置 runtime 已实现的架构；不保存通用计算图 | ggml 等兼容 runtime 的后端 |
 | ONNX | 图中的 initializer，可内嵌或引用外部 tensor 数据 | 文件内的计算图与算子语义 | ONNX Runtime 等兼容 runtime 的后端 |
 
-因此，Safetensors 与 GGUF 都需要模型实现来组织参数；GGUF 额外约定了更多模型与权重表示信息。ONNX 则把计算图交给 runtime 解析。三者都不能只凭模型文件完成执行，还需要相应的算子实现。具体字段与加载路径在第 3 节展开。
+Safetensors 与 GGUF 都需要模型实现来组织参数；GGUF 额外约定了更多模型与权重表示信息。ONNX 则把计算图交给 runtime 解析。三者都还需要相应的算子实现才能执行。具体字段与加载路径在第 3 节展开。
 
 > GGUF/Safetensors 解决“如何高效、可靠地存取 $\theta$”；runtime 的模型实现或 ONNX graph 解决“$\theta$ 如何组成 $f$”；CPU/GPU backend 的 kernels 解决“$f$ 如何真正跑起来”。
 
@@ -126,9 +128,9 @@ $$
 
 因此，本文不把 PyTorch checkpoint 作为第四种部署格式，并不是因为 PyTorch 不能推理：纯 `state_dict` 很适合在 PyTorch 内恢复参数，训练 checkpoint 适合恢复训练，完整 `nn.Module` 适合紧耦合的 Python 环境。它们的封装边界由 PyTorch 序列化与调用者的对象选择决定；Safetensors、GGUF 与 ONNX 则分别代表了本文要比较的安全 tensor 容器、面向本地量化 runtime 的模型包，以及可交换计算图。
 
-# 3. 三种 file format 的 schema、加载方式与生态
+# 3. 三种文件格式的结构（schema）、加载方式与生态
 
-上一节明确了三种格式的封装边界；本节详细介绍它们的 schema、加载方式与社区生态支持。
+上一节明确了三种格式的封装边界；本节进一步介绍它们的结构（schema）、加载方式与社区生态支持。
 
 ## 3.1 Safetensors：安全、直接的 tensor 容器
 
@@ -151,7 +153,7 @@ loader 只需读取很小的 header，便能定位 `fc1.weight` 在原始数据�
 
 它通常是 Hugging Face `transformers` 生态的默认权重格式：模型语义仍由 `config.json` 与 Transformers 模型代码给出，权重以一个或多个 `.safetensors` shard 存放。
 
-一个常见的模型目录是：
+常见模型目录如下：
 
 ```text
 model/
@@ -161,7 +163,7 @@ model/
 └── tokenizer_config.json
 ```
 
-以前面的 FFN 为例，loader 根据 header 中的 dtype、shape 与数据偏移读取参数，再交给已定义计算过程的模型。下面是加载职责的伪代码：
+以前面的 FFN 为例，loader 根据 header 中的 dtype、shape 与数据偏移读取参数，再交给已定义计算过程的模型。加载职责可概括为：
 
 ```python
 model = TinyFFN()              # Defines the computation
@@ -262,7 +264,7 @@ ONNX 的可交换计算图和多种 Execution Provider 支持，使其适合跨�
 
 ## 3.5 Safetensors 与 GGUF 的 mmap 加载及其内存优势
 
-两种格式都有共同性质：**先读小索引，再通过 offset 直接寻址连续 tensor bytes**。
+这一节回到 3.4 节提到的加载成本。Safetensors 与 GGUF 都能通过 mmap 降低加载阶段的额外内存占用，其共同性质是：**先读取小型索引，再通过 offset 直接寻址连续的 tensor bytes**。
 
 ```text
 metadata/header
@@ -273,7 +275,7 @@ metadata/header
 
 Linux 中，`mmap()` 将文件的一段字节映射到进程虚拟地址空间；它并不立即把整个文件复制到用户态 heap。CPU 首次访问未驻留页时，OS 再通过缺页处理将该页带入内存。`MAP_PRIVATE` 的写入采用 copy-on-write，`MAP_SHARED` 则使用共享修改语义；见 [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html)。
 
-模型加载的好处包括：
+这种加载方式的好处包括：
 
 - 避免先完整 `read()` 再新建同等大小 host buffer 的显式复制。
 - 由 OS page cache 统一管理，并让多个进程复用同一 checkpoint 的缓存页。
@@ -286,12 +288,12 @@ Safetensors 的布局支持按 tensor 索引与 mmap-friendly loading，但这�
 
 # 4. 总结
 
-从一个最小 FFN 出发，每一次模型推理都可还原为一条清晰链路：
+从最小 FFN 出发，模型推理可还原为一条清晰链路：
 
 ```text
 model file
   → parse metadata / index
-  → recover tensors θ
+  → recover tensors theta
   → recover or load model semantics f
   → choose CPU/GPU kernels
   → logits
