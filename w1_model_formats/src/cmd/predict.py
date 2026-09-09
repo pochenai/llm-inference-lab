@@ -20,7 +20,7 @@ def main() -> None:
     try:
         with load_runner(args.backend, args.directory, args.storage or "mmap") as runner:
             logits = runner.predict([args.x])
-        print(json.dumps({"backend": args.backend, "logits": logits.tolist(), "prediction": logits.argmax(axis=-1).tolist()}, indent=2))
+        print(json.dumps({"backend": args.backend, "logits": logits.tolist(), "predicted_class": logits.argmax(axis=-1).tolist()}, indent=2))
     except (ValueError, RuntimeError, OSError) as error:
         parser.exit(1, f"Error: {error}\n")
 

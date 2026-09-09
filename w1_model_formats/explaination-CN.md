@@ -307,4 +307,4 @@ Safetensors 是训练、微调、Hugging Face 与高性能 GPU serving 的主流
 
 ## 实验
 
-[三种文件格式解析、加载和 runtime 的可复现实验](https://github.com/pochenai/llm-inference-lab/blob/main/w1_model_formats/README.md) 使用同一个 $4 \rightarrow 8 \rightarrow 3$ 的 FFN，将同一组权重分别交给 Safetensors/PyTorch、GGUF/ggml 与 ONNX/ONNX Runtime 加载和执行。它可验证本文的两个核心边界：权重从文件的何处恢复，$f$ 从运行时代码或 ONNX graph 的何处获得；同时通过 `mmap` 与 `read()` 的对照检查权重存储方式，以及三个后端的 logits 与 prediction 是否一致。
+[三种文件格式解析、加载和 runtime 的可复现实验](https://github.com/pochenai/llm-inference-lab/blob/main/w1_model_formats/README.md) 使用同一个 $4 \rightarrow 8 \rightarrow 3$ 的 FFN，将同一组权重分别交给 Safetensors/PyTorch、GGUF/ggml 与 ONNX/ONNX Runtime 加载和执行。它可验证本文的两个核心边界：权重从文件的何处恢复，$f$ 从运行时代码或 ONNX graph 的何处获得；同时通过 `mmap` 与 `read()` 的对照检查权重存储方式，以及三个后端的 logits 与 `predicted_class` 是否一致。

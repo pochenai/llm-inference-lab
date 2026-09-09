@@ -80,7 +80,7 @@ cmd/export.py -> common.make_weights()
 
 cmd/predict.py -> runner.load_runner(backend)
               -> selected runner loads its model file(s)
-              -> runner.predict(x) -> logits -> argmax -> prediction
+              -> runner.predict(x) -> logits -> argmax -> predicted_class
 ```
 
 Predicting does not rerun export or regenerate weights. All runners expose
@@ -122,9 +122,9 @@ env -u LD_LIBRARY_PATH uv run --offline python --version
 env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.build_ggml
 env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.export
 env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.inspect
-env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend torch --x 1 2 3 4
-env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend ggml --x 1 2 3 4
-env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend onnx --x 1 2 3 4
+env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend torch --x -1 0 0 0
+env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend ggml --x -1 0 0 0
+env -u LD_LIBRARY_PATH uv run --offline python -m w1_model_formats.src.cmd.predict --backend onnx --x -1 0 0 0
 ```
 
 The `env` prefix prevents an inherited `LD_LIBRARY_PATH` from mixing another
@@ -145,8 +145,9 @@ env -u LD_LIBRARY_PATH uv run --offline pyright
 env -u LD_LIBRARY_PATH uv run --offline pytest -q w1_model_formats/tests
 ```
 
-For `[1, 2, 3, 4]`, expect logits approximately
-`[0.346988, 0.111663, -0.154423]` and prediction `0` (zero-based class index).
+For `[-1, 0, 0, 0]`, expect logits approximately
+`[0.208841, 0.247016, 0.057876]` and `predicted_class: [1]` (zero-based class index).
+The nonzero class makes an accidental hard-coded `0` easier to spot when comparing backends.
 The CLI accepts one sample; the runner API also accepts batches:
 
 ```python

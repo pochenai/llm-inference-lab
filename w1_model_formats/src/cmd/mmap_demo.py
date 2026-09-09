@@ -58,7 +58,7 @@ def demonstrate(directory: PathLike = ARTIFACTS) -> None:
                 actual = model(torch.from_numpy(x)).numpy()
             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
             state.clear()  # Release torch views before the mmap owner closes.
-        print(f"prediction={actual.argmax(axis=-1).tolist()}")
+        print(f"predicted_class={actual.argmax(axis=-1).tolist()}")
 
         print(f"\nGGUF + ggml, storage={mode}")
         with GGMLRunner(directory, mode) as runner:
@@ -75,7 +75,7 @@ def demonstrate(directory: PathLike = ARTIFACTS) -> None:
                       f"view=0x{value.ctypes.data:x}, ggml=0x{addresses[name]:x}, shares_mapping={shared}")
             actual = runner.predict(x)
             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
-        print(f"prediction={actual.argmax(axis=-1).tolist()}")
+        print(f"predicted_class={actual.argmax(axis=-1).tolist()}")
 
     for path in paths:
         assert digest(path) == before[path], f"Source file changed: {path}"

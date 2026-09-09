@@ -187,10 +187,10 @@ def test_standalone_prediction(models: Path, backend: Backend) -> None:
             "--directory",
             str(models),
             "--x",
-            "1",
-            "2",
-            "3",
-            "4",
+            "-1",
+            "0",
+            "0",
+            "0",
         ],
         check=True,
         capture_output=True,
@@ -198,9 +198,9 @@ def test_standalone_prediction(models: Path, backend: Backend) -> None:
     )
     data = json.loads(result.stdout)
     np.testing.assert_allclose(
-        data["logits"], reference([[1, 2, 3, 4]], make_weights()), rtol=1e-5, atol=1e-6
+        data["logits"], reference([[-1, 0, 0, 0]], make_weights()), rtol=1e-5, atol=1e-6
     )
-    assert data["prediction"] == [0]
+    assert data["predicted_class"] == [1]
 
 
 def test_onnx_loads_without_python_architecture_or_config(models: Path, tmp_path: Path) -> None:
