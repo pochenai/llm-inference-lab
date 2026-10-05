@@ -13,7 +13,7 @@ import pytest
 from safetensors.numpy import load_file, save_file
 import torch
 
-from w1_model_formats.src.common import (
+from d1_model_formats.src.common import (
     Backend,
     Config,
     SHAPES,
@@ -23,19 +23,19 @@ from w1_model_formats.src.common import (
     reference,
     test_inputs as sample_inputs,
 )
-from w1_model_formats.src.cmd.export import export_models
-from w1_model_formats.src.model.gguf_ggml import (
+from d1_model_formats.src.cmd.export import export_models
+from d1_model_formats.src.model.gguf_ggml import (
     ACTIVATION_CONTEXT_BASE_BYTES,
     F32_BYTES,
     activation_context_bytes,
 )
-from w1_model_formats.src.runner.ggml import GGMLRunner
-from w1_model_formats.src.cmd.mmap_demo import demonstrate, digest
-from w1_model_formats.src.runner._ggml import GGML
-from w1_model_formats.src.runner import load_runner
-from w1_model_formats.src.storage import WeightFile
-from w1_model_formats.src.model.torch import TinyFFN
-from w1_model_formats.src.runner.torch import TorchRunner
+from d1_model_formats.src.runner.ggml import GGMLRunner
+from d1_model_formats.src.cmd.mmap_demo import demonstrate, digest
+from d1_model_formats.src.runner._ggml import GGML
+from d1_model_formats.src.runner import load_runner
+from d1_model_formats.src.storage import WeightFile
+from d1_model_formats.src.model.torch import TinyFFN
+from d1_model_formats.src.runner.torch import TorchRunner
 
 
 @pytest.fixture(scope="session")
