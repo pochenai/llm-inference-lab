@@ -14,3 +14,5 @@ repository = "https://github.com/pochenai/llm-inference-lab"
 
 [workspace.dependencies]
 cutile = "0.4.0"
+cuda-core = "0.4.0"
+cuda-async = "0.4.0"
