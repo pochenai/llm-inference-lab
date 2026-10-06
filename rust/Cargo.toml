@@ -1,0 +1,16 @@
+
+[workspace]
+resolver = "2"
+members = ["cutile-tutorials"]
+
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+authors = ["Po Chen"]
+repository = "https://github.com/pochenai/llm-inference-lab"
+
+[workspace.dependencies]
+cutile = "0.4.0"
