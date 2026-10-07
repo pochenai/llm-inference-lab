@@ -32,7 +32,7 @@ fn main() -> Result<(), Error> {
     let x: Tensor<f32> = ones(&[32, 32]).sync_on(&stream)?.into();
     let y: Tensor<f32> = ones(&[32, 32]).sync_on(&stream)?.into();
 
-    let z = zeros(&[32, 32]).sync_on(&stream)?.partition([4, 4]);
+    let z = zeros(&[32, 32]).sync_on(&stream)?.partition([4, 8]);
 
     let (z, x, _y) = add(z, x, y).sync_on(&stream)?;
     let x = x.to_host_vec().sync_on(&stream)?;
