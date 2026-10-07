@@ -4,7 +4,6 @@
 /// grid 划分的是执行单元（Tile Block 的数量与维度）; 具体每个tile block有多少threads由编译器决定
 /// program_id 是连接执行单元与数据切片的桥梁;
 /// 数据怎么切、加载哪一部分、甚至是重复加载，完全由你在 Kernel 函数里写的内存读取代码（如 load_tile）说了算
-
 use cutile::error::Error;
 use cutile::prelude::*;
 
@@ -23,8 +22,12 @@ mod hello_world_module {
         let n2 = num_programs(2);
         cuda_tile_print!(
             "Hello from program <{}, {}, {}> in a grid of <{}, {}, {}> programs!\n",
-            pid0, pid1, pid2,
-            n0, n1, n2
+            pid0,
+            pid1,
+            pid2,
+            n0,
+            n1,
+            n2
         );
     }
 }

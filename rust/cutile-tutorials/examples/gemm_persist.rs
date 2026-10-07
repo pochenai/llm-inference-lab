@@ -1,21 +1,21 @@
 use cuda_async::prelude::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{full, zeros};
+use cutile::bench::{do_bench, BenchOptions};
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Tensor, ToHostVec};
 use cutile::tile_kernel::TileKernel;
 use cutile::DType;
-use std::time::Instant;
 
 #[cutile::module]
 mod persistent_module {
     use cutile::core::*;
 
     #[cutile::entry(
-        optimization_hints = (
-            sm_120 = (num_cta_in_cga = 2,),
-            sm_100 = (num_cta_in_cga = 2,),
-        ),
+        // optimization_hints = (
+        //     sm_120 = (num_cta_in_cga = 2,),
+        //     sm_100 = (num_cta_in_cga = 2,),
+        // ),
         deny_in_kernel_checks = true,
     )]
     fn gemm_persistent<
@@ -55,9 +55,8 @@ fn main() -> Result<(), Error> {
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
 
-    let d = 1024;
-    let tile_d = d / 8;
-    let (bm, bn, bk) = (tile_d, tile_d, tile_d);
+    let d = 2048;
+    let (bm, bn, bk) = (16, 16, 8);
     let (m, n, k) = (d, d, d);
     let num_tile_blocks = (m / bm * (n / bn)) as u32;
 
@@ -74,37 +73,29 @@ fn main() -> Result<(), Error> {
         "1".to_string(),
     ];
 
-    let warmup_steps = 1;
-    let runs = 2;
-    let mut z = z;
-    let mut x = x;
-    let mut y = y;
+    let mut z = Some(z);
+    let mut x = Some(x);
+    let mut y = Some(y);
 
-    for _ in 0..warmup_steps {
+    let measurement = do_bench(&stream, &BenchOptions::default(), |bench_stream| {
         let mapped_z = z
+            .take()
+            .expect("benchmark output tensor is available")
             .partition([bm, bn])
             .map([4, 1], num_tile_blocks);
-        let (next_z, next_x, next_y) = gemm_persistent(mapped_z, x, y)
-            .generics(generics.clone())
-            .sync_on(&stream)?;
-        z = next_z.unpartition();
-        x = next_x;
-        y = next_y;
-    }
-
-    let start = Instant::now();
-    for _ in 0..runs {
-        let mapped_z = z
-            .partition([bm, bn])
-            .map([4, 1], num_tile_blocks);
-        let (next_z, next_x, next_y) = gemm_persistent(mapped_z, x, y)
-            .generics(generics.clone())
-            .sync_on(&stream)?;
-        z = next_z.unpartition();
-        x = next_x;
-        y = next_y;
-    }
-    let average_time = start.elapsed() / runs;
+        let (next_z, next_x, next_y) = gemm_persistent(
+            mapped_z,
+            x.take().expect("benchmark input X is available"),
+            y.take().expect("benchmark input Y is available"),
+        )
+        .generics(generics.clone())
+        .sync_on(bench_stream)?;
+        z = Some(next_z.unpartition());
+        x = Some(next_x);
+        y = Some(next_y);
+        Ok(())
+    })?;
+    let z = z.expect("benchmark returned the output tensor");
     let z_host: Vec<f32> = z.to_host_vec().sync_on(&stream)?;
 
     println!(
@@ -113,8 +104,10 @@ fn main() -> Result<(), Error> {
         2.0 * 3.0 * k as f32
     );
     println!(
-        "average time over {runs} runs (after {warmup_steps} warmup steps): {:.3} ms/run",
-        average_time.as_secs_f64() * 1_000.0
+        "cuTile bench: median {:.3} ms, mean {:.3} ms, {} reps",
+        measurement.median_ms(),
+        measurement.mean_ms(),
+        measurement.reps()
     );
     Ok(())
 }
