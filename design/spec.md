@@ -1,7 +1,7 @@
 # features
 - 在[cutile-grout](../../cutile-grout)基础上，添加上[mini-sglang](../../mini-sglang/)的radix cache功能，这样就能实现一个full-fledged infrence框架，同时性能还不错
 
-## 简化的假设
+# 简化的假设
 
 采用 Mini-SGLang 式的**无状态请求入口 + 请求级执行状态 + 跨请求前缀 KV 复用**。每个请求携带完整 prompt 和生成参数；请求结束后，其有效 KV 前缀可留在 radix cache 中供后续请求复用。第一版不定义跨调用的 session 续写语义，也不做鉴权。
 
@@ -20,7 +20,87 @@ token prefix -> radix cache -> per-token SlotIds
 - 非流式输出
 - 每个 ReqToTokenTable 项保存一个 token 对应的 SlotId， 每一个slotid对应k/v的heads*dim的值所在的gpu索引位置
 
-# model loader
+# 总体架构
+
+The interface below assumes structured requests and non-streaming responses.
+The later token-event API is an alternative output interface.
+
+```text
+caller -> execute(request) -> tokenizer.encode(prompt) -> Submit(tokens, reply_tx)
+       -> scheduler -> Batch -> model runner -> BatchOutput -> scheduler
+       <- response_rx <- reply_tx.send(response) <- decode(generated_tokens)
+```
+
+```rust
+// Interface sketch; existing token, sampling, batch and error types are reused.
+GenerateRequest { prompt: String, sampling: SamplingConfig }
+GenerateResponse { request_id: RequestId, text: String, reason: FinishReason }
+Submit {
+    token_ids: Vec<TokenId>, sampling: SamplingConfig,
+    reply_tx: oneshot::Sender<Result<GenerateResponse, RequestError>>,
+}
+PendingRequest { state: RequestState, reply_tx: oneshot::Sender<Result<GenerateResponse, RequestError>> }
+requests: HashMap<RequestId, PendingRequest> // RequestId -> state + reply_tx; scheduler-owne    tokens = tokenizer.encode(request.prompt)
+    (reply_tx, response_rx) = oneshot::channel()
+    command_tx.send(Submit { tokens, request.sampling, reply_tx }).await
+    response_rx.await // each caller waits on its own receiverd
+
+async execute(request) -> Result<GenerateResponse, RequestError>:
+
+
+scheduler loop:
+    on Submit: assign unique RequestId; validate tokens/limits; store state + reply_tx
+    when idle: build prefill/decode Batch; batch_tx.send(batch).await
+    on result_rx.recv():
+        validate BatchId and item RequestIds against the in-flight batch
+        for item in output.results:
+            update requests[item.request_id].state with token/progress or error
+            if terminal:
+                pending = requests.remove(item.request_id) // take ownership of reply_tx
+                result = build_final_result(pending.state) // decode tokens or return error
+                release KV references
+                let _ = pending.reply_tx.send(result) // receiver may already be closed
+
+model runner loop:
+    batch = batch_rx.recv().await
+    output = runner.run(batch).await // forward + sampling; wait for GPU completion
+    result_tx.send(output).await
+```
+
+`BatchOutput` carries one step result per participating request, each with its
+`RequestId`; it is not the final response. Scheduler accumulates generated tokens
+across steps and sends each request's oneshot result exactly once at termination.
+Routing is `item.request_id -> requests entry -> reply_tx`; no separate reply map
+is needed. Removing the entry transfers ownership of the single-use sender.
+One scheduler loop owns the shared batch-result receiver; concurrent `execute`
+calls receive only their own final results. Validation errors use the same reply;
+an execution error fails affected requests, and runner-channel closure fails all
+pending requests. First version allows one in-flight batch and bounded queues.
+
+Model selection happens at startup: `load(model_path) -> tokenizer + model + KVLayout`.
+One runner serves one loaded model; its tokenizer, vocabulary, weights and KV layout
+must match. Supporting another text LLM means implementing the same model contract:
+
+```text
+model.forward(PackedInput, KVContext) -> logits for items with sample_next=true
+PackedInput {
+    token_ids, positions, offsets, row_ids, write_slots, sample_indices
+}
+runner.run(Batch) -> pack inputs -> model.forward -> sample -> BatchOutput
+```
+
+Scheduler handles token sequences, progress and KV allocation; each model handles
+its layers and backend kernels. `KVLayout` supplies layer count, KV heads, head
+dimension and dtype. `KVContext` gives forward access to the KV pool and request
+slot table; scheduler owns their allocation metadata and runner writes KV values.
+For input lengths 3 and 2, pack `[a,b,c,d,e]` with offsets `[0,3,5]`; row IDs select
+each request's history and positions start at its `start_position`. Attention must
+respect these boundaries. Decode normally contributes one token per request.
+Packing/padding belongs to the runner's model adapter; kernel support determines
+which layout it uses. Chat messages first become text through that model's chat
+template; image/audio inputs would need a separate processor and input contract.
+
+# Model loader
 
 ## model overview
 ```mermaid

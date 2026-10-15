@@ -1,7 +1,7 @@
 
 [workspace]
 resolver = "2"
-members = ["cutile-tutorials"]
+members = ["cutile-tutorials", "engine"]
 
 
 [workspace.package]

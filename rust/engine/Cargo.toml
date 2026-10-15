@@ -11,3 +11,6 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+dashmap = "6"
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
