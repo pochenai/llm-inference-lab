@@ -1,19 +1,21 @@
 //! Compare direct powers, Horner, explicit FMA over a vector of x values.
 //!
-//! Run from `rust/` with `cargo run -p cutile-tutorials --example polynomial_eval`.
+//! Run from `rust/` with `cargo run --release -p cutile-tutorials --example polynomial_eval`.
+//! Historical coefficient-access comparisons are recorded in ../experiments/polynomial/RESULTS.md.
+
+mod support;
 
 use cuda_async::prelude::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{copy_host_vec_to_device, linspace, zeros};
-use cutile::bench::{do_bench, BenchOptions};
+use cutile::bench::{do_bench_paired, BenchOptions};
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Reshape, Tensor, ToHostVec};
 use cutile::tile_kernel::TileKernel;
 use std::sync::Arc;
+use support::{Args, TimedGraph};
 
-const N: usize = 1 << 20;
-const TILE: usize = 16;
-const COEFFICIENT_COUNT: usize = 16;
+const DEFAULT_TILE: usize = 1024;
 
 #[cutile::module]
 mod polynomial_module {
@@ -28,18 +30,12 @@ mod polynomial_module {
         coeffs: &Tensor<f32, { [-1, -1] }>,
     ) {
         let x = x.load_like(z);
-        let coefficient_tile = coeffs
-            .partition(shape![COEFFICIENT_COUNT, 1])
-            .load([0i32, 0i32]);
-        let coefficient_column = scalar_to_tile(0i32);
+        let coefficients = coeffs.partition(shape![1, 1]);
         let mut power = constant(1.0f32, z.shape());
         let mut result = constant(0.0f32, z.shape());
-
         for i in 0..COEFFICIENT_COUNT {
-            let coefficient_cell: Tile<f32, { [1, 1] }> =
-                extract(coefficient_tile, [scalar_to_tile(i), coefficient_column]);
-            let coefficient = coefficient_cell.broadcast(z.shape());
-            result = result + coefficient * power;
+            let c = coefficients.load([i, 0i32]).broadcast(z.shape());
+            result = result + c * power;
             power = power * x;
         }
         z.store(result);
@@ -54,26 +50,17 @@ mod polynomial_module {
         coeffs: &Tensor<f32, { [-1, -1] }>,
     ) {
         let x = x.load_like(z);
-        let coefficient_tile = coeffs
-            .partition(shape![COEFFICIENT_COUNT, 1])
-            .load([0i32, 0i32]);
-        let coefficient_column = scalar_to_tile(0i32);
-        let result_cell: Tile<f32, { [1, 1] }> = extract(
-            coefficient_tile,
-            [scalar_to_tile(COEFFICIENT_COUNT - 1), coefficient_column],
-        );
-        let mut result = result_cell.broadcast(z.shape());
-
-        for i in 1..COEFFICIENT_COUNT {
-            let coefficient_cell: Tile<f32, { [1, 1] }> = extract(
-                coefficient_tile,
-                [
-                    scalar_to_tile(COEFFICIENT_COUNT - 1 - i),
-                    coefficient_column,
-                ],
-            );
-            let coefficient = coefficient_cell.broadcast(z.shape());
-            result = result * x + coefficient;
+        let coefficients = coeffs.partition(shape![1, 1]);
+        let mut result = coefficients
+            .load([COEFFICIENT_COUNT - 1, 0i32])
+            .broadcast(z.shape());
+        if COEFFICIENT_COUNT > 1 {
+            for i in 1..COEFFICIENT_COUNT {
+                let coefficient = coefficients
+                    .load([COEFFICIENT_COUNT - 1 - i, 0i32])
+                    .broadcast(z.shape());
+                result = result * x + coefficient;
+            }
         }
         z.store(result);
     }
@@ -87,26 +74,17 @@ mod polynomial_module {
         coeffs: &Tensor<f32, { [-1, -1] }>,
     ) {
         let x = x.load_like(z);
-        let coefficient_tile = coeffs
-            .partition(shape![COEFFICIENT_COUNT, 1])
-            .load([0i32, 0i32]);
-        let coefficient_column = scalar_to_tile(0i32);
-        let result_cell: Tile<f32, { [1, 1] }> = extract(
-            coefficient_tile,
-            [scalar_to_tile(COEFFICIENT_COUNT - 1), coefficient_column],
-        );
-        let mut result = result_cell.broadcast(z.shape());
-
-        for i in 1..COEFFICIENT_COUNT {
-            let coefficient_cell: Tile<f32, { [1, 1] }> = extract(
-                coefficient_tile,
-                [
-                    scalar_to_tile(COEFFICIENT_COUNT - 1 - i),
-                    coefficient_column,
-                ],
-            );
-            let coefficient = coefficient_cell.broadcast(z.shape());
-            result = fma(x, result, coefficient, rounding::NearestEven, ftz::Disabled);
+        let coefficients = coeffs.partition(shape![1, 1]);
+        let mut result = coefficients
+            .load([COEFFICIENT_COUNT - 1, 0i32])
+            .broadcast(z.shape());
+        if COEFFICIENT_COUNT > 1 {
+            for i in 1..COEFFICIENT_COUNT {
+                let coefficient = coefficients
+                    .load([COEFFICIENT_COUNT - 1 - i, 0i32])
+                    .broadcast(z.shape());
+                result = fma(x, result, coefficient, rounding::NearestEven, ftz::Disabled);
+            }
         }
         z.store(result);
     }
@@ -114,72 +92,127 @@ mod polynomial_module {
 
 use polynomial_module::{horner, horner_fma, naive};
 
-macro_rules! benchmark_kernel {
-    ($kernel:ident, $name:literal, $stream:ident, $input_tensor:ident, $coeff_tensor:ident) => {{
-        let mut z = Some(zeros(&[N, 1]).sync_on(&$stream)?.partition([TILE, 1]));
-        let mut input = Some($input_tensor.dup().sync_on(&$stream)?);
-        let mut coefficient_input = Some($coeff_tensor.dup().sync_on(&$stream)?);
-        let measurement = do_bench(&$stream, &BenchOptions::default(), |bench_stream| {
-            let (next_z, next_x, next_coeffs) = $kernel(
-                z.take().expect("benchmark output is available"),
-                input.take().expect("benchmark input is available"),
-                coefficient_input
-                    .take()
-                    .expect("benchmark coefficients are available"),
-            )
-            .generics(vec![
-                TILE.to_string(),
-                (COEFFICIENT_COUNT as i32).to_string(),
-            ])
-            .sync_on(bench_stream)?;
-            z = Some(next_z);
-            input = Some(next_x);
-            coefficient_input = Some(next_coeffs);
-            Ok(())
-        })?;
-        let result: Vec<f32> = z
-            .expect("benchmark returned the output partition")
-            .unpartition()
-            .to_host_vec()
-            .sync_on(&$stream)?;
-        println!(
-            "{}: y[0]={:.6}, y[N/2]={:.6}, y[N-1]={:.6}",
-            $name,
-            result[0],
-            result[N / 2],
-            result[N - 1]
-        );
-        println!(
-            "{} CUDA-event bench: median {:.3} ms, mean {:.3} ms, {} reps",
-            $name,
-            measurement.median_ms(),
-            measurement.mean_ms(),
-            measurement.reps()
-        );
-    }};
-}
-
 fn main() -> Result<(), Error> {
+    let args = Args::parse_with_tile(DEFAULT_TILE);
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let x_1d: Tensor<f32> = linspace(-1.0, 1.0, N).sync_on(&stream)?.into();
-    let x = x_1d.reshape(&[N, 1])?;
-
-    // Generate reproducible pseudo-random coefficients on the CPU.
-    assert!(
-        COEFFICIENT_COUNT > 0,
-        "polynomial needs at least one coefficient"
-    );
-    let host_coefficients: Arc<Vec<f32>> =
-        Arc::new(make_coefficients(COEFFICIENT_COUNT, 0x5eed_cafe));
-    let coefficients_1d: Tensor<f32> =
-        copy_host_vec_to_device(&host_coefficients).sync_on(&stream)?;
-    let coeffs = coefficients_1d.reshape(&[COEFFICIENT_COUNT, 1])?;
-
-    benchmark_kernel!(naive, "naive", stream, x, coeffs);
-    benchmark_kernel!(horner, "horner", stream, x, coeffs);
-    benchmark_kernel!(horner_fma, "horner_fma", stream, x, coeffs);
-    println!("Degree: {}; all times are CUDA-event kernel timings. Input creation and host copies are outside the measurement.", COEFFICIENT_COUNT - 1);
+    let x: Tensor<f32> = linspace(-1.0, 1.0, args.n).sync_on(&stream)?;
+    let x = x.reshape(&[args.n, 1])?;
+    let host_coefficients = Arc::new(make_coefficients(args.coefficients, 0x5eed_cafe));
+    let coeffs = copy_host_vec_to_device(&host_coefficients)
+        .sync_on(&stream)?
+        .reshape(&[args.coefficients, 1])?;
+    let generics = vec![args.tile.to_string(), args.coefficients.to_string()];
+    let options = args.options();
+    let output = || -> Result<_, Error> {
+        let z: Tensor<f32> = zeros(&[args.n, 1]).sync_on(&stream)?;
+        Ok(Some(z.partition([args.tile, 1])))
+    };
+    let mut zn = output()?;
+    let mut zh = output()?;
+    let mut zf = output()?;
+    macro_rules! capture {
+        ($kernel:ident, $z:ident) => {
+            TimedGraph::capture(&stream, args.batch, |scope| {
+                let (next, _, _) = scope.record(
+                    $kernel($z.take().unwrap(), &x, &coeffs)
+                        .generics(generics.clone())
+                        .compile_options(options.clone()),
+                )?;
+                $z = Some(next);
+                Ok(())
+            })?
+        };
+    }
+    let gn = capture!(naive, zn);
+    let gh = capture!(horner, zh);
+    let gf = capture!(horner_fma, zf);
+    if args.profile {
+        gn.sample_us(&stream)?;
+    } else {
+        let (sn, sh) = support::paired_samples(&stream, &gn, &gh, args.reps, args.cold)?;
+        println!(
+            "naive vs Horner GPU graph interval: {:.3} vs {:.3} us, speedup {:.3}x",
+            sn.median(),
+            sh.median(),
+            sn.median() / sh.median()
+        );
+    }
+    let (sh, sf) = support::paired_samples(&stream, &gh, &gf, args.reps, args.cold)?;
+    support::print_pair("horner", &args, &sh, &sf);
+    if args.eager {
+        // The outer event interval can include GPU idle time while Rust prepares a launch.
+        let bench_options = BenchOptions {
+            clear_l2: args.cold,
+            min_reps: args.reps,
+            max_reps: args.reps,
+            ..BenchOptions::default()
+        };
+        let (a, b) = do_bench_paired(
+            &stream,
+            &bench_options,
+            |s| {
+                let (next, _, _) = horner(zh.take().unwrap(), &x, &coeffs)
+                    .generics(generics.clone())
+                    .compile_options(options.clone())
+                    .sync_on(s)?;
+                zh = Some(next);
+                Ok(())
+            },
+            |s| {
+                let (next, _, _) = horner_fma(zf.take().unwrap(), &x, &coeffs)
+                    .generics(generics.clone())
+                    .compile_options(options.clone())
+                    .sync_on(s)?;
+                zf = Some(next);
+                Ok(())
+            },
+        )?;
+        println!(
+            "EAGER,event_interval_horner_us={:.3},event_interval_fma_us={:.3},speedup={:.3}",
+            a.median_ms() * 1e3,
+            b.median_ms() * 1e3,
+            a.median_ms() / b.median_ms()
+        );
+    }
+    let xv: Vec<f32> = x.dup().sync_on(&stream)?.to_host_vec().sync_on(&stream)?;
+    for (name, z) in [("naive", zn), ("horner", zh), ("horner_fma", zf)] {
+        let values: Vec<f32> = z.unwrap().unpartition().to_host_vec().sync_on(&stream)?;
+        let mut max_error = 0.0f64;
+        for (&v, &x) in values.iter().zip(&xv) {
+            let reference = host_coefficients
+                .iter()
+                .rev()
+                .fold(0.0f64, |p, &c| p * x as f64 + c as f64);
+            max_error = max_error.max((v as f64 - reference).abs());
+            if !v.is_finite() || (v as f64 - reference).abs() > 2e-5 + reference.abs() * 2e-5 {
+                return Err(cutile::error::tensor_error(
+                    "polynomial disagrees with CPU f64 reference",
+                ));
+            }
+        }
+        println!(
+            "{name}: y[0]={:.6}, y[N/2]={:.6}, y[N-1]={:.6}, max_abs_error={max_error:.9e}",
+            values[0],
+            values[args.n / 2],
+            values[args.n - 1]
+        );
+    }
+    if let Some(dir) = &args.inspect_dir {
+        for kernel in ["naive", "horner", "horner_fma"] {
+            support::inspect(
+                polynomial_module::__module_ast_self,
+                "polynomial_module",
+                kernel,
+                generics.clone(),
+                &[("z", &[1, 1]), ("x", &[1, 1]), ("coeffs", &[1, 1])],
+                options.clone(),
+                dir,
+                &format!("final_b{}_c{}", args.tile, args.coefficients),
+            )?;
+        }
+    }
+    println!("Degree: {}; tile: {}; cache: {}; graph batch: {}. Coefficient preparation and CPU launch time are outside the graph-internal event interval.", args.coefficients-1,args.tile,if args.cold {"cold"}else{"warm"},args.batch);
     Ok(())
 }
 
