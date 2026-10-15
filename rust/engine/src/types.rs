@@ -3,19 +3,15 @@ use tokio::sync::oneshot;
 
 pub type RequestId = u64;
 
-pub struct Promp {
-    pub prompt: String,
-}
-
 #[derive(Debug)]
 pub struct LLMResponse {
     pub request_id: RequestId,
-    pub value: u32,
+    pub output: String,
 }
 
 pub(crate) struct Submit {
     pub request_id: RequestId,
-    pub request: Promp,
+    pub request: String,
     pub reply_tx: oneshot::Sender<Result<LLMResponse, EngineError>>,
 }
 
@@ -23,10 +19,15 @@ pub(crate) struct PendingRequest {
     pub reply_tx: oneshot::Sender<Result<LLMResponse, EngineError>>,
 }
 
-pub struct SingleRequest {
+pub struct SingleRequest<T = String> {
     pub request_id: RequestId,
-    pub request: Promp,
+    pub request: T,
 }
 
-pub type BatchIn = Vec<SingleRequest>;
+pub type BatchIn<T = String> = Vec<SingleRequest<T>>;
 pub type BatchOut = Vec<LLMResponse>;
+
+pub struct BatchReply {
+    pub request_ids: Vec<RequestId>,
+    pub result: Result<BatchOut, EngineError>,
+}

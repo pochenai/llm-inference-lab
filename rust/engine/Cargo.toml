@@ -14,3 +14,6 @@ publish = false
 dashmap = "6"
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
+cutile.workspace = true
+cuda-async.workspace = true
+tokenizers = { version = "0.20.4", default-features = false, features = ["onig"] }

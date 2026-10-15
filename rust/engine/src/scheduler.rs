@@ -1,4 +1,4 @@
-use crate::{common::*, error::EngineError};
+use crate::{error::EngineError, types::*};
 use dashmap::DashMap;
 use std::{
     sync::{
@@ -35,7 +35,7 @@ impl Scheduler {
     pub fn new(
         cancel_token: CancellationToken,
         batch_req_tx: mpsc::UnboundedSender<BatchIn>,
-        batch_reply_rx: mpsc::UnboundedReceiver<BatchOut>,
+        batch_reply_rx: mpsc::UnboundedReceiver<BatchReply>,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let requests = Arc::new(DashMap::new());
@@ -74,7 +74,7 @@ impl Scheduler {
         self.requests.clear();
     }
 
-    pub async fn execute(&self, request: Promp) -> Result<LLMResponse, EngineError> {
+    pub async fn execute(&self, request: String) -> Result<LLMResponse, EngineError> {
         if self.cancel_token.is_cancelled() {
             return Err(EngineError::ChannelClosed);
         }
@@ -136,13 +136,24 @@ impl Scheduler {
     }
 
     async fn run_recv_resp(
-        mut batch_reply_rx: mpsc::UnboundedReceiver<BatchOut>,
+        mut batch_reply_rx: mpsc::UnboundedReceiver<BatchReply>,
         requests: Requests,
     ) {
         while let Some(output) = batch_reply_rx.recv().await {
-            for item in output {
-                if let Some((_, request)) = requests.remove(&item.request_id) {
-                    let _ = request.reply_tx.send(Ok(item));
+            match output.result {
+                Ok(items) => {
+                    for item in items {
+                        if let Some((_, request)) = requests.remove(&item.request_id) {
+                            let _ = request.reply_tx.send(Ok(item));
+                        }
+                    }
+                }
+                Err(error) => {
+                    for request_id in output.request_ids {
+                        if let Some((_, request)) = requests.remove(&request_id) {
+                            let _ = request.reply_tx.send(Err(error.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -154,31 +165,25 @@ impl Scheduler {
 mod tests {
     use super::*;
 
+    // Verify cancellation releases pending callers and rejects later submissions.
     #[tokio::test]
     async fn cancellation_wakes_pending_callers_and_closes_ingress() {
         let cancel_token = CancellationToken::new();
         let (batch_req_tx, _batch_req_rx) = mpsc::unbounded_channel();
         let (_batch_reply_tx, batch_reply_rx) = mpsc::unbounded_channel();
         let scheduler = Scheduler::new(cancel_token.child_token(), batch_req_tx, batch_reply_rx);
-        let (result, ()) = tokio::join!(
-            scheduler.execute(Promp {
-                prompt: "hello".into()
-            }),
-            async {
-                cancel_token.cancel();
-                scheduler.wait_stopped().await;
-            },
-        );
+        // No runner is attached, so this request can finish only through cancellation.
+        let (result, ()) = tokio::join!(scheduler.execute("hello".into()), async {
+            cancel_token.cancel();
+            scheduler.wait_stopped().await;
+        },);
         assert!(matches!(result, Err(EngineError::ChannelClosed)));
+        // wait_stopped must finish both tasks before clearing all request state.
         assert!(scheduler.requests.is_empty());
         assert!(scheduler.task_tracker.is_empty());
         assert!(scheduler.tasks.iter().all(AbortHandle::is_finished));
         assert!(matches!(
-            scheduler
-                .execute(Promp {
-                    prompt: "after cancel".into()
-                })
-                .await,
+            scheduler.execute("after cancel".into()).await,
             Err(EngineError::ChannelClosed)
         ));
     }
