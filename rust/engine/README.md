@@ -43,3 +43,13 @@ Numeric input words `0..255` map to token IDs, which are divided by the configur
 `input_divisor` (100) before execution. The result is spelled as numeric output
 tokens for decoding. Generation settings are loaded and exposed; this MLP is
 deterministic and does not implement LLM sampling.
+
+Weight loading accepts F16, BF16, F32, and F64 source tensors. Select the
+in-memory destination independently with `loader.load_host::<f16>(name)` or
+`loader.load_device::<f16>(name, &policy).await`; `f32` and `bf16` destinations
+are also supported (`f16` and `bf16` are exported by `cutile::core`). Host loading
+returns `HostTensor<T>`; device loading returns `Arc<Tensor<T>>`. Same-dtype
+loads preserve the original bits; narrowing conversions may round or overflow
+to infinity. The `WeightElement` trait describes decoding and device storage,
+not supported kernel operations. Existing `load_host_f32` and `load_device_f32`
+methods remain available. The demo MLP still executes exclusively in f32.

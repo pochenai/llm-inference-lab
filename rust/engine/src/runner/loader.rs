@@ -6,12 +6,13 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use cuda_async::{device_operation::DeviceOp, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
     core::{bf16, f16},
     tensor::{Reshape, Tensor},
+    DType,
 };
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
@@ -42,12 +43,93 @@ pub struct GenerationConfig {
 }
 
 #[derive(Debug)]
-pub struct HostTensor {
-    /// Owned CPU values converted to f32, flattened in row-major order.
-    pub data: Vec<f32>,
+pub struct HostTensor<T = f32> {
+    /// Owned CPU values in the requested dtype, flattened in row-major order.
+    pub data: Vec<T>,
     /// Tensor dimensions, e.g. [16, 16]; their product equals data.len().
     pub shape: Vec<usize>,
 }
+
+/// A supported destination type for floating-point Safetensors weights.
+///
+/// This contract covers weight decoding and device storage, not kernel support.
+pub trait WeightElement: DType {
+    /// Decode little-endian F16, BF16, F32, or F64 data into this type.
+    /// Narrowing conversions may round or overflow to infinity.
+    fn decode_weights(dtype: Dtype, bytes: &[u8]) -> Result<Vec<Self>>;
+}
+
+macro_rules! impl_weight_element {
+    ($ty:ty, $native:expr, $decode:expr, $convert:expr) => {
+        impl WeightElement for $ty {
+            fn decode_weights(dtype: Dtype, bytes: &[u8]) -> Result<Vec<Self>> {
+                ensure!(
+                    matches!(dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64),
+                    "unsupported weight dtype {dtype:?}"
+                );
+                ensure!(
+                    bytes.len() % (dtype.bitsize() / 8) == 0,
+                    "invalid byte length {} for weight dtype {dtype:?}",
+                    bytes.len()
+                );
+                if dtype == $native {
+                    // Preserve the exact bits when no conversion is requested.
+                    return Ok(bytes
+                        .chunks_exact(dtype.bitsize() / 8)
+                        .map($decode)
+                        .collect());
+                }
+                let convert: fn(f64) -> Self = $convert;
+                Ok(match dtype {
+                    Dtype::F16 => bytes
+                        .chunks_exact(2)
+                        .map(|b| {
+                            convert(
+                                f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f64(),
+                            )
+                        })
+                        .collect(),
+                    Dtype::BF16 => bytes
+                        .chunks_exact(2)
+                        .map(|b| {
+                            convert(
+                                bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f64(),
+                            )
+                        })
+                        .collect(),
+                    Dtype::F32 => bytes
+                        .chunks_exact(4)
+                        .map(|b| convert(f32::from_le_bytes(b.try_into().unwrap()) as f64))
+                        .collect(),
+                    Dtype::F64 => bytes
+                        .chunks_exact(8)
+                        .map(|b| convert(f64::from_le_bytes(b.try_into().unwrap())))
+                        .collect(),
+                    _ => unreachable!("weight dtype validated above"),
+                })
+            }
+        }
+    };
+}
+
+impl_weight_element!(
+    f32,
+    Dtype::F32,
+    |b: &[u8]| f32::from_le_bytes(b.try_into().unwrap()),
+    |v| v as f32
+);
+impl_weight_element!(
+    f16,
+    Dtype::F16,
+    |b: &[u8]| f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())),
+    f16::from_f64
+);
+impl_weight_element!(
+    bf16,
+    Dtype::BF16,
+    |b: &[u8]| bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())),
+    bf16::from_f64
+);
 
 #[derive(Deserialize)]
 struct SafetensorsIndex {
@@ -127,7 +209,8 @@ impl WeightLoader {
             .map_err(|error| anyhow::anyhow!("failed to load {}: {error}", path.display()))
     }
 
-    pub fn load_host_f32(&self, name: &str) -> Result<HostTensor> {
+    /// Load weights into an explicit destination dtype, independent of file dtype.
+    pub fn load_host<T: WeightElement>(&self, name: &str) -> Result<HostTensor<T>> {
         let shard = self
             .weight_map
             .get(name)
@@ -138,43 +221,40 @@ impl WeightLoader {
         let tensor = tensors
             .tensor(name)
             .with_context(|| format!("tensor {name:?} missing from {shard}"))?;
-        let bytes = tensor.data();
-        let data = match tensor.dtype() {
-            Dtype::F32 => bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect(),
-            Dtype::F16 => bytes
-                .chunks_exact(2)
-                .map(|b| f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32())
-                .collect(),
-            Dtype::BF16 => bytes
-                .chunks_exact(2)
-                .map(|b| bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32())
-                .collect(),
-            Dtype::F64 => bytes
-                .chunks_exact(8)
-                .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
-                .collect(),
-            dtype => bail!("unsupported weight dtype {dtype:?} for tensor {name:?}"),
-        };
+        let data = T::decode_weights(tensor.dtype(), tensor.data())
+            .with_context(|| format!("failed to decode tensor {name:?}"))?;
         Ok(HostTensor {
             data,
             shape: tensor.shape().to_vec(),
         })
     }
 
-    pub async fn load_device_f32(
+    /// Compatibility entry point for existing f32 models.
+    pub fn load_host_f32(&self, name: &str) -> Result<HostTensor> {
+        self.load_host::<f32>(name)
+    }
+
+    /// Upload weights using the requested destination dtype.
+    pub async fn load_device<T: WeightElement>(
         &self,
         name: &str,
         policy: &Arc<dyn SchedulingPolicy>,
-    ) -> Result<Arc<Tensor<f32>>> {
-        let host = self.load_host_f32(name)?;
+    ) -> Result<Arc<Tensor<T>>> {
+        let host = self.load_host::<T>(name)?;
         let tensor = api::copy_host_vec_to_device(&Arc::new(host.data))
             .schedule(policy)?
             .await?
             .reshape(&host.shape)?;
         Ok(Arc::new(tensor))
+    }
+
+    /// Compatibility entry point for existing f32 models.
+    pub async fn load_device_f32(
+        &self,
+        name: &str,
+        policy: &Arc<dyn SchedulingPolicy>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        self.load_device::<f32>(name, policy).await
     }
 }
 
@@ -284,11 +364,103 @@ mod tests {
             )?;
             let loader = WeightLoader::new(dir.path())?;
             if dtype == Dtype::I32 {
-                assert!(loader.load_host_f32("w").is_err());
+                assert!(loader.load_host::<f32>("w").is_err());
+                assert!(loader.load_host::<f16>("w").is_err());
+                assert!(loader.load_host::<bf16>("w").is_err());
             } else {
                 assert_eq!(loader.load_host_f32("w")?.data, vec![1.5]);
+                let half: HostTensor<f16> = loader.load_host("w")?;
+                assert_eq!(half.shape, vec![1]);
+                assert_eq!(half.data, vec![f16::from_f32(1.5)]);
+                assert_eq!(
+                    loader.load_host::<bf16>("w")?.data,
+                    vec![bf16::from_f32(1.5)]
+                );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_native_bits_and_validates_conversion_bytes() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Negative zero, a subnormal, infinity, and a NaN with a payload.
+        for dtype in [Dtype::F16, Dtype::BF16] {
+            let bits: Vec<u16> = if dtype == Dtype::F16 {
+                vec![0x8000, 0x0001, 0x7c00, 0x7e55]
+            } else {
+                vec![0x8000, 0x0001, 0x7f80, 0x7fc5]
+            };
+            let bytes: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            write_tensor(
+                &dir.path().join("model.safetensors"),
+                "w",
+                dtype,
+                vec![4],
+                &bytes,
+            )?;
+            let loader = WeightLoader::new(dir.path())?;
+            let actual: Vec<u16> = if dtype == Dtype::F16 {
+                loader
+                    .load_host::<f16>("w")?
+                    .data
+                    .into_iter()
+                    .map(f16::to_bits)
+                    .collect()
+            } else {
+                loader
+                    .load_host::<bf16>("w")?
+                    .data
+                    .into_iter()
+                    .map(bf16::to_bits)
+                    .collect()
+            };
+            assert_eq!(actual, bits);
+        }
+        assert!(f16::decode_weights(Dtype::F32, &[0, 0, 0]).is_err());
+        assert!(bf16::decode_weights(Dtype::F16, &[0]).is_err());
+        // Narrowing rounds to a destination value and can overflow to infinity.
+        let value = 1.0007f64;
+        assert_eq!(
+            f16::decode_weights(Dtype::F64, &value.to_le_bytes())?[0].to_bits(),
+            0x3c01
+        );
+        assert!(f16::decode_weights(Dtype::F64, &70000.0f64.to_le_bytes())?[0].is_infinite());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploads_requested_float_dtypes() -> Result<()> {
+        use cutile::tensor::ToHostVec;
+        let _gpu_guard = crate::runner::GPU_TEST_LOCK.lock().await;
+        let dir = TempDir::new()?;
+        let bytes: Vec<u8> = [1.5f32, -2.25]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        write_tensor(
+            &dir.path().join("model.safetensors"),
+            "w",
+            Dtype::F32,
+            vec![1, 2],
+            &bytes,
+        )?;
+        let loader = WeightLoader::new(dir.path())?;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let single = loader.load_device::<f32>("w", &policy).await?;
+        let half = loader.load_device::<f16>("w", &policy).await?;
+        let brain = loader.load_device::<bf16>("w", &policy).await?;
+        assert_eq!(single.shape(), half.shape());
+        assert_eq!(single.shape(), brain.shape());
+        assert_eq!(single.to_host_vec().await?, vec![1.5f32, -2.25]);
+        assert_eq!(
+            half.to_host_vec().await?,
+            vec![f16::from_f32(1.5), f16::from_f32(-2.25)]
+        );
+        assert_eq!(
+            brain.to_host_vec().await?,
+            vec![bf16::from_f32(1.5), bf16::from_f32(-2.25)]
+        );
         Ok(())
     }
 
