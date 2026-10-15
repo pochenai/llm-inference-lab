@@ -95,6 +95,7 @@ mod tests {
     // Exercise encoding and batch results directly, without a scheduler or run loop.
     #[tokio::test]
     async fn execute_batch_encodes_strings_and_returns_input_errors() -> Result<(), EngineError> {
+        let _gpu_guard = crate::runner::GPU_TEST_LOCK.lock().await;
         let model: SimpleMLPEngine = SimpleMLPEngine::new(0).await?;
         let (_request_tx, request_rx) = mpsc::unbounded_channel();
         let (reply_tx, _reply_rx) = mpsc::unbounded_channel();

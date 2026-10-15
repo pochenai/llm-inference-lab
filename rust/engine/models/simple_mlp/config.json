@@ -1,0 +1,11 @@
+{
+  "model_type": "simple_mlp",
+  "architectures": [
+    "SimpleMLPEngine"
+  ],
+  "torch_dtype": "float32",
+  "input_size": 16,
+  "hidden_size": 16,
+  "output_size": 1,
+  "input_divisor": 100.0
+}

@@ -1,4 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use anyhow::{ensure, Context};
+use cutile::tensor::ToHostVec;
+use safetensors::{
+    tensor::{serialize_to_file, TensorView},
+    Dtype,
+};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokenizers::{
     decoders::fuse::Fuse, models::wordlevel::WordLevel,
     pre_tokenizers::whitespace::WhitespaceSplit, Encoding, Tokenizer,
@@ -14,21 +25,130 @@ use cutile::{
 };
 
 use super::Model;
-use crate::{error::EngineError, runner::types::ModelOutput, types::BatchIn};
+use crate::{
+    error::EngineError,
+    runner::{
+        loader::{GenerationConfig, WeightLoader},
+        types::ModelOutput,
+    },
+    types::BatchIn,
+};
 
 pub const INPUT_DIM: usize = 16;
 const TILE: usize = 4;
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct SimpleMLPConfig {
+    pub model_type: String,
+    pub architectures: Vec<String>,
+    pub torch_dtype: String,
+    pub input_size: usize,
+    pub hidden_size: usize,
+    pub output_size: usize,
+    pub input_divisor: f32,
+}
+
+impl Default for SimpleMLPConfig {
+    fn default() -> Self {
+        Self {
+            model_type: "simple_mlp".into(),
+            architectures: vec!["SimpleMLPEngine".into()],
+            torch_dtype: "float32".into(),
+            input_size: 16,
+            hidden_size: 16,
+            output_size: 1,
+            input_divisor: 100.0,
+        }
+    }
+}
+
 /// A bias-free 16 -> 16 -> 1 MLP: output = ReLU(input * w0) * w1.
 pub struct SimpleMLPEngine {
     tokenizer: Tokenizer,
+    config: SimpleMLPConfig,
+    generation_config: Option<GenerationConfig>,
     policy: Arc<dyn SchedulingPolicy>,
     // Hidden-layer matrix [16, 16], followed by output-layer vector [16].
     layers: Vec<Arc<Tensor<f32>>>,
 }
 
 impl SimpleMLPEngine {
+    fn default_model_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("models/simple_mlp")
+    }
+
     pub async fn new(device_id: usize) -> Result<Self, EngineError> {
+        Self::load(&Self::default_model_dir(), device_id).await
+    }
+
+    pub async fn load(model_dir: &Path, device_id: usize) -> Result<Self, EngineError> {
+        if !model_dir
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", model_dir.display()))?
+        {
+            eprintln!(
+                "WARN: model directory {} does not exist; initializing random weights on GPU {device_id}",
+                model_dir.display()
+            );
+            return Self::random(device_id).await;
+        }
+
+        let result: anyhow::Result<Self> = async {
+            let loader = WeightLoader::new(model_dir)?;
+            let config: SimpleMLPConfig = loader.config()?;
+            ensure!(
+                config.model_type == "simple_mlp"
+                    && config.input_size == INPUT_DIM
+                    && config.hidden_size == INPUT_DIM
+                    && config.output_size == 1
+                    && config.torch_dtype == "float32"
+                    && config.input_divisor.is_finite()
+                    && config.input_divisor > 0.0,
+                "this kernel requires a float32 simple_mlp with dimensions 16 -> 16 -> 1"
+            );
+            let tokenizer = loader.tokenizer()?;
+            let generation_config = loader.generation_config()?;
+            let policy = global_policy(device_id)?;
+            let mut layers = Vec::new();
+            for (index, shape) in [vec![INPUT_DIM, INPUT_DIM], vec![INPUT_DIM]]
+                .iter()
+                .enumerate()
+            {
+                let name = format!("layers.{index}.weight");
+                let weight = loader.load_device_f32(&name, &policy).await?;
+                ensure!(
+                    weight
+                        .shape()
+                        .iter()
+                        .map(|&dim| dim as usize)
+                        .eq(shape.iter().copied()),
+                    "unexpected shape for {name}: {:?}",
+                    weight.shape()
+                );
+                layers.push(weight);
+            }
+            Ok(Self {
+                tokenizer,
+                config,
+                generation_config,
+                policy,
+                layers,
+            })
+        }
+        .await;
+        result.map_err(Into::into)
+    }
+
+    pub fn config(&self) -> &SimpleMLPConfig {
+        &self.config
+    }
+
+    pub fn generation_config(&self) -> Option<&GenerationConfig> {
+        self.generation_config.as_ref()
+    }
+
+    /// Initialize weights on the GPU for the explicit export step, not inference startup.
+    pub async fn random(device_id: usize) -> Result<Self, EngineError> {
         // A tiny demo vocabulary: numeric words map to their integer IDs.
         // A real LLM would load its matching tokenizer.json here.
         let mut vocab: HashMap<String, u32> = (0..256).map(|id| (id.to_string(), id)).collect();
@@ -57,9 +177,73 @@ impl SimpleMLPEngine {
             .await?;
         Ok(Self {
             tokenizer,
+            config: SimpleMLPConfig::default(),
+            generation_config: Some(GenerationConfig {
+                do_sample: Some(false),
+                ..Default::default()
+            }),
             policy,
             layers: vec![Arc::new(w0), Arc::new(w1)],
         })
+    }
+
+    /// Save a local Hugging Face style directory; the Rust model owns its computation graph.
+    pub async fn save_pretrained(&self, model_dir: &Path) -> Result<(), EngineError> {
+        let result: anyhow::Result<()> = async {
+            fs::create_dir_all(model_dir)?;
+            ensure!(
+                !model_dir.join("model.safetensors.index.json").exists(),
+                "refusing to export single-file weights over an existing shard index"
+            );
+            let mut buffers = Vec::new();
+            for layer in &self.layers {
+                let data = layer.clone().to_host_vec().schedule(&self.policy)?.await?;
+                buffers.push(
+                    data.into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let tensors = self
+                .layers
+                .iter()
+                .zip(&buffers)
+                .enumerate()
+                .map(|(index, (layer, bytes))| {
+                    Ok((
+                        format!("layers.{index}.weight"),
+                        TensorView::new(
+                            Dtype::F32,
+                            layer.shape().iter().map(|&dim| dim as usize).collect(),
+                            bytes,
+                        )?,
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            serialize_to_file(
+                tensors,
+                Some(HashMap::from([("format".into(), "pt".into())])),
+                &model_dir.join("model.safetensors"),
+            )?;
+            fs::write(
+                model_dir.join("config.json"),
+                serde_json::to_string_pretty(&self.config)?,
+            )?;
+            if let Some(config) = &self.generation_config {
+                fs::write(
+                    model_dir.join("generation_config.json"),
+                    serde_json::to_string_pretty(config)?,
+                )?;
+            }
+            self.tokenizer
+                .save(model_dir.join("tokenizer.json"), true)
+                .map_err(|error| anyhow::anyhow!("failed to save tokenizer: {error}"))?;
+            Ok(())
+        }
+        .await;
+        result
+            .context("failed to save MLP model directory")
+            .map_err(Into::into)
     }
 }
 
@@ -88,7 +272,7 @@ impl Model for SimpleMLPEngine {
         for (row, item) in batch.iter().enumerate() {
             // Scale demo token IDs into the MLP's floating-point features.
             for (column, &id) in item.request.get_ids().iter().enumerate() {
-                inputs[row * INPUT_DIM + column] = id as f32 / 100.0;
+                inputs[row * INPUT_DIM + column] = id as f32 / self.config.input_divisor;
             }
         }
         let input = api::copy_host_vec_to_device(&Arc::new(inputs))
@@ -191,11 +375,101 @@ mod tests {
     use crate::types::SingleRequest;
     use cutile::tensor::ToHostVec;
 
+    // Only an absent directory triggers random initialization; existing broken models fail.
+    #[tokio::test]
+    async fn missing_directory_uses_random_weights() -> Result<(), EngineError> {
+        let _gpu_guard = crate::runner::GPU_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().map_err(anyhow::Error::from)?;
+        let missing = dir.path().join("missing-model");
+        let model = SimpleMLPEngine::load(&missing, 0).await?;
+        assert_eq!(model.config().input_size, INPUT_DIM);
+        assert!(!missing.exists()); // Fallback does not implicitly save model files.
+        let output = model
+            .generate(vec![SingleRequest {
+                request_id: 42,
+                request: model
+                    .tokenizer()
+                    .encode(vec!["0"; INPUT_DIM].join(" "), true)
+                    .expect("numeric fixture is tokenizable"),
+            }])
+            .await?;
+        assert_eq!(
+            model
+                .tokenizer()
+                .decode(&output[0].token_ids, true)
+                .unwrap(),
+            "0"
+        );
+        assert!(SimpleMLPEngine::load(dir.path(), 0).await.is_err());
+        fs::write(dir.path().join("model.safetensors"), b"invalid weights")
+            .map_err(anyhow::Error::from)?;
+        assert!(SimpleMLPEngine::load(dir.path(), 0).await.is_err());
+        Ok(())
+    }
+
+    // Re-shard the exported fixture and verify that both layouts execute identically.
+    #[tokio::test]
+    async fn sharded_model_matches_single_file_on_gpu() -> Result<(), EngineError> {
+        let _gpu_guard = crate::runner::GPU_TEST_LOCK.lock().await;
+        let source = SimpleMLPEngine::default_model_dir();
+        let dir = tempfile::tempdir().map_err(anyhow::Error::from)?;
+        let bytes = fs::read(source.join("model.safetensors")).map_err(anyhow::Error::from)?;
+        let weights = safetensors::SafeTensors::deserialize(&bytes).map_err(anyhow::Error::from)?;
+        let mut weight_map = HashMap::new();
+        for (index, name) in ["layers.0.weight", "layers.1.weight"].iter().enumerate() {
+            let shard = format!("model-{:05}-of-00002.safetensors", index + 1);
+            serialize_to_file(
+                [(*name, weights.tensor(name).map_err(anyhow::Error::from)?)],
+                None,
+                &dir.path().join(&shard),
+            )
+            .map_err(anyhow::Error::from)?;
+            weight_map.insert(*name, shard);
+        }
+        for name in ["config.json", "generation_config.json", "tokenizer.json"] {
+            fs::copy(source.join(name), dir.path().join(name)).map_err(anyhow::Error::from)?;
+        }
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({"metadata": {"total_size": 1088}, "weight_map": weight_map})
+                .to_string(),
+        )
+        .map_err(anyhow::Error::from)?;
+        let single = SimpleMLPEngine::load(&source, 0).await?;
+        let sharded = SimpleMLPEngine::load(dir.path(), 0).await?;
+        assert_eq!(sharded.config().input_size, INPUT_DIM);
+        assert_eq!(sharded.generation_config().unwrap().do_sample, Some(false));
+        let batch = |model: &SimpleMLPEngine| {
+            vec![SingleRequest {
+                request_id: 42,
+                request: model
+                    .tokenizer()
+                    .encode(
+                        (0..INPUT_DIM)
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        true,
+                    )
+                    .expect("numeric fixture is tokenizable"),
+            }]
+        };
+        let (a, b) = tokio::join!(
+            single.generate(batch(&single)),
+            sharded.generate(batch(&sharded))
+        );
+        let (a, b) = (a?, b?);
+        assert_eq!(a[0].request_id, b[0].request_id);
+        assert_eq!(a[0].token_ids, b[0].token_ids);
+        Ok(())
+    }
+
     // Verify concurrent GPU batches against the same weights evaluated on the CPU.
     #[tokio::test]
     async fn gpu_mlp_matches_cpu_for_padded_batches() -> Result<(), EngineError> {
+        let _gpu_guard = crate::runner::GPU_TEST_LOCK.lock().await;
         let model = SimpleMLPEngine::new(0).await?;
-        // Copy the GPU-initialized weights back solely for the CPU reference.
+        // Copy the loaded GPU weights back solely for the CPU reference.
         let w0 = model.layers[0]
             .clone()
             .to_host_vec()

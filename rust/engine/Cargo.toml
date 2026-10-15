@@ -17,3 +17,11 @@ tokio-util = { version = "0.7", features = ["rt"] }
 cutile.workspace = true
 cuda-async.workspace = true
 tokenizers = { version = "0.20.4", default-features = false, features = ["onig"] }
+anyhow = "1"
+memmap2 = "0.9"
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

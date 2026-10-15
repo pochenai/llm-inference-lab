@@ -19,6 +19,12 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+impl From<anyhow::Error> for EngineError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Model(format!("{error:#}"))
+    }
+}
+
 impl From<cuda_async::error::DeviceError> for EngineError {
     fn from(error: cuda_async::error::DeviceError) -> Self {
         Self::Model(error.to_string())
