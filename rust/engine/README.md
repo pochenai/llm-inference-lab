@@ -118,3 +118,33 @@ backend state and logical token range rather than the owning KVContext; the pool
 maps that range to its physical layout. The Naive attention backend supports
 reading completed-cache windows as well as newly appended suffixes. The grouping
 change has correctness coverage; no throughput improvement is claimed.
+
+## Uniform attention-MLP profiling
+
+`examples/simple_mlp_attn.rs` runs uniform stateless requests through Scheduler and
+Runner using fixed-seed random weights, so it does not depend on exported model files.
+It checks identical finite outputs and verifies KV release after each batch. The
+example-only model wrapper measures Model::generate separately from end-to-end time.
+
+```bash
+cargo build --manifest-path rust/Cargo.toml --offline --release -p engine --example simple_mlp_attn
+rust/target/release/examples/simple_mlp_attn --warmup 10 --iterations 50
+mkdir -p rust/profiling/simple_mlp_attn
+nsys profile --trace=cuda,nvtx,osrt --gpu-metrics-devices=0 --capture-range=cudaProfilerApi --capture-range-end=stop --sample=none --cpuctxsw=none --event-sample=none --backtrace=none --force-overwrite=true --output=rust/profiling/simple_mlp_attn/uniform-b5-t16 rust/target/release/examples/simple_mlp_attn --warmup 10 --iterations 50 --profile
+```
+
+The defaults are five requests, sixteen tokens per request, and one execution
+stream. `--batch-size` accepts 1..5 and `--tokens` accepts 1..512. Smaller batches
+include Scheduler's 100ms collection window; the default fills its dispatch limit.
+Profiler start/stop excludes weight/pool initialization, JIT, and warmup. CUDA
+tracing selects hardware trace where supported; GPU metrics sample device 0.
+Profiling can perturb timings, so compare wall times without the profiler.
+NVTX ranges label the synchronous `prepare_append`, `submit_batch`, and
+`commit_append` calls. Prepare/commit occur per request; submit occurs per batch.
+These ranges measure CPU work and submission, not GPU completion or the outer await.
+
+The initial [results and commands](../profiling/simple_mlp_attn/RESULTS.md) include
+three unprofiled runs, CUDA kernel/API summaries, and a directly openable
+[Nsight Systems report](../profiling/simple_mlp_attn/uniform-b5-t16.nsys-rep).
+These local profiling artifacts are ignored by Git. The example uses libloading
+only as a dev dependency to resolve CUDA profiler APIs without a WSL linker path.

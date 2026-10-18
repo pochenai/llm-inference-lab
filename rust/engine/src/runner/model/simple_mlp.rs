@@ -350,6 +350,7 @@ impl SimpleMLPEngine {
         rows: usize,
         exec: &ExecutionContext,
     ) -> Result<Vec<f32>, ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"submit_batch");
         let packed_token_ids = api::copy_host_vec_to_device(&packed_token_ids).execute(exec)?;
         let x = kernels::embedding(
             api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),

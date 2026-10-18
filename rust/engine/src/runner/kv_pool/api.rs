@@ -148,6 +148,7 @@ impl<P: KVPool> KVContext<P> {
     /// and commit_append follows successful outer completion. A failed submission
     /// invalidates this context until release; rollback/truncate is not implemented.
     pub fn prepare_append(&mut self, count: usize, exec: &ExecutionContext) -> ContextResult<()> {
+        let _range = crate::profiling::ScopedRange::new(c"prepare_append");
         if self.pending.is_some() || count == 0 {
             return Err(KVContextError::InvalidState(
                 "append must be nonempty and context idle".into(),
@@ -230,6 +231,7 @@ impl<P: KVPool> KVContext<P> {
     /// successful completion of this append's mapping updates, K/V writes, and all
     /// layers, e.g. after the outer scheduled operation is awaited or sync_on succeeds.
     pub(in crate::runner) fn commit_append(&mut self) -> ContextResult<()> {
+        let _range = crate::profiling::ScopedRange::new(c"commit_append");
         let pending = self
             .pending
             .take()
