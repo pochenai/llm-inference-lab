@@ -9,25 +9,63 @@ pub struct LLMResponse {
     pub output: String,
 }
 
-pub(crate) struct Submit {
-    pub request_id: RequestId,
-    pub request: String,
-    pub reply_tx: oneshot::Sender<Result<LLMResponse, EngineError>>,
+pub type SessionId = u64;
+
+pub use crate::runner::loader::GenerationConfig as SamplingConfig;
+
+#[derive(Clone, Debug)]
+pub struct SessionRequest<T = String> {
+    request_id: Option<RequestId>,
+    pub session_id: Option<SessionId>,
+    pub input: T,
+    pub sampling: Option<SamplingConfig>,
 }
 
-pub(crate) struct PendingRequest {
-    pub reply_tx: oneshot::Sender<Result<LLMResponse, EngineError>>,
+impl<T> SessionRequest<T> {
+    pub fn new(session_id: Option<SessionId>, input: T) -> Self {
+        Self {
+            request_id: None,
+            session_id,
+            input,
+            sampling: None,
+        }
+    }
+
+    /// None until Scheduler admission; callers may inspect but cannot choose the ID.
+    pub fn request_id(&self) -> Option<RequestId> {
+        self.request_id
+    }
+
+    /// Used for Scheduler admission and preserving identity through internal transforms.
+    pub(crate) fn with_request_id(mut self, id: RequestId) -> Self {
+        self.request_id = Some(id);
+        self
+    }
+
+    /// Internal invariant: Scheduler assigns the ID before dispatching this envelope.
+    pub(crate) fn assigned_request_id(&self) -> RequestId {
+        self.request_id
+            .expect("Scheduler assigns request IDs before dispatch")
+    }
 }
 
-pub struct SingleRequest<T = String> {
-    pub request_id: RequestId,
-    pub request: T,
-}
+pub type BatchIn<T = String> = Vec<SessionRequest<T>>;
+pub type BatchOut = Vec<(RequestId, Result<LLMResponse, EngineError>)>;
 
-pub type BatchIn<T = String> = Vec<SingleRequest<T>>;
-pub type BatchOut = Vec<LLMResponse>;
+/// Ordered transport between Scheduler and Runner; applications use Scheduler APIs.
+#[derive(Debug)]
+pub enum RunnerCommand {
+    Execute(BatchIn),
+    OpenSession {
+        id: SessionId,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    CloseSession {
+        id: SessionId,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+}
 
 pub struct BatchReply {
-    pub request_ids: Vec<RequestId>,
-    pub result: Result<BatchOut, EngineError>,
+    pub(crate) results: BatchOut,
 }

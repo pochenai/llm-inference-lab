@@ -1,4 +1,4 @@
-use engine::runner::model::simple_mlp::SimpleMLPEngine;
+use engine::runner::model::SimpleMLPEngine;
 use std::path::PathBuf;
 
 #[tokio::main]
