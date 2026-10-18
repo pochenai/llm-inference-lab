@@ -37,6 +37,7 @@ struct Options {
     warmup: usize,
     iterations: usize,
     profile: bool,
+    cuda_graph: bool,
 }
 
 impl Options {
@@ -47,15 +48,20 @@ impl Options {
             warmup: 3,
             iterations: 20,
             profile: false,
+            cuda_graph: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
+            if arg == "--cuda-graph" {
+                options.cuda_graph = true;
+                continue;
+            }
             if arg == "--profile" {
                 options.profile = true;
                 continue;
             }
             if arg == "--help" {
-                println!("simple_mlp_attn [--batch-size 1..5] [--tokens 1..512] [--warmup N] [--iterations N] [--profile]");
+                println!("simple_mlp_attn [--batch-size 1..5] [--tokens 1..512] [--warmup N] [--iterations N] [--profile] [--cuda-graph]");
                 println!("Batch size 5 fills the Scheduler dispatch limit; smaller batches include its 100ms collection window.");
                 std::process::exit(0);
             }
@@ -163,6 +169,7 @@ async fn main() -> Result<()> {
     let samples = Arc::new(Mutex::new(Vec::new()));
     let timings = samples.clone();
     let owned_pool = pool.clone();
+    let cuda_graph = options.cuda_graph;
     let cancel = CancellationToken::new();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
@@ -170,7 +177,14 @@ async fn main() -> Result<()> {
     let runner = RunnerBuilder::default()
         .with_model_factory(move || async move {
             Ok(TimedModel {
-                inner: SimpleMLPEngine::random(0).await?,
+                inner: {
+                    let model = SimpleMLPEngine::random(0).await?;
+                    if cuda_graph {
+                        model.with_cuda_graphs()
+                    } else {
+                        model
+                    }
+                },
                 samples: timings,
             })
         })
@@ -240,6 +254,7 @@ async fn main() -> Result<()> {
             "batch_size": options.batch_size, "prompt_tokens": options.tokens,
             "packed_rows": (options.batch_size * options.tokens).div_ceil(4) * 4,
             "warmup": options.warmup, "iterations": options.iterations, "profiled": options.profile,
+            "cuda_graph": options.cuda_graph,
             "input_dim": 16, "hidden_dim": 16, "dtype": "f32", "uniform_output": output,
             "model_generate_median_us": median(&mut model_times),
             "model_generate_mean_us": model_times.iter().sum::<f64>() / model_times.len() as f64,

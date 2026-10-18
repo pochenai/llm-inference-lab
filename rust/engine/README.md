@@ -164,6 +164,31 @@ metadata; attention derives its causal end as position + 1. The packed batch
 upload is submitted before bind and embedding. The final pageable host
 readback retains its existing behavior.
 
+CUDA Graph replay is optional: enable it with
+`SimpleMLPEngine::random(0).await?.with_cuda_graphs()` (or after `load`/`new`).
+The profiling example accepts `--cuda-graph`; experiment commands and measurements
+belong in the local results file linked below. Eager execution remains the default.
+Each graph owns fixed input and scratch allocations and captures bind plus the
+seven model kernels through `CudaGraph::scope`. Scratch consists of ordinary
+owned tensors borrowed by each recorded operation; no scratch alias handles are
+created for warmup or capture. Eager execution and capture share the same kernel
+definitions, with capture restricted to `GraphNode` operations. Each replay
+uploads the new packed payload, launches once,
+and performs the existing pageable readback. CPU reservation, upload, readback,
+and KV commit remain outside capture; logical progress advances after completion.
+
+Graphs are captured lazily for a packed shape, KV backing store, and weight
+identity. A new instance allocates its private buffers and warms kernels on a
+dedicated stream before capture, so its first use has an extra initialization
+cost. Warmup repeats the current append's K/V writes without committing progress.
+Changes in token IDs, slot IDs, context rows, and history positions only change
+the uploaded payload and reuse the same graph when its geometry is compatible.
+An in-flight batch exclusively owns its graph until completion; concurrent batches
+use separate instances. The cache keeps at most four idle instances and retains
+GPU storage, never per-request KV state leases. Pool/weight replacement or shape
+changes select a separate instance. This implementation uses exact shapes rather
+than padding requests into a fixed set of graph buckets.
+
 The initial [results and commands](../profiling/simple_mlp_attn/RESULTS.md) include
 three unprofiled runs, CUDA kernel/API summaries, and a directly openable
 [Nsight Systems report](../profiling/simple_mlp_attn/uniform-b5-t16.nsys-rep).

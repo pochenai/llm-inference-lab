@@ -17,16 +17,16 @@ use tokenizers::{
 };
 
 use cuda_async::{
-    device_buffer::DevicePointer, device_context::global_policy, device_operation::*,
-    scheduling_policies::SchedulingPolicy,
+    device_context::global_policy, device_operation::*, scheduling_policies::SchedulingPolicy,
 };
 use cutile::{
     api,
-    tensor::{Reshape, Tensor, TensorView as DeviceTensorView, Unpartition},
+    tensor::{PartitionMut, Reshape, Tensor, TensorView as DeviceTensorView, Unpartition},
     tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
 };
 
 use super::{AttentionBackend, Model, ModelError, ModelInput, ModelOutput};
+mod graph;
 mod workspace;
 use crate::runner::kv_pool::{KVContext, NaiveKVPool, NaiveMappingPlan, NaiveReadView};
 use crate::runner::upload::UploadPool;
@@ -34,7 +34,8 @@ use crate::{
     runner::loader::{GenerationConfig, WeightLoader},
     types::{BatchIn, SamplingConfig},
 };
-use workspace::WorkspacePool;
+use graph::{GraphInstance, GraphKey, GraphPool};
+use workspace::{Buffers, WorkspacePool};
 
 pub const INPUT_DIM: usize = 16;
 const TILE: usize = 4;
@@ -108,9 +109,49 @@ pub struct SimpleMLPEngine {
     layers: Vec<Arc<Tensor<f32>>>,
     workspaces: Arc<WorkspacePool>,
     input_uploads: Arc<UploadPool>,
+    graphs: Option<Arc<GraphPool>>,
+}
+
+/// GPU storage only: never retain a request's context/state lease in a cached graph.
+struct CacheBuffers {
+    k: Arc<Tensor<f32>>,
+    v: Arc<Tensor<f32>>,
+    table: Arc<Tensor<i32>>,
+}
+
+struct PreparedBatch {
+    payload: Arc<Vec<i32>>,
+    rows: usize,
+    mapping_words: usize,
+    metadata_start: usize,
+    cache: CacheBuffers,
+}
+
+/// Share kernel definitions between ordinary submission and checked scope recording.
+/// Both modes borrow scratch; neither creates replacement tensor aliases.
+enum ComputeRecorder<'a> {
+    Eager(&'a ExecutionContext),
+    Capture(&'a cuda_async::cuda_graph::Scope),
+}
+
+impl ComputeRecorder<'_> {
+    /// Eager callers must retain storage and prevent reuse until GPU completion.
+    unsafe fn record<N: GraphNode>(&self, op: N) -> Result<<N as DeviceOp>::Output, ModelError> {
+        Ok(match self {
+            Self::Eager(exec) => op.execute(exec)?,
+            Self::Capture(scope) => scope.record(op)?,
+        })
+    }
 }
 
 impl SimpleMLPEngine {
+    /// Enable fixed-buffer CUDA Graph replay. Graphs are captured lazily per shape,
+    /// KV storage, and weight identity; capture/initialization is a cold-path cost.
+    pub fn with_cuda_graphs(mut self) -> Self {
+        self.graphs.get_or_insert_with(Default::default);
+        self
+    }
+
     fn default_model_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/simple_mlp")
     }
@@ -169,6 +210,7 @@ impl SimpleMLPEngine {
                 layers,
                 workspaces: Arc::default(),
                 input_uploads: Arc::default(),
+                graphs: None,
             })
         }
         .await;
@@ -230,6 +272,7 @@ impl SimpleMLPEngine {
             layers,
             workspaces: Arc::default(),
             input_uploads: Arc::default(),
+            graphs: None,
         })
     }
 
@@ -313,6 +356,19 @@ impl SimpleMLPEngine {
 
     /// Pack all uncached suffixes into one tensor. Shared projections and MLP run once;
     /// per-query metadata selects each request's KV row and causal history boundary.
+    ///
+    /// Memory ownership differs between the two execution paths:
+    /// - Eager checks out six scratch buffers from WorkspacePool and one packed i32
+    ///   input from UploadPool. Each pool allocates on a miss and recycles only after
+    ///   completion; later batches need not receive the same GPU addresses.
+    /// - Graph checks out a GraphInstance. Only a cache miss allocates its private
+    ///   packed input and six scratch buffers, then warms and captures them. Every
+    ///   replay uses those same addresses, overwriting input contents without going
+    ///   through WorkspacePool, UploadPool, or KVPool's mapping_uploads.
+    /// CPU mapping/IDs/metadata and the host readback Vec are allocated per batch
+    /// in either mode. Both paths share model weights and KVPool's stable K/V and
+    /// slot_table backing allocations; row/slot contents change. Request leases
+    /// survive GPU completion but are never cached in graphs.
     async fn forward_batch(
         &self,
         mut batch: Vec<ModelInput<'_, NaiveKVPool>>,
@@ -332,10 +388,19 @@ impl SimpleMLPEngine {
         if rows > i32::MAX as usize / INPUT_DIM {
             return Err(ModelError::InvalidInput("packed batch is too large".into()));
         }
-        let values =
+        let values = if let Some(graphs) = &self.graphs {
+            self.forward_graph_batch(
+                &mut batch,
+                &policy,
+                Arc::new(packed_token_ids),
+                &query_ranges,
+                rows,
+                graphs,
+            )
+            .await?
+        } else {
             Self::execute_packed_append_batch(&mut batch, &policy, |batch, mapping, exec| {
-                // SAFETY: one awaited future owns the whole submission. All buffers and
-                // logical allocation leases are retained before their GPU accesses.
+                // SAFETY: the awaited submission retains all buffers and state leases.
                 unsafe {
                     self.submit_batch(
                         batch,
@@ -347,7 +412,8 @@ impl SimpleMLPEngine {
                     )
                 }
             })
-            .await?;
+            .await?
+        };
         Ok(query_ranges
             .iter()
             .map(|range| values[range.end - 1])
@@ -388,9 +454,9 @@ impl SimpleMLPEngine {
         Ok(output)
     }
 
-    /// Build one upload from the backend mapping payload, IDs, and query metadata.
-    /// Bind precedes every cache access on exec; the final pageable readback is unchanged.
-    unsafe fn submit_batch(
+    /// Build all request-dependent CPU data and retain state leases on the outer exec.
+    /// The returned cache descriptors own GPU storage, not request/session state.
+    unsafe fn prepare_batch(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         packed_token_ids: Arc<Vec<i32>>,
@@ -398,10 +464,8 @@ impl SimpleMLPEngine {
         rows: usize,
         mapping: &NaiveMappingPlan,
         exec: &ExecutionContext,
-    ) -> Result<Vec<f32>, ModelError> {
-        let _range = crate::profiling::ScopedRange::new(c"submit_batch");
-        let workspace = self.workspaces.acquire(rows, exec)?;
-        let (k_ptr, v_ptr, table, table_width, metadata) = {
+    ) -> Result<PreparedBatch, ModelError> {
+        let metadata = {
             let destinations = batch
                 .iter_mut()
                 .map(|input| input.kv.write_view(0, exec))
@@ -424,99 +488,232 @@ impl SimpleMLPEngine {
                     metadata[packed_row * 3 + 1] = (dst.positions().start + local) as i32;
                 }
             }
-            // Views retain buffers and state leases on exec. The returned pointers
-            // remain valid after the Rust views drop, until GPU completion.
-            (
-                first.k_mut_ptr(),
-                first.v_mut_ptr(),
-                DevicePointer::<i32>::from_cu_deviceptr(first.slot_table_ptr() as u64),
-                first.table_width() as i32,
-                metadata,
-            )
+            metadata
         };
         let views = batch
             .iter()
             .map(|input| input.kv.read_view(0))
             .collect::<Result<Vec<_>, _>>()?;
+        for view in &views {
+            view.retain(exec)?;
+        }
+        let (k, v, table) = views[0].tensors();
+        let cache = CacheBuffers {
+            k: k.clone(),
+            v: v.clone(),
+            table: table.clone(),
+        };
         let ids_start = mapping.payload().len();
         let metadata_start = ids_start + packed_token_ids.len();
         let mut payload = Vec::with_capacity(metadata_start + metadata.len());
         payload.extend_from_slice(mapping.payload());
         payload.extend_from_slice(&packed_token_ids);
         payload.extend(metadata);
-        let count = payload.len();
-        let upload = self
-            .input_uploads
-            .upload(Arc::new(payload), &[count], exec)?;
-        let ids = upload.slice(&[ids_start..metadata_start])?;
-        let metadata_flat = upload.slice(&[metadata_start..count])?;
-        let metadata = metadata_flat.view(&[rows, 3])?;
-        // One copy precedes bind and every model kernel on the same exec.
-        mapping.submit(&upload, 0, exec)?;
-        let x = Arc::new(
-            kernels::embedding(
-                value(workspace.x).partition([1, INPUT_DIM]),
-                &ids,
-                self.layers[2].clone(),
-                self.config.input_divisor,
-            )
-            .first()
-            .unpartition()
-            .execute(exec)?,
-        );
-        let q = kernels::qkv_to_cache(
-            value(workspace.q).partition([TILE, TILE]),
-            x.clone(),
-            self.layers[3].clone(),
-            self.layers[4].clone(),
-            self.layers[5].clone(),
-            k_ptr,
-            v_ptr,
-            table,
-            &metadata,
-            table_width,
-        )
-        .generics(vec!["4".into(), "4".into(), "4".into()])
-        .map(|(q, ..)| q)
-        .unpartition()
-        .execute(exec)?;
-        let attention = NaiveAttention.submit_prepared(
-            Arc::new(q),
-            &views,
-            &metadata,
-            workspace.attention,
-            exec,
+        Ok(PreparedBatch {
+            payload: Arc::new(payload),
+            rows,
+            mapping_words: ids_start,
+            metadata_start,
+            cache,
+        })
+    }
+
+    unsafe fn submit_batch(
+        &self,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        packed_token_ids: Arc<Vec<i32>>,
+        query_ranges: &[Range<usize>],
+        rows: usize,
+        mapping: &NaiveMappingPlan,
+        exec: &ExecutionContext,
+    ) -> Result<Vec<f32>, ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"submit_batch");
+        let mut workspace = self.workspaces.acquire(rows, exec)?;
+        let prepared =
+            self.prepare_batch(batch, packed_token_ids, query_ranges, rows, mapping, exec)?;
+        let upload =
+            self.input_uploads
+                .upload(prepared.payload.clone(), &[prepared.payload.len()], exec)?;
+        self.submit_compute(
+            mapping,
+            &prepared,
+            &upload,
+            &mut workspace,
+            &ComputeRecorder::Eager(exec),
         )?;
-        let h = Arc::new(
-            kernels::residual(
-                value(workspace.residual).partition([1, INPUT_DIM]),
-                x,
-                attention,
+        Ok(value(workspace.output).to_host_vec().execute(exec)?)
+    }
+
+    /// Compute only: borrowed preallocated buffers, no uploads/readback/allocation,
+    /// and no request state leases retained by a capture. Each record releases its
+    /// Rust borrows; stream ordering supplies the GPU write-before-read dependency.
+    unsafe fn submit_compute(
+        &self,
+        mapping: &NaiveMappingPlan,
+        prepared: &PreparedBatch,
+        upload: &Arc<Tensor<i32>>,
+        buffers: &mut Buffers<Tensor<f32>>,
+        recorder: &ComputeRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        let ids = upload.slice(&[prepared.mapping_words..prepared.metadata_start])?;
+        let metadata_flat = upload.slice(&[prepared.metadata_start..prepared.payload.len()])?;
+        let metadata = metadata_flat.view(&[prepared.rows, 3])?;
+        // One upload precedes bind and every model kernel on the same stream.
+        // prepare_batch retains current reservations on the outer exec. Attention
+        // retains the table's GPU storage in the graph, never those reservations.
+        if prepared.mapping_words != 0 {
+            let flat = upload.slice(&[0..prepared.mapping_words])?;
+            let updates = flat.view(&[2, prepared.mapping_words / 2])?;
+            recorder.record(mapping.bind_op(&updates)?)?;
+        }
+        recorder.record(kernels::embedding(
+            (&mut buffers.x).partition([1, INPUT_DIM]),
+            &ids,
+            self.layers[2].clone(),
+            self.config.input_divisor,
+        ))?;
+        recorder.record(
+            kernels::qkv_to_cache(
+                (&mut buffers.q).partition([TILE, TILE]),
+                &buffers.x,
+                self.layers[3].clone(),
+                self.layers[4].clone(),
+                self.layers[5].clone(),
+                prepared.cache.k.device_pointer(),
+                prepared.cache.v.device_pointer(),
+                prepared.cache.table.device_pointer(),
+                &metadata,
+                prepared.cache.table.shape()[1],
             )
-            .first()
-            .unpartition()
-            .execute(exec)?,
-        );
-        let hidden = kernels::gemm(
-            value(workspace.hidden).partition([TILE, TILE]),
-            h,
-            self.layers[0].clone(),
-        )
-        .generics(vec!["4".into(), "4".into(), "4".into(), "16".into()])
-        .first();
-        let hidden = kernels::relu(hidden)
-            .generics(vec!["4".into(), "4".into()])
-            .map(|(hidden,)| hidden);
-        Ok(kernels::matvec(
-            value(workspace.output).partition([TILE]),
-            hidden.unpartition(),
-            self.layers[1].clone(),
-        )
-        .generics(vec!["4".into(), "4".into(), "16".into()])
-        .first()
-        .unpartition()
-        .to_host_vec()
-        .execute(exec)?)
+            .generics(vec!["4".into(), "4".into(), "4".into()]),
+        )?;
+        recorder.record(kernels::attention(
+            (&mut buffers.attention).partition([1, INPUT_DIM]),
+            &buffers.q,
+            prepared.cache.k.clone(),
+            prepared.cache.v.clone(),
+            prepared.cache.table.clone(),
+            &metadata,
+        ))?;
+        recorder.record(kernels::residual(
+            (&mut buffers.residual).partition([1, INPUT_DIM]),
+            &buffers.x,
+            &buffers.attention,
+        ))?;
+        recorder.record(
+            kernels::gemm(
+                (&mut buffers.hidden).partition([TILE, TILE]),
+                &buffers.residual,
+                self.layers[0].clone(),
+            )
+            .generics(vec!["4".into(), "4".into(), "4".into(), "16".into()]),
+        )?;
+        recorder.record(
+            kernels::relu((&mut buffers.hidden).partition([TILE, TILE]))
+                .generics(vec!["4".into(), "4".into()]),
+        )?;
+        recorder.record(
+            kernels::matvec(
+                (&mut buffers.output).partition([TILE]),
+                &buffers.hidden,
+                self.layers[1].clone(),
+            )
+            .generics(vec!["4".into(), "4".into(), "16".into()]),
+        )?;
+        Ok(())
+    }
+
+    async fn forward_graph_batch(
+        &self,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        policy: &Arc<dyn SchedulingPolicy>,
+        packed_token_ids: Arc<Vec<i32>>,
+        query_ranges: &[Range<usize>],
+        rows: usize,
+        graphs: &Arc<GraphPool>,
+    ) -> Result<Vec<f32>, ModelError> {
+        let stream = policy.next_stream()?;
+        let exec = ExecutionContext::new(stream);
+        let mut appends: Vec<_> = batch
+            .iter_mut()
+            .map(|input| {
+                let count = input.token_ids.len() - input.kv.ready_len();
+                (&mut *input.kv, count)
+            })
+            .collect();
+        let mapping = KVContext::reserve_append_batch(&mut appends, &exec)?;
+        // SAFETY: state leases stay on this outer exec throughout build and replay.
+        let prepared = unsafe {
+            self.prepare_batch(batch, packed_token_ids, query_ranges, rows, &mapping, &exec)?
+        };
+        let key = GraphKey {
+            device: exec.get_device_id(),
+            rows,
+            mapping_words: prepared.mapping_words,
+            payload_words: prepared.payload.len(),
+            cache: [
+                Arc::as_ptr(&prepared.cache.k) as usize,
+                Arc::as_ptr(&prepared.cache.v) as usize,
+                Arc::as_ptr(&prepared.cache.table) as usize,
+            ],
+            weights: std::array::from_fn(|i| Arc::as_ptr(&self.layers[i]) as usize),
+        };
+        // Capture cannot run inside DeviceFuture::execute's execution lock. Build
+        // a missing instance here on a dedicated stream, before scheduling replay.
+        let lease = graphs.acquire(key.clone(), || {
+            let capture_stream = exec
+                .device()
+                .new_stream()
+                .map_err(cuda_async::error::DeviceError::from)?;
+            let input =
+                Arc::new(api::copy_host_vec_to_device(&prepared.payload).sync_on(&capture_stream)?);
+            let mut buffers = graph::allocate(rows, &capture_stream)?;
+            // Warm JIT/modules outside capture using this batch's valid payload.
+            // All kernels overwrite outputs; repeating current-append KV writes
+            // does not advance ready_len or change the mathematical result.
+            with_context(|warm| {
+                value(unsafe {
+                    self.submit_compute(
+                        &mapping,
+                        &prepared,
+                        &input,
+                        &mut buffers,
+                        &ComputeRecorder::Eager(warm),
+                    )
+                })
+            })
+            .sync_on(&capture_stream)??;
+            let graph = cuda_async::cuda_graph::CudaGraph::scope(&capture_stream, |scope| {
+                // SAFETY: the instance exclusively owns these buffers. Scope only
+                // records GraphNode operations; no GPU computation runs in capture.
+                unsafe {
+                    self.submit_compute(
+                        &mapping,
+                        &prepared,
+                        &input,
+                        &mut buffers,
+                        &ComputeRecorder::Capture(scope),
+                    )
+                }
+                .map_err(|error| cuda_async::error::DeviceError::Internal(error.to_string()))
+            })?;
+            Ok(GraphInstance {
+                key,
+                input,
+                buffers,
+                graph,
+            })
+        })?;
+        let operation = with_context(|run| {
+            let _range = crate::profiling::ScopedRange::new(c"submit_batch");
+            // SAFETY: this checkout is exclusive; the outer exec establishes completion.
+            value(unsafe { lease.execute(prepared.payload.clone(), run) })
+        });
+        let output = cuda_async::device_future::DeviceFuture::scheduled(operation, exec).await??;
+        for input in batch {
+            input.kv.commit_append()?;
+        }
+        Ok(output)
     }
 }
 
@@ -947,6 +1144,157 @@ mod kernels {
 mod tests {
     use super::*;
     use crate::runner::kv_pool::{KVPool, NaiveKVPoolConfig};
+
+    #[tokio::test]
+    async fn graph_replays_new_inputs_without_retaining_stateless_kv() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = SimpleMLPEngine::random(0).await?.with_cuda_graphs();
+        let policy = model.weight_policy.clone();
+        let pool = pool(&policy).await?;
+        let initial = pool.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        for tokens in [[1, 2, 3], [4, 5, 6], [9, 8, 7]] {
+            let mut kv = KVContext::new(pool.clone())?;
+            close(
+                model.forward(&tokens, &mut kv, policy.clone()).await?,
+                cpu_reference(&tokens, &weights, model.config.input_divisor),
+            );
+            kv.release();
+            assert_eq!(
+                pool.metrics(),
+                initial,
+                "graph retained a request state lease"
+            );
+        }
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (1, 3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_cache_handles_history_padding_pool_and_weight_changes() -> Result<(), ModelError>
+    {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let mut model = SimpleMLPEngine::random(0).await?.with_cuda_graphs();
+        let policy = model.weight_policy.clone();
+        let pool_a = pool(&policy).await?;
+        let initial = pool_a.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        let mut contexts = [
+            KVContext::new(pool_a.clone())?,
+            KVContext::new(pool_a.clone())?,
+        ];
+        for histories in [
+            [vec![1, 2], vec![7, 8]],
+            [vec![1, 2, 3], vec![7, 8, 9]],
+            [vec![1, 2, 3, 4], vec![7, 8, 9, 10]],
+        ] {
+            let inputs = contexts
+                .iter_mut()
+                .zip(&histories)
+                .map(|(kv, tokens)| ModelInput {
+                    kv,
+                    token_ids: tokens,
+                })
+                .collect();
+            let outputs = model.forward_batch(inputs, policy.clone()).await?;
+            for (index, tokens) in histories.iter().enumerate() {
+                close(
+                    outputs[index],
+                    cpu_reference(tokens, &weights, model.config.input_divisor),
+                );
+                assert_eq!(contexts[index].ready_len(), tokens.len());
+            }
+        }
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (2, 3));
+        drop(contexts);
+        assert_eq!(pool_a.metrics(), initial);
+        let pool_b = pool(&policy).await?;
+        let b_initial = pool_b.metrics();
+        let mut kv = KVContext::new(pool_b.clone())?;
+        close(
+            model
+                .forward(&[5, 4, 3, 2], &mut kv, policy.clone())
+                .await?,
+            cpu_reference(&[5, 4, 3, 2], &weights, model.config.input_divisor),
+        );
+        kv.release();
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (3, 4));
+        model.layers[0] = Arc::new(api::zeros::<f32>(&[16, 16]).schedule(&policy)?.await?);
+        let mut kv = KVContext::new(pool_b.clone())?;
+        close(
+            model
+                .forward(&[5, 4, 3, 2], &mut kv, policy.clone())
+                .await?,
+            0.0,
+        );
+        kv.release();
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (4, 5));
+        let original = model.layers[3].clone();
+        model.layers[3] = Arc::new(api::zeros::<f32>(&[1, 1]).schedule(&policy)?.await?);
+        let mut kv = KVContext::new(pool_b.clone())?;
+        assert!(model
+            .forward(&[5, 4, 3, 2], &mut kv, policy.clone())
+            .await
+            .is_err());
+        assert_eq!(kv.ready_len(), 0);
+        assert!(kv.is_pending());
+        kv.release();
+        assert_eq!(pool_b.metrics(), b_initial);
+        model.layers[3] = original;
+        let mut kv = KVContext::new(pool_b.clone())?;
+        close(model.forward(&[5, 4, 3, 2], &mut kv, policy).await?, 0.0);
+        kv.release();
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (4, 6));
+        assert_eq!(pool_b.metrics(), b_initial);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_concurrent_requests_keep_scratch_and_kv_isolated() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = Arc::new(SimpleMLPEngine::random(0).await?.with_cuda_graphs());
+        let policy = model.weight_policy.clone();
+        let pool = pool(&policy).await?;
+        let initial = pool.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        for _ in 0..4 {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut tasks = Vec::new();
+            for tokens in [vec![1, 2, 3], vec![8, 7, 6]] {
+                let model = model.clone();
+                let policy = policy.clone();
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut kv = KVContext::new(pool)?;
+                    barrier.wait().await;
+                    let output = model.forward(&tokens, &mut kv, policy).await?;
+                    Ok::<_, ModelError>((tokens, output))
+                }));
+            }
+            for task in tasks {
+                let (tokens, output) = task.await.unwrap()?;
+                close(
+                    output,
+                    cpu_reference(&tokens, &weights, model.config.input_divisor),
+                );
+            }
+            assert_eq!(pool.metrics(), initial);
+        }
+        let (captures, replays) = model.graphs.as_ref().unwrap().stats();
+        assert!(captures <= 2);
+        assert_eq!(replays, 8);
+        Ok(())
+    }
 
     fn close(actual: f32, expected: f32) {
         assert!(actual.is_finite() && expected.is_finite());

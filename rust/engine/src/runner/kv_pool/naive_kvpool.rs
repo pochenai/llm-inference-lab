@@ -5,7 +5,7 @@ use std::{
 
 use cuda_async::{
     device_buffer::DevicePointer,
-    device_operation::{DeviceOp, ExecutionContext},
+    device_operation::{DeviceOp, ExecutionContext, GraphNode},
     scheduling_policies::SchedulingPolicy,
 };
 use cutile::{
@@ -84,8 +84,10 @@ impl NaiveMappingPlan {
         &self.updates
     }
 
-    /// Submit on the same still-active exec that reserved the slots. The payload
-    /// must be uploaded unchanged at offset; dependent K/V work uses this exec too.
+    /// The payload must be uploaded unchanged at offset. Retain matching state
+    /// leases until execution completes, and order bind before dependent K/V work.
+    /// Capture records only backing buffers; every replay must retain its own
+    /// request's reservations on the outer execution context.
     pub(in crate::runner) unsafe fn submit(
         &self,
         upload: &Arc<Tensor<i32>>,
@@ -111,11 +113,26 @@ impl NaiveMappingPlan {
         let flat = upload.slice(&[offset..end])?;
         let updates = flat.view(&[2, count])?;
         exec.retain(self.table.clone())?;
-        kernels::bind_batch(self.table.device_pointer(), &updates)
-            .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
-            .grid((count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
-            .execute(exec)?;
+        self.bind_op(&updates)?.execute(exec)?;
         Ok(())
+    }
+
+    /// Construct bind without submitting it, for eager execution or scope recording.
+    /// The caller retains the table and matching reservations until GPU completion;
+    /// updates must contain the unchanged payload returned by this plan.
+    pub(crate) unsafe fn bind_op<'a>(
+        &'a self,
+        updates: &'a TensorView<'_, i32>,
+    ) -> Result<impl GraphNode + 'a> {
+        let count = self.updates.len() / 2;
+        if count == 0 || updates.shape() != [2, count as i32] {
+            return Err(KVPoolError::InvalidInput(
+                "bind needs a nonempty [2, mapping_count] payload".into(),
+            ));
+        }
+        Ok(kernels::bind_batch(self.table.device_pointer(), updates)
+            .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
+            .grid((count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1)))
     }
 }
 
