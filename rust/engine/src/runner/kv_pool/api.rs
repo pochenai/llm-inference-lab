@@ -45,6 +45,20 @@ pub trait KVPool: Sized + Send + Sync {
         positions: Range<usize>,
         exec: &ExecutionContext,
     ) -> Result<()>;
+
+    /// Reserve and enqueue mappings for a batch from this pool, on the same exec.
+    /// Backends may combine uploads/launches; the default preserves per-context behavior.
+    /// A failure may leave reservations pending; callers must release affected contexts.
+    fn prepare_append_batch(
+        &self,
+        appends: &mut [(&mut Self::ContextState, Range<usize>)],
+        exec: &ExecutionContext,
+    ) -> Result<()> {
+        for (state, positions) in appends {
+            self.prepare_append(state, positions.clone(), exec)?;
+        }
+        Ok(())
+    }
     /// View a logical token range using only backend state. The range may include
     /// pending K/V writes; reads must follow those writes on the same exec.
     /// During append forward, read_range covers history plus the current queries' K/V;
@@ -165,6 +179,54 @@ impl<P: KVPool> KVContext<P> {
         self.pool
             .prepare_append(self.state.as_mut().unwrap(), positions, exec)?;
         self.allocated_len = end;
+        Ok(())
+    }
+
+    /// Prepare a batch from one pool without advancing ready_len or waiting for GPU work.
+    /// Validate logical inputs first, then mark all contexts pending before backend
+    /// reservation/submission. On backend failure, release every affected context.
+    pub fn prepare_append_batch(
+        appends: &mut [(&mut Self, usize)],
+        exec: &ExecutionContext,
+    ) -> ContextResult<()> {
+        let _range = crate::profiling::ScopedRange::new(c"prepare_append_batch");
+        let Some((first, _)) = appends.first() else {
+            return Ok(());
+        };
+        let pool = first.pool.clone();
+        for (context, count) in appends.iter() {
+            if !Arc::ptr_eq(&pool, &context.pool) {
+                return Err(KVContextError::InvalidState(
+                    "append batch must use one KV pool".into(),
+                ));
+            }
+            if context.pending.is_some() || *count == 0 {
+                return Err(KVContextError::InvalidState(
+                    "append must be nonempty and context idle".into(),
+                ));
+            }
+            context
+                .ready_len
+                .checked_add(*count)
+                .filter(|&end| end <= pool.max_seq_len())
+                .ok_or(KVContextError::CapacityExceeded)?;
+        }
+        for (context, count) in appends.iter_mut() {
+            context.pending = Some(context.ready_len..context.ready_len + *count);
+        }
+        let mut states: Vec<_> = appends
+            .iter_mut()
+            .map(|(context, _)| {
+                (
+                    context.state.as_mut().unwrap(),
+                    context.pending.clone().unwrap(),
+                )
+            })
+            .collect();
+        pool.prepare_append_batch(&mut states, exec)?;
+        for (context, _) in appends {
+            context.allocated_len = context.pending.as_ref().unwrap().end;
+        }
         Ok(())
     }
 

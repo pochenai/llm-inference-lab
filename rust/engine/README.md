@@ -139,8 +139,10 @@ include Scheduler's 100ms collection window; the default fills its dispatch limi
 Profiler start/stop excludes weight/pool initialization, JIT, and warmup. CUDA
 tracing selects hardware trace where supported; GPU metrics sample device 0.
 Profiling can perturb timings, so compare wall times without the profiler.
-NVTX ranges label the synchronous `prepare_append`, `submit_batch`, and
-`commit_append` calls. Prepare/commit occur per request; submit occurs per batch.
+NVTX ranges label the synchronous `prepare_append_batch`, `submit_batch`, and
+`commit_append` calls. Prepare/submit occur per batch; commit occurs per request.
+The Naive pool uploads one packed mapping update and launches one `bind_batch`
+kernel per batch; the single-context prepare API remains available.
 These ranges measure CPU work and submission, not GPU completion or the outer await.
 
 The initial [results and commands](../profiling/simple_mlp_attn/RESULTS.md) include

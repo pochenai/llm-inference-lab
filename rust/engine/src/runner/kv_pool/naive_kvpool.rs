@@ -10,7 +10,7 @@ use cuda_async::{
 };
 use cutile::{
     api,
-    tensor::{Tensor, TensorView},
+    tensor::{Reshape, Tensor, TensorView},
     tile_kernel::TileKernel,
 };
 
@@ -285,6 +285,46 @@ impl NaiveKVPool {
         })
     }
 
+    /// Reserve physical slots on CPU, retaining the lease before any GPU submission.
+    fn reserve_append(
+        &self,
+        state: &mut NaiveContextState,
+        positions: Range<usize>,
+        exec: &ExecutionContext,
+    ) -> Result<Vec<i32>> {
+        self.validate_state(state)?;
+        if exec.get_device_id() != self.slot_table.device_id() {
+            return Err(KVPoolError::InvalidInput(
+                "KV pool and execution device differ".into(),
+            ));
+        }
+        let mut slots = state.lease.slots.lock().unwrap();
+        if positions.start != slots.len()
+            || positions.end > self.max_seq_len()
+            || positions.is_empty()
+        {
+            return Err(KVPoolError::InvalidInput(
+                "KV append range does not match allocation".into(),
+            ));
+        }
+        exec.retain(state.lease.clone())?;
+        let new_slots = {
+            let mut allocation = self.allocation.lock().unwrap();
+            if positions.len() > allocation.free_slots.len() {
+                return Err(KVPoolError::CapacityExhausted(
+                    "KV pool has no free token slots".into(),
+                ));
+            }
+            let start = allocation.free_slots.len() - positions.len();
+            let reserved = allocation.free_slots.split_off(start);
+            allocation.bound_positions += reserved.len();
+            reserved
+        };
+        slots.extend_from_slice(&new_slots);
+        drop(slots);
+        Ok(new_slots)
+    }
+
     fn validate_state(&self, state: &NaiveContextState) -> Result<()> {
         if !Arc::ptr_eq(&self.allocation, &state.lease.allocation) {
             return Err(KVPoolError::InvalidInput(
@@ -340,36 +380,7 @@ impl KVPool for NaiveKVPool {
         positions: Range<usize>,
         exec: &ExecutionContext,
     ) -> Result<()> {
-        self.validate_state(state)?;
-        if exec.get_device_id() != self.slot_table.device_id() {
-            return Err(KVPoolError::InvalidInput(
-                "KV pool and execution device differ".into(),
-            ));
-        }
-        let mut slots = state.lease.slots.lock().unwrap();
-        if positions.start != slots.len()
-            || positions.end > self.max_seq_len()
-            || positions.is_empty()
-        {
-            return Err(KVPoolError::InvalidInput(
-                "KV append range does not match allocation".into(),
-            ));
-        }
-        exec.retain(state.lease.clone())?;
-        let new_slots = {
-            let mut allocation = self.allocation.lock().unwrap();
-            if positions.len() > allocation.free_slots.len() {
-                return Err(KVPoolError::CapacityExhausted(
-                    "KV pool has no free token slots".into(),
-                ));
-            }
-            let start = allocation.free_slots.len() - positions.len();
-            let reserved = allocation.free_slots.split_off(start);
-            allocation.bound_positions += reserved.len();
-            reserved
-        };
-        slots.extend_from_slice(&new_slots);
-        drop(slots);
+        let new_slots = self.reserve_append(state, positions.clone(), exec)?;
         // SAFETY: exec owns the submission; its caller establishes completion.
         unsafe {
             let indices = api::copy_host_vec_to_device(&Arc::new(new_slots)).execute(exec)?;
@@ -393,6 +404,41 @@ impl KVPool for NaiveKVPool {
             .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
             .grid((positions.len().div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
             .execute(exec)?;
+        }
+        Ok(())
+    }
+
+    /// Upload all [destination offsets; slot IDs] together and scatter in one launch.
+    fn prepare_append_batch(
+        &self,
+        appends: &mut [(&mut Self::ContextState, Range<usize>)],
+        exec: &ExecutionContext,
+    ) -> Result<()> {
+        if appends.is_empty() {
+            return Ok(());
+        }
+        let mut offsets = Vec::new();
+        let mut slot_ids = Vec::new();
+        for (state, positions) in appends {
+            let slots = self.reserve_append(state, positions.clone(), exec)?;
+            let base = state.lease.row * self.config.max_seq_len;
+            offsets.extend(positions.clone().map(|position| (base + position) as i32));
+            slot_ids.extend(slots);
+        }
+        let count = slot_ids.len();
+        // Shape [2, count]: first row is table offsets, second row is slot IDs.
+        offsets.extend(slot_ids);
+        // SAFETY: exec retains all state leases and the table until completion.
+        // Later model work uses this same exec, so it observes the mapping updates.
+        unsafe {
+            let updates = api::copy_host_vec_to_device(&Arc::new(offsets))
+                .execute(exec)?
+                .reshape(&[2, count])?;
+            exec.retain(self.slot_table.clone())?;
+            kernels::bind_batch(self.slot_table.device_pointer(), updates)
+                .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
+                .grid((count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
+                .execute(exec)?;
         }
         Ok(())
     }
@@ -537,6 +583,36 @@ mod kernels {
         }
     }
 
+    /// Scatter all contexts' mapping updates; mask the final partial tile.
+    #[cutile::entry()]
+    pub(super) unsafe fn bind_batch<const B: i32>(
+        table_ptr: *mut i32,
+        updates: &Tensor<i32, { [-1, -1] }>,
+    ) {
+        let pid = program_id(0);
+        let local: Tile<i32, { [B] }> = iota(shape![B]);
+        let indices = local + (pid * B).broadcast(shape![B]);
+        let valid = lt_tile(indices, updates.shape()[1].broadcast(shape![B]));
+        let parts = updates.partition(shape![1, B]);
+        let offsets = parts.load([0, pid]).reshape(shape![B]);
+        let slots = parts.load([1, pid]).reshape(shape![B]);
+        let pointer: PointerTile<*mut i32, { [] }> = pointer_to_tile(table_ptr);
+        let pointer: PointerTile<*mut i32, { [1] }> = pointer.reshape(shape![1]);
+        let pointer: PointerTile<*mut i32, { [B] }> = pointer.broadcast(shape![B]);
+        let destinations = pointer.offset_tile(offsets);
+        unsafe {
+            store_ptr_tko(
+                destinations,
+                slots,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid),
+                None,
+                Latency::<1>,
+            );
+        }
+    }
+
     /// Scatter [B, D] K/V tiles: each program handles B tokens, masking tail rows.
     /// slot_table maps logical positions to potentially noncontiguous physical slots,
     /// so each tile element writes through its computed pointer instead of a contiguous slice.
@@ -628,6 +704,107 @@ mod tests {
         device_operation::{value, with_context},
     };
     use cutile::tensor::{Reshape, ToHostVec};
+
+    /// Batch mappings cover multiple rows, nonzero append starts, and partial tiles.
+    #[tokio::test]
+    async fn batch_mapping_preserves_prefixes_and_masks_tails() -> Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_slots: 512,
+                max_rows: 3,
+                max_seq_len: 256,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut contexts = (0..3)
+            .map(|_| KVContext::new(pool.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut ready = [0; 3];
+        let mut expected = vec![0i32; 3 * 256];
+        for counts in [[129, 1, 7], [3, 128, 2]] {
+            let table = with_context(|exec| {
+                value((|| -> Result<_> {
+                    let mut appends: Vec<_> = contexts.iter_mut().zip(counts).collect();
+                    KVContext::prepare_append_batch(&mut appends, exec)?;
+                    for (i, context) in contexts.iter().enumerate() {
+                        assert_eq!(context.ready_len(), ready[i]);
+                        assert_eq!(context.allocated_len(), ready[i] + counts[i]);
+                        let state = context.state();
+                        let slots = state.lease.slots.lock().unwrap();
+                        let base = state.lease.row * 256;
+                        expected[base..base + slots.len()].copy_from_slice(&slots);
+                    }
+                    // SAFETY: the outer future completes before CPU inspection.
+                    unsafe { Ok(pool.slot_table.clone().to_host_vec().execute(exec)?) }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            assert_eq!(table, expected);
+            for (i, context) in contexts.iter_mut().enumerate() {
+                context.commit_append()?;
+                ready[i] += counts[i];
+                assert_eq!(context.ready_len(), ready[i]);
+            }
+        }
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    /// Reject logical errors before mutation; partial backend OOM remains releasable.
+    #[tokio::test]
+    async fn batch_mapping_failure_preserves_progress_and_releases_slots() -> Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_slots: 3,
+                max_rows: 2,
+                max_seq_len: 4,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        with_context(|exec| {
+            value((|| -> Result<()> {
+                assert!(
+                    KVContext::prepare_append_batch(&mut [(&mut a, 1), (&mut b, 0)], exec).is_err()
+                );
+                assert!(!a.is_pending());
+                assert!(!b.is_pending());
+                assert!(matches!(
+                    KVContext::prepare_append_batch(&mut [(&mut a, 2), (&mut b, 2)], exec),
+                    Err(KVContextError::Pool(KVPoolError::CapacityExhausted(_)))
+                ));
+                assert!(a.is_pending() && b.is_pending());
+                assert_eq!(a.ready_len(), 0);
+                assert_eq!(b.ready_len(), 0);
+                assert_eq!(a.allocated_len(), 0);
+                assert_eq!(b.allocated_len(), 0);
+                // The partially reserved slots stay leased until outer completion.
+                a.release();
+                b.release();
+                assert_eq!(pool.metrics().layers.assigned_bytes, 2 * 2 * 4 * 4);
+                Ok(())
+            })())
+        })
+        .schedule(&policy)?
+        .await??;
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
 
     /// Explicit store/readback checks the physical scatter and GPU logical mapping.
     #[tokio::test]

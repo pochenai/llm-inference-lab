@@ -54,7 +54,7 @@ pub trait Model<P: KVPool>: Send + Sync {
         (packed_token_ids, query_ranges)
     }
 
-    /// Reserve each uncached suffix and enqueue mappings before calling submit on the
+    /// Reserve a same-pool batch of uncached suffixes and enqueue mappings before submit on the
     /// same exec. The callback must submit every KV cache update required by this
     /// forward; caller should ensure every layer call this function.
     /// The framework does not inspect network topology or verify cache coverage.
@@ -68,10 +68,14 @@ pub trait Model<P: KVPool>: Send + Sync {
         async move {
             let output = with_context(|exec| {
                 value((|| {
-                    for input in batch.iter_mut() {
-                        let count = input.token_ids.len() - input.kv.ready_len();
-                        input.kv.prepare_append(count, exec)?;
-                    }
+                    let mut appends: Vec<_> = batch
+                        .iter_mut()
+                        .map(|input| {
+                            let count = input.token_ids.len() - input.kv.ready_len();
+                            (&mut *input.kv, count)
+                        })
+                        .collect();
+                    KVContext::prepare_append_batch(&mut appends, exec)?;
                     submit(batch, exec)
                 })())
             })
