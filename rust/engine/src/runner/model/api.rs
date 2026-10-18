@@ -96,10 +96,22 @@ pub trait Model<P: KVPool>: Send + Sync {
 /// Compile-time pairing of an attention implementation and its supported pool layout.
 pub trait AttentionBackend<P: KVPool> {
     /// Submit on exec; callers establish completion before consuming the tensor.
+    /// Write views must be consumed or dropped before creating attention read views.
+    ///
+    /// ```compile_fail,E0308
+    /// use engine::runner::{model::AttentionBackend, kv_pool::{NaiveKVPool, NaiveWriteView}};
+    /// use cuda_async::device_operation::ExecutionContext;
+    /// use cutile::tensor::Tensor;
+    /// use std::sync::Arc;
+    /// fn invalid_attention(backend: &impl AttentionBackend<NaiveKVPool>,
+    ///     q: Arc<Tensor<f32>>, dst: NaiveWriteView<'_>, exec: &ExecutionContext) {
+    ///     backend.forward(q, &[dst], &[0..1], exec).unwrap();
+    /// }
+    /// ```
     fn forward(
         &self,
         q: Arc<Tensor<f32>>,
-        kv: &[P::LayerView<'_>],
+        kv: &[P::ReadView<'_>],
         query_ranges: &[Range<usize>],
         exec: &ExecutionContext,
     ) -> Result<Arc<Tensor<f32>>, ModelError>;

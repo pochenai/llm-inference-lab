@@ -4,6 +4,7 @@ use std::{
 };
 
 use cuda_async::{
+    device_buffer::DevicePointer,
     device_operation::{DeviceOp, ExecutionContext},
     scheduling_policies::SchedulingPolicy,
 };
@@ -96,22 +97,100 @@ pub struct NaiveContextState {
     lease: Arc<StateLease>,
 }
 
-pub struct NaiveLayerView<'a> {
-    pub(crate) k: &'a Arc<Tensor<f32>>,
-    pub(crate) v: &'a Arc<Tensor<f32>>,
-    pub(crate) slot_table: &'a Arc<Tensor<i32>>,
-    pub(crate) row: usize,
-    /// Logical KV positions covering history plus the current queries' K/V during
-    /// append forward; the attention backend further restricts reads per query.
-    pub(crate) read_range: Range<usize>,
+struct LayerStorage<'a> {
+    k: &'a Arc<Tensor<f32>>,
+    v: &'a Arc<Tensor<f32>>,
+    slot_table: &'a Arc<Tensor<i32>>,
+    row: usize,
+    positions: Range<usize>,
     lease: Arc<StateLease>,
 }
 
-impl NaiveLayerView<'_> {
-    /// Protect logical allocation ownership before attention submits a read.
-    pub(crate) fn retain(&self, exec: &ExecutionContext) -> Result<()> {
+impl LayerStorage<'_> {
+    fn retain(&self, exec: &ExecutionContext) -> Result<()> {
         exec.retain(self.lease.clone())?;
+        exec.retain(self.k.clone())?;
+        exec.retain(self.v.clone())?;
+        exec.retain(self.slot_table.clone())?;
         Ok(())
+    }
+}
+
+/// Read-only addressing. Safe accessors expose const pointers, never writable buffers.
+pub struct NaiveReadView<'a> {
+    inner: LayerStorage<'a>,
+}
+
+/// Writable addressing for reserved positions, borrowed exclusively from context state.
+/// Construction retains GPU resources on exec; this is not proof of GPU completion.
+pub struct NaiveWriteView<'a> {
+    inner: LayerStorage<'a>,
+    exec: &'a ExecutionContext,
+}
+
+impl NaiveReadView<'_> {
+    pub fn k_ptr(&self) -> *const f32 {
+        self.inner.k.device_pointer().cu_deviceptr() as *const f32
+    }
+    pub fn v_ptr(&self) -> *const f32 {
+        self.inner.v.device_pointer().cu_deviceptr() as *const f32
+    }
+    pub fn slot_table_ptr(&self) -> *const i32 {
+        self.inner.slot_table.device_pointer().cu_deviceptr() as *const i32
+    }
+    pub fn row(&self) -> usize {
+        self.inner.row
+    }
+    pub fn positions(&self) -> &Range<usize> {
+        &self.inner.positions
+    }
+    pub fn head_dim(&self) -> usize {
+        self.inner.k.shape()[1] as usize
+    }
+    pub fn table_width(&self) -> usize {
+        self.inner.slot_table.shape()[1] as usize
+    }
+    /// Retain buffers and allocation ownership before submitting any GPU reads.
+    pub fn retain(&self, exec: &ExecutionContext) -> Result<()> {
+        self.inner.retain(exec)
+    }
+    /// Internal bridge for tensor-based kernels; safe callers only receive const pointers.
+    ///
+    /// # Safety
+    /// Use these handles only for reads within positions and retain the view in exec
+    /// before submission. Do not use Tensor's mutable device pointers to write storage.
+    pub(crate) unsafe fn tensors(
+        &self,
+    ) -> (&Arc<Tensor<f32>>, &Arc<Tensor<f32>>, &Arc<Tensor<i32>>) {
+        (self.inner.k, self.inner.v, self.inner.slot_table)
+    }
+}
+
+impl NaiveWriteView<'_> {
+    pub fn k_mut_ptr(&self) -> DevicePointer<f32> {
+        self.inner.k.device_pointer()
+    }
+    pub fn v_mut_ptr(&self) -> DevicePointer<f32> {
+        self.inner.v.device_pointer()
+    }
+    pub fn slot_table_ptr(&self) -> *const i32 {
+        self.inner.slot_table.device_pointer().cu_deviceptr() as *const i32
+    }
+    pub fn row(&self) -> usize {
+        self.inner.row
+    }
+    pub fn positions(&self) -> &Range<usize> {
+        &self.inner.positions
+    }
+    pub fn head_dim(&self) -> usize {
+        self.inner.k.shape()[1] as usize
+    }
+    pub fn table_width(&self) -> usize {
+        self.inner.slot_table.shape()[1] as usize
+    }
+    /// Submit fused writes on the same context that retains these destinations.
+    pub fn execution_context(&self) -> &ExecutionContext {
+        self.exec
     }
 }
 
@@ -178,6 +257,34 @@ impl NaiveKVPool {
         self.config
     }
 
+    fn layer_storage<'a>(
+        &'a self,
+        state: &'a NaiveContextState,
+        layer: usize,
+        positions: Range<usize>,
+    ) -> Result<LayerStorage<'a>> {
+        self.validate_state(state)?;
+        if positions.start > positions.end
+            || positions.end > state.lease.slots.lock().unwrap().len()
+        {
+            return Err(KVPoolError::InvalidInput(
+                "KV view range exceeds mapped tokens".into(),
+            ));
+        }
+        let (k, v) = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| KVPoolError::InvalidInput("invalid KV layer".into()))?;
+        Ok(LayerStorage {
+            k,
+            v,
+            slot_table: &self.slot_table,
+            row: state.lease.row,
+            positions,
+            lease: state.lease.clone(),
+        })
+    }
+
     fn validate_state(&self, state: &NaiveContextState) -> Result<()> {
         if !Arc::ptr_eq(&self.allocation, &state.lease.allocation) {
             return Err(KVPoolError::InvalidInput(
@@ -190,7 +297,8 @@ impl NaiveKVPool {
 
 impl KVPool for NaiveKVPool {
     type ContextState = NaiveContextState;
-    type LayerView<'a> = NaiveLayerView<'a>;
+    type ReadView<'a> = NaiveReadView<'a>;
+    type WriteView<'a> = NaiveWriteView<'a>;
 
     fn max_seq_len(&self) -> usize {
         self.config.max_seq_len
@@ -289,32 +397,32 @@ impl KVPool for NaiveKVPool {
         Ok(())
     }
 
-    fn layer_view<'a>(
+    fn read_view<'a>(
         &'a self,
         state: &'a Self::ContextState,
         layer: usize,
-        read_range: Range<usize>,
-    ) -> Result<Self::LayerView<'a>> {
-        self.validate_state(state)?;
-        if read_range.start > read_range.end
-            || read_range.end > state.lease.slots.lock().unwrap().len()
-        {
+        positions: Range<usize>,
+    ) -> Result<Self::ReadView<'a>> {
+        Ok(NaiveReadView {
+            inner: self.layer_storage(state, layer, positions)?,
+        })
+    }
+
+    fn write_view<'a>(
+        &'a self,
+        state: &'a mut Self::ContextState,
+        layer: usize,
+        positions: Range<usize>,
+        exec: &'a ExecutionContext,
+    ) -> Result<Self::WriteView<'a>> {
+        let inner = self.layer_storage(state, layer, positions)?;
+        if inner.positions.is_empty() || exec.get_device_id() != inner.k.device_id() {
             return Err(KVPoolError::InvalidInput(
-                "KV read range exceeds mapped tokens".into(),
+                "invalid KV write range or device".into(),
             ));
         }
-        let (k, v) = self
-            .layers
-            .get(layer)
-            .ok_or_else(|| KVPoolError::InvalidInput("invalid KV layer".into()))?;
-        Ok(NaiveLayerView {
-            k,
-            v,
-            slot_table: &self.slot_table,
-            row: state.lease.row,
-            read_range,
-            lease: state.lease.clone(),
-        })
+        inner.retain(exec)?;
+        Ok(NaiveWriteView { inner, exec })
     }
 
     /// Enqueue K/V scatter writes through slot_table on exec, without waiting.
@@ -323,52 +431,41 @@ impl KVPool for NaiveKVPool {
     /// Each [B, head_dim] tile handles up to B tokens (B=8); the last tile is masked.
     fn store(
         &self,
-        state: &Self::ContextState,
-        layer: usize,
-        positions: Range<usize>,
+        dst: Self::WriteView<'_>,
         k: TensorView<'_, f32>,
         v: TensorView<'_, f32>,
-        exec: &ExecutionContext,
     ) -> Result<()> {
-        self.validate_state(state)?;
-        let (cache_k, cache_v) = self
-            .layers
-            .get(layer)
-            .ok_or_else(|| KVPoolError::InvalidInput("invalid KV layer".into()))?;
         let width = self.config.head_dim;
-        if positions.is_empty()
-            || exec.get_device_id() != cache_k.device_id()
+        if !Arc::ptr_eq(dst.inner.slot_table, &self.slot_table)
             || k.shape() != v.shape()
             || k.shape().len() != 2
-            || k.shape()[0] < positions.len() as i32
+            || k.shape()[0] < dst.positions().len() as i32
             || k.shape()[1] != width as i32
-            || positions.end > state.lease.slots.lock().unwrap().len()
         {
             return Err(KVPoolError::InvalidInput(
-                "invalid KV store shape or range".into(),
+                "invalid KV store pool or shape".into(),
             ));
         }
-        exec.retain(state.lease.clone())?;
-        // SAFETY: reserved slots are unique to this state; mapping updates precede this
-        // scatter on exec's stream. Raw output buffers are retained explicitly;
-        // generated launchers retain input tensor storage. Raw argument names differ
-        // from input names to avoid collisions with generated <name>_ptr bindings.
+        // SAFETY: the view validates mapped bounds and retains storage/leases on exec.
+        // Reserved slots are unique to this state; mapping updates precede the scatter.
         unsafe {
-            exec.retain(cache_k.clone())?;
-            exec.retain(cache_v.clone())?;
             kernels::store(
-                cache_k.device_pointer(),
-                cache_v.device_pointer(),
-                self.slot_table.clone(),
+                dst.k_mut_ptr(),
+                dst.v_mut_ptr(),
+                dst.inner.slot_table.clone(),
                 &k,
                 &v,
-                state.lease.row as i32,
-                positions.start as i32,
-                positions.len() as i32,
+                dst.row() as i32,
+                dst.positions().start as i32,
+                dst.positions().len() as i32,
             )
             .generics(vec![STORE_TOKENS_PER_TILE.to_string(), width.to_string()])
-            .grid((positions.len().div_ceil(STORE_TOKENS_PER_TILE) as u32, 1, 1))
-            .execute(exec)?;
+            .grid((
+                dst.positions().len().div_ceil(STORE_TOKENS_PER_TILE) as u32,
+                1,
+                1,
+            ))
+            .execute(dst.exec)?;
         }
         Ok(())
     }
@@ -578,13 +675,13 @@ mod tests {
                 assert_eq!(kv.allocated_len(), 2);
                 assert!(kv.prepare_append(1, exec).is_err());
                 kv.store(0, k.view(&[2, 4])?, v.view(&[2, 4])?, exec)?;
-                let view = kv.layer_view(0)?;
+                let view = kv.read_view(0)?;
                 // SAFETY: the outer future is awaited before host access.
                 unsafe {
                     Ok((
-                        view.slot_table.clone().to_host_vec().execute(exec)?,
-                        view.k.clone().to_host_vec().execute(exec)?,
-                        view.v.clone().to_host_vec().execute(exec)?,
+                        view.inner.slot_table.clone().to_host_vec().execute(exec)?,
+                        view.inner.k.clone().to_host_vec().execute(exec)?,
+                        view.inner.v.clone().to_host_vec().execute(exec)?,
                     ))
                 }
             })())
@@ -661,10 +758,18 @@ mod tests {
             }
             with_context(|exec| {
                 value((|| -> Result<()> {
+                    assert!(matches!(
+                        kv.write_view(0, exec),
+                        Err(KVContextError::InvalidState(_))
+                    ));
                     kv.prepare_append(count, exec)?;
                     for (layer, (k, v)) in inputs.iter().enumerate() {
-                        kv.store(layer, k.slice(&[0..count])?, v.slice(&[0..count])?, exec)?;
+                        let dst = kv.write_view(layer, exec)?;
+                        assert_eq!(dst.positions(), &(total..total + count));
+                        pool.store(dst, k.slice(&[0..count])?, v.slice(&[0..count])?)?;
                     }
+                    assert_eq!(kv.read_view(0)?.positions(), &(0..total + count));
+                    assert_eq!(kv.ready_len(), total);
                     Ok(())
                 })())
             })
@@ -674,16 +779,29 @@ mod tests {
             total += count;
         }
         for layer in 0..2 {
-            let view = kv.layer_view(layer)?;
-            assert_eq!(view.read_range, 0..total);
+            let view = kv.read_view(layer)?;
+            assert_eq!(view.positions().clone(), 0..total);
             let indices = view
+                .inner
                 .slot_table
                 .clone()
                 .to_host_vec()
                 .schedule(&policy)?
                 .await?;
-            let k = view.k.clone().to_host_vec().schedule(&policy)?.await?;
-            let v = view.v.clone().to_host_vec().schedule(&policy)?.await?;
+            let k = view
+                .inner
+                .k
+                .clone()
+                .to_host_vec()
+                .schedule(&policy)?
+                .await?;
+            let v = view
+                .inner
+                .v
+                .clone()
+                .to_host_vec()
+                .schedule(&policy)?
+                .await?;
             for (token, &slot) in indices.iter().take(total).enumerate() {
                 for column in 0..4 {
                     let expected = (1 + layer * 1000 + token * 4 + column) as f32;
@@ -692,9 +810,9 @@ mod tests {
                 }
             }
         }
-        assert!(pool.layer_view(kv.state(), 0, 0..total + 1).is_err());
+        assert!(pool.read_view(kv.state(), 0, 0..total + 1).is_err());
         assert_eq!(
-            pool.layer_view(kv.state(), 0, 5..total)?.read_range,
+            pool.read_view(kv.state(), 0, 5..total)?.positions().clone(),
             5..total
         );
         kv.release();

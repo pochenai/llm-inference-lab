@@ -37,7 +37,7 @@ Numeric words `0..255` map to input token IDs. `input_divisor` scales embeddings
 spelled as output tokens for decoding. These output characters are not appended
 to the input history: this demo validates attention/KV rather than text generation.
 
-`KVPool` abstracts storage through `ContextState` and `LayerView`. `NaiveKVPool`
+`KVPool` abstracts storage through `ContextState`, `ReadView`, and `WriteView`. `NaiveKVPool`
 preallocates per-layer K/V buffers and a GPU `[context_row, token_position]` slot
 table. `KVContext` tracks completed and pending token ranges. The model receives
 full history plus a mutable context, computes only the uncached suffix, and uses
@@ -92,8 +92,12 @@ support does not establish operator support; this model executes only in f32.
 Public interfaces cover application ingress, Runner construction/lifecycle,
 model/pool extension traits, and loader/export operations. Runner dispatch
 (`execute_batch`), decoding, and its assembly
-constructor are private. BatchReply bookkeeping and NaiveLayerView layout fields
-are `pub(crate)`; their types remain public for channel wiring and trait signatures.
+constructor are private. BatchReply bookkeeping is `pub(crate)`. Read/write view
+fields are private; their types stay public for trait signatures. Read views expose
+const pointers through safe accessors; writable handles require a distinct WriteView.
+KVContext selects only pending positions for write views and holds an exclusive
+borrow until they are consumed or dropped. GPU storage and leases remain retained
+in exec until submission completion, independently of these CPU borrows.
 Kernel launchers are `pub(super)` inside private kernel modules. Tests use module
 privacy rules rather than widening production APIs.
 
@@ -106,7 +110,10 @@ Admission uses KVPool::can_append as a conservative capacity snapshot; reservati
 remains the pool's responsibility. Workspace-based batching is deferred.
 
 
-Naive K/V writes use `[8, head_dim]` tiles, with masked tails. Layer views take a
+The standalone Naive store uses `[8, head_dim]` tiles with masked tails. SimpleMLP
+uses a fused QKV projection instead: Q goes to its temporary tensor, while K/V
+accumulators scatter directly into cache via WriteView metadata. Padding lanes
+never read slot-table entries or write cache; no temporary K/V tensors are allocated. Read/write views take a
 backend state and logical token range rather than the owning KVContext; the pool
 maps that range to its physical layout. The Naive attention backend supports
 reading completed-cache windows as well as newly appended suffixes. The grouping

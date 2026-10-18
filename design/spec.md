@@ -20,9 +20,9 @@ Trait methods inherit their trait's visibility and do not take a `pub` modifier.
 | `pub` | Scheduler construction, `execute`, `open_session`, `close_session`, `wait_stopped`; request construction/read-only ID; response fields |
 | `pub` | RunnerBuilder/factory configuration and `build`; ModelRunner `run`; RunnerCommand transport type |
 | `pub` | Model/KVPool/AttentionBackend extension traits and signature types; KVContext operations; configs, metrics, loader/export APIs |
-| `pub` type, private fields | ModelRunner, KVContext, NaiveKVPool, NaiveContextState; storage/progress ownership stays encapsulated |
-| `pub` type, `pub(crate)` fields | BatchReply channel payload; NaiveLayerView layout fields |
-| `pub(crate)` | SessionRequest internal ID assignment/access; NaiveLayerView allocation retention |
+| `pub` type, private fields | ModelRunner, KVContext, NaiveKVPool, NaiveContextState, NaiveReadView, NaiveWriteView; storage/progress ownership stays encapsulated |
+| `pub` type, `pub(crate)` fields | BatchReply channel payload |
+| `pub(crate)` | SessionRequest internal ID assignment/access; unsafe read-buffer bridge for internal tensor kernels |
 | private | ModelRunner `new`, `open_session`, `close_session`, `execute_batch`, `execute_model_batch`, decoding; Scheduler dispatch/receive and PendingRequest; allocation state |
 | `pub(super)` in private kernel modules | Generated launch functions called only by their parent implementation |
 
@@ -108,9 +108,10 @@ sequenceDiagram
     M->>A: submit one batch DeviceOp using Runner policy
     A->>M: execute operation with one exec
     M->>K: reserve each append; submit mapping updates on exec
-    M->>A: one packed embedding and QKV projection stage
-    M->>K: store each request's K/V tensor slices
-    K-->>M: each request's LayerView
+    M->>A: packed embedding
+    M->>K: obtain pending WriteViews; retain resources on exec
+    M->>A: one fused QKV projection; write K/V directly to mapped cache slots
+    K-->>M: each request's ReadView
     M->>A: one attention launch; per-query metadata selects history
     M->>A: packed residual and MLP; one result readback
     Note over M,A: Submitted, but ready_len has not advanced
@@ -299,8 +300,8 @@ pub struct ModelOutput {
 
 pub trait AttentionBackend<P: KVPool> {
     /// query_ranges[i] 标识 packed Q 中第 i 个 context 的本次 query 行。
-    /// 整个 batch 一起提交 attention；KV 布局仍由关联 LayerView 抽象。
-    fn forward(&self, q: Arc<Tensor<f32>>, views: &[P::LayerView<'_>],
+    /// 整个 batch 一起提交 attention；KV 布局仍由关联 ReadView 抽象。
+    fn forward(&self, q: Arc<Tensor<f32>>, views: &[P::ReadView<'_>],
         query_ranges: &[Range<usize>], exec: &ExecutionContext)
         -> Result<Arc<Tensor<f32>>, ModelError>;
 }
@@ -322,8 +323,8 @@ B: ready=1, full tokens=[x,y]       -> suffix=[y],     query_range=3..4
 C: ready=0, full tokens=[m,n]       -> suffix=[m,n],   query_range=4..6
 
 packed tokens: [c,d,e,y,m,n, PAD,PAD]     // One final tile padding, not per request.
-embedding / QKV: shared batch tensors [8,16]
-store: K/V slices 0..3 -> A, 3..4 -> B, 4..6 -> C
+embedding / Q: shared batch tensors [8,16]
+fused QKV: K/V accumulators -> slots for A/B/C; padding rows never write cache
 attention: query metadata selects A/B/C row and each query's causal history end
 residual / MLP: shared batch tensors
 results: last real query of A, B, C
@@ -332,18 +333,22 @@ results: last real query of A, B, C
 The Naive backend launches one attention kernel for packed queries. It reads
 per-query `(context_row, history_start, history_end)` metadata, then follows that context's slot
 table. The model/weights are shared; the history and causal boundary differ.
-No query can attend to another request's tokens. Context-specific stores still
-submit separate scatter launches; there is no per-request GPU wait.
+No query can attend to another request's tokens. One fused QKV launch uses packed
+(context_row, absolute_token_position) metadata to scatter K/V accumulators directly
+into cache. Only Q is materialized as a temporary output; no temporary K/V tensors
+or per-request store launches are used by SimpleMLP. Padding has a negative context
+row, and masked table loads/cache stores prevent writes for those lanes.
 
 ```rust
 /// 此函数在一次 DeviceOp 的 execute 中执行，只提交工作，不等待。
 fn submit_batch(batch, exec: &ExecutionContext) -> Result<HostResults> {
     // execute_append_batch has already prepared every uncached suffix on exec.
-    let (x, q, k, v) = project_packed_tokens(batch, exec)?;
-    for (input, range) in batch.zip(query_ranges) {
-        input.kv.store(0, k.slice(range)?, v.slice(range)?, exec)?;
-    }
-    let views = batch.map(|input| input.kv.layer_view(0)).collect()?;
+    let x = embed_packed_tokens(batch, exec)?;
+    let q = {
+        let destinations = batch.iter_mut().map(|input| input.kv.write_view(0, exec)).collect()?;
+        fused_qkv_to_cache(&x, &destinations, &query_ranges, exec)?
+    }; // Release exclusive CPU borrows; resources remain retained in exec.
+    let views = batch.map(|input| input.kv.read_view(0)).collect()?;
     let attention = backend.forward(q, &views, &query_ranges, exec)?;
     mlp_and_readback(x + attention, exec)
 }
@@ -360,7 +365,7 @@ Model does not rescan existing history for input validation. Numeric ID constrai
 (including the toy tokenizer's UNK=256) are checked through validate_input on new
 tokens. Runner checks full-history length against max_seq_len per request.
 Cached logits or final-token replay are future work. A real multi-layer model repeats the shared
-projection/store/attention/FFN stage per layer inside the same execution boundary.
+projection/cache-write/attention/FFN stage per attention layer inside the same execution boundary.
 
 # KV Cache state and APIs
 
@@ -369,7 +374,8 @@ projection/store/attention/FFN stage per layer inside the same execution boundar
 ```rust
 pub trait KVPool: Sized + Send + Sync {
     type ContextState: Send + Sync;
-    type LayerView<'a> where Self: 'a;
+    type ReadView<'a> where Self: 'a;
+    type WriteView<'a> where Self: 'a;
 
     fn max_seq_len(&self) -> usize;
     fn alloc_state(&self) -> Result<Self::ContextState, KVPoolError>;
@@ -380,12 +386,15 @@ pub trait KVPool: Sized + Send + Sync {
         positions: Range<usize>, exec: &ExecutionContext) -> Result<(), KVPoolError>;
     /// 仅接收 backend 自有状态与逻辑 token 读取范围，不依赖整个 KVContext。
     /// 范围可包含同 exec 中已提交的 pending 写入；读取必须排在写入之后。
-    fn layer_view<'a>(&'a self, state: &'a Self::ContextState, layer: usize,
-        read_range: Range<usize>) -> Result<Self::LayerView<'a>, KVPoolError>;
-    /// 使用 packed batch 的借用切片；不复制 K/V，不单独等待，不推进长度。
-    fn store(&self, state: &Self::ContextState, layer: usize,
-        positions: Range<usize>, k: TensorView<'_, f32>, v: TensorView<'_, f32>,
-        exec: &ExecutionContext) -> Result<(), KVPoolError>;
+    fn read_view<'a>(&'a self, state: &'a Self::ContextState, layer: usize,
+        read_range: Range<usize>) -> Result<Self::ReadView<'a>, KVPoolError>;
+    /// Expose reserved destinations and retain storage/leases on exec; no K/V writes.
+    fn write_view<'a>(&'a self, state: &'a mut Self::ContextState, layer: usize,
+        positions: Range<usize>, exec: &'a ExecutionContext)
+        -> Result<Self::WriteView<'a>, KVPoolError>;
+    /// Consume a write view and submit copies on its retained execution context.
+    fn store(&self, dst: Self::WriteView<'_>,
+        k: TensorView<'_, f32>, v: TensorView<'_, f32>) -> Result<(), KVPoolError>;
     /// 移除 context 的所有权；在途 submission 的 lease 延迟实际 row/slot 回收。
     fn release_state(&self, state: Self::ContextState);
     fn metrics(&self) -> KVPoolMetrics;
@@ -409,7 +418,10 @@ impl<P: KVPool> KVContext<P> {
     pub fn is_pending(&self) -> bool;
     /// Idle 且 count>0；预留 [ready_len, ready_len+count)，保持 ready_len 不变。
     pub fn prepare_append(&mut self, count: usize, exec: &ExecutionContext) -> Result<(), KVContextError>;
-    pub fn layer_view(&self, layer: usize) -> Result<P::LayerView<'_>, KVContextError>;
+    pub fn read_view(&self, layer: usize) -> Result<P::ReadView<'_>, KVContextError>;
+    /// Only the pending append is writable; callers cannot supply a range.
+    pub fn write_view<'a>(&'a mut self, layer: usize, exec: &'a ExecutionContext)
+        -> Result<P::WriteView<'a>, KVContextError>;
     /// 只向当前 pending 区间写入；借用的 tensor view 可来自 batch 大张量。
     pub fn store(&mut self, layer: usize, k: TensorView<'_, f32>,
         v: TensorView<'_, f32>, exec: &ExecutionContext) -> Result<(), KVContextError>;
@@ -476,46 +488,67 @@ struct StateLease {
     slots: Mutex<Vec<i32>>,
     allocation: Arc<Mutex<Allocation>>,
 }
-pub struct NaiveLayerView<'a> {
-    pub(crate) k: &'a Arc<Tensor<f32>>,
-    pub(crate) v: &'a Arc<Tensor<f32>>,
-    pub(crate) slot_table: &'a Arc<Tensor<i32>>,
-    pub(crate) row: usize,
-    pub(crate) read_range: Range<usize>,
+struct LayerStorage<'a> {
+    k: &'a Arc<Tensor<f32>>,
+    v: &'a Arc<Tensor<f32>>,
+    slot_table: &'a Arc<Tensor<i32>>,
+    row: usize,
+    positions: Range<usize>,
     lease: Arc<StateLease>,
+}
+pub struct NaiveReadView<'a> { inner: LayerStorage<'a> }
+pub struct NaiveWriteView<'a> {
+    inner: LayerStorage<'a>,
+    exec: &'a ExecutionContext,
 }
 ```
 
-`KVContext` owns logical ready/pending progress and requests a view over
-`0..allocated_len`. KVPool receives only its ContextState and a logical token
-read_range; it translates that range into its own slot/page layout. Layer views
-carry this range, not ready/pending lifecycle flags. For causal suffix queries,
-the Naive backend computes query start as `read_range.end - query_count` and reads
-history from `read_range.start`. Completed-cache subranges can also be read with
-no pending append. These logical positions are independent of physical slots and
-of the packed Q tensor's query_ranges. No new lifecycle entity is introduced.
+`KVContext` owns logical ready/pending progress. Its read_view covers
+`0..allocated_len` (history plus the current append); write_view selects only pending
+positions and rejects idle contexts. KVPool receives backend state and logical
+positions, and shares a private addressing builder between its read/write methods.
+ReadView and WriteView are distinct types, with private fields and controlled
+construction. Attention accepts only ReadView; store consumes WriteView. A write
+view holds an exclusive context-state borrow and retains buffers/mapping/allocation
+leases in its ExecutionContext before returning. It exposes no new GPU work by itself.
+The existing KVContext::store remains a convenience path that constructs a write
+view and delegates to KVPool::store on that view's execution context.
+
+NaiveReadView's safe API exposes const pointers and read-only metadata. The internal
+Tensor-handle bridge is unsafe and permits reads only; it does not give safe callers
+writable Tensor handles. NaiveWriteView exposes writable device handles. Consume or
+drop write views before constructing attention read views. CPU borrow lifetimes do
+not prove GPU completion: stream ordering, retained leases, bounds checks, and the
+unsafe kernel contracts still apply. Distinct view types do not statically prove
+that every pending token/layer was written or that dynamic GPU indices stay in bounds.
+
+For causal suffix queries the Naive backend computes query start as
+`read_view.positions().end - query_count`, reading history from positions.start.
+Completed-cache subranges can be read without a pending append. Logical positions
+remain independent of physical slots and packed Q query_ranges.
 
 Naive K/V scatter uses `[B, head_dim]` tiles with B=8 and grid
 `(ceil(append_tokens/B), 1, 1)`. Table gathers and output scatters mask invalid tail
 rows; padded source loads never write slot zero for an inactive lane. This is a
 work-granularity choice, not a measured speedup claim.
 
-Future optimization: a compatible QKV projection kernel can write K/V directly
-to cache instead of materializing temporary K/V tensors and launching a separate
-store kernel:
+SimpleMLP now fuses KV addressing/writes into its QKV projection kernel:
 
 ```text
-Current: prepare_append -> QKV -> temporary K/V -> store -> cache -> attention
-Future:  prepare_append -> QKV with cache scatter -> cache -> attention
+SimpleMLP: prepare_append -> WriteViews -> fused QKV -> cache -> attention
+Baseline:  prepare_append -> temporary K/V -> KVContext::store -> cache -> attention
 ```
 
-Both paths still reserve slots and update slot_table in prepare_append. The fused
-kernel uses that mapping to locate physical cache rows; the same ExecutionContext
-orders mapping updates before projection/cache writes and attention. Fusion saves
-the temporary K/V writes and reads plus the separate store launch, not the final
-cache writes. Addressing remains backend-specific; a projection kernel must support
-the selected pool's writable layout. No fused-write API or implementation is added
-yet, and any speedup requires measurement. The current store path remains the baseline.
+Both paths reserve slots and update slot_table in prepare_append. The fused kernel
+uses WriteView mapping/buffers and per-packed-row metadata to find physical cache
+rows. The same ExecutionContext orders mapping updates, projection/cache writes,
+and attention. Q remains a temporary tensor; K/V go directly from projection
+accumulators into cache. This removes intermediate K/V writes/reads and separate
+store launches, not the final cache writes. Addressing is backend-specific: this
+fused kernel supports the current single-head, 16-dimensional NaiveKVPool layout.
+KVContext::store and KVPool::store remain available as the non-fused baseline.
+Correctness is checked against CPU outputs and actual cache contents; no throughput
+improvement is claimed without a benchmark.
 
 `StateLease` is private resource retention, not a new public sequence handle.
 Its final Drop returns its row and slots. Prefix refcounts/indexes are not present
@@ -567,7 +600,7 @@ For the naive single-head layout, with `active_rows=rows-free_rows`,
 
 ## Future storage and lifecycle extensions
 
-A paged pool can replace ContextState and LayerView while keeping Runner history
+A paged pool can replace ContextState and read/write views while keeping Runner history
 ownership and Model's semantic append lifecycle. Its compatible attention backend
 uses block tables rather than per-token slots; shared partial tails may need COW.
 FlashAttention and paging are separate choices and require a compatible kernel /

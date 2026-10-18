@@ -9,9 +9,22 @@ type Result<T> = std::result::Result<T, KVPoolError>;
 type ContextResult<T> = std::result::Result<T, KVContextError>;
 
 /// Storage and mapping contract. Prefix sharing and eviction are deliberately deferred.
+/// A read view cannot be used as a store destination:
+///
+/// ```compile_fail,E0308
+/// use engine::runner::kv_pool::{KVPool, NaiveKVPool, NaiveReadView};
+/// use cutile::tensor::TensorView;
+/// fn invalid_store(pool: &NaiveKVPool, read: NaiveReadView<'_>,
+///                  k: TensorView<'_, f32>, v: TensorView<'_, f32>) {
+///     pool.store(read, k, v).unwrap();
+/// }
+/// ```
 pub trait KVPool: Sized + Send + Sync {
     type ContextState: Send + Sync;
-    type LayerView<'a>
+    type ReadView<'a>
+    where
+        Self: 'a;
+    type WriteView<'a>
     where
         Self: 'a;
 
@@ -36,26 +49,33 @@ pub trait KVPool: Sized + Send + Sync {
     /// pending K/V writes; reads must follow those writes on the same exec.
     /// During append forward, read_range covers history plus the current queries' K/V;
     /// the attention backend applies the per-query causal mask within this range.
-    fn layer_view<'a>(
+    fn read_view<'a>(
         &'a self,
         state: &'a Self::ContextState,
         layer: usize,
         // Logical KV positions: history plus the current queries' K/V during append
         // forward. Attention applies the per-query causal mask within this range.
         read_range: Range<usize>,
-    ) -> Result<Self::LayerView<'a>>;
+    ) -> Result<Self::ReadView<'a>>;
 
-    /// Enqueue GPU K/V writes on the same exec as mapping updates and attention.
-    /// This ordinary fn returns after submission, not GPU completion; writes may be
-    /// pending, running, or finished. Do not reserve new slots or advance ready_len.
-    fn store(
-        &self,
-        state: &Self::ContextState,
+    /// Expose writable destinations for already reserved positions and retain their
+    /// buffers/leases in exec. No K/V writes or GPU wait occur here. KVContext chooses
+    /// pending positions; this lower-level API validates backend bounds and ownership.
+    fn write_view<'a>(
+        &'a self,
+        state: &'a mut Self::ContextState,
         layer: usize,
         positions: Range<usize>,
+        exec: &'a ExecutionContext,
+    ) -> Result<Self::WriteView<'a>>;
+
+    /// Consume a write view and enqueue K/V copies on its execution context.
+    /// Read views are not valid destinations. Return does not imply GPU completion.
+    fn store(
+        &self,
+        dst: Self::WriteView<'_>,
         k: TensorView<'_, f32>,
         v: TensorView<'_, f32>,
-        exec: &ExecutionContext,
     ) -> Result<()>;
 
     /// Drop context ownership; in-flight submission leases delay actual row/slot reuse.
@@ -149,10 +169,39 @@ impl<P: KVPool> KVContext<P> {
 
     /// View all reserved positions, including history and the current pending append.
     /// Pending K/V writes must precede attention reads on the same exec.
-    pub fn layer_view(&self, layer: usize) -> ContextResult<P::LayerView<'_>> {
+    pub fn read_view(&self, layer: usize) -> ContextResult<P::ReadView<'_>> {
         Ok(self
             .pool
-            .layer_view(self.state(), layer, 0..self.allocated_len)?)
+            .read_view(self.state(), layer, 0..self.allocated_len)?)
+    }
+
+    /// Expose only the current pending append as writable destinations; callers cannot
+    /// choose a range. Hold an exclusive context borrow and retain GPU resources in exec.
+    /// Dropping the view does not complete GPU work or advance ready_len.
+    ///
+    /// ```compile_fail,E0502
+    /// use engine::runner::kv_pool::{KVContext, KVContextError, NaiveKVPool};
+    /// use cuda_async::device_operation::ExecutionContext;
+    /// fn overlapping_views(kv: &mut KVContext<NaiveKVPool>, exec: &ExecutionContext)
+    ///     -> Result<(), KVContextError> {
+    ///     let dst = kv.write_view(0, exec)?;
+    ///     let read = kv.read_view(0)?;
+    ///     drop(dst);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn write_view<'a>(
+        &'a mut self,
+        layer: usize,
+        exec: &'a ExecutionContext,
+    ) -> ContextResult<P::WriteView<'a>> {
+        let positions = self
+            .pending
+            .clone()
+            .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
+        Ok(self
+            .pool
+            .write_view(self.state.as_mut().unwrap(), layer, positions, exec)?)
     }
 
     /// Enqueue GPU K/V writes only to the current pending append range.
@@ -170,9 +219,10 @@ impl<P: KVPool> KVContext<P> {
             .pending
             .clone()
             .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
-        Ok(self
+        let dst = self
             .pool
-            .store(self.state.as_ref().unwrap(), layer, positions, k, v, exec)?)
+            .write_view(self.state.as_mut().unwrap(), layer, positions, exec)?;
+        Ok(self.pool.store(dst, k, v)?)
     }
 
     /// Internal: execute_append_batch advances CPU ready_len only after GPU success.

@@ -17,7 +17,8 @@ use tokenizers::{
 };
 
 use cuda_async::{
-    device_context::global_policy, device_operation::*, scheduling_policies::SchedulingPolicy,
+    device_buffer::DevicePointer, device_context::global_policy, device_operation::*,
+    scheduling_policies::SchedulingPolicy,
 };
 use cutile::{
     api,
@@ -28,7 +29,7 @@ use cutile::{
 use super::{AttentionBackend, Model, ModelError, ModelInput, ModelOutput};
 #[cfg(test)]
 use crate::runner::kv_pool::KVContext;
-use crate::runner::kv_pool::{NaiveKVPool, NaiveLayerView};
+use crate::runner::kv_pool::{NaiveKVPool, NaiveReadView};
 use crate::{
     runner::loader::{GenerationConfig, WeightLoader},
     types::{BatchIn, SamplingConfig},
@@ -317,7 +318,7 @@ impl SimpleMLPEngine {
         // A=[10,11,12,13], ready=2;
         // B=[20,21], ready=1.
         // With TILE=4: packed_token_ids=[12,13,21,0(PAD)], query_ranges=[0..2, 2..3].
-        // Per-request rows in the packed token/Q/K/V tensors, excluding padding;
+        // Per-request rows in packed token/Q tensors and projected K/V, excluding padding;
         // these are not history positions or physical KV slot indices.
         let (packed_token_ids, query_ranges) = Self::pack_token_ids(&batch, TILE);
         let rows = packed_token_ids.len();
@@ -360,33 +361,60 @@ impl SimpleMLPEngine {
         .unpartition()
         .execute(exec)?;
         let x = Arc::new(x);
-        let mut qkv = Vec::new();
-        for projection in &self.layers[3..6] {
-            qkv.push(Arc::new(
-                kernels::gemm(
-                    api::zeros::<f32>(&[rows, INPUT_DIM]).partition([TILE, TILE]),
-                    x.clone(),
-                    projection.clone(),
-                )
-                .generics(vec!["4".into(), "4".into(), "4".into(), "16".into()])
-                .first()
-                .unpartition()
-                .execute(exec)?,
-            ));
-        }
-        for (input, range) in batch.iter_mut().zip(query_ranges) {
-            input.kv.store(
-                0,
-                qkv[1].slice(&[range.clone()])?,
-                qkv[2].slice(&[range.clone()])?,
-                exec,
-            )?;
-        }
+        let q = {
+            // Views retain cache buffers/mapping/leases on exec before the fused launch.
+            // They borrow each context exclusively until this projection is submitted.
+            let destinations = batch
+                .iter_mut()
+                .map(|input| input.kv.write_view(0, exec))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first = &destinations[0];
+            // Per packed row: context row and absolute token position in that context.
+            // A negative context row marks padding, which must never write any KV slot.
+            let mut metadata = vec![-1i32; rows * 2];
+            for (dst, range) in destinations.iter().zip(query_ranges) {
+                if dst.k_mut_ptr().cu_deviceptr() != first.k_mut_ptr().cu_deviceptr()
+                    || dst.v_mut_ptr().cu_deviceptr() != first.v_mut_ptr().cu_deviceptr()
+                    || dst.slot_table_ptr() != first.slot_table_ptr()
+                    || dst.head_dim() != INPUT_DIM
+                    || dst.positions().len() != range.len()
+                {
+                    return Err(ModelError::InvalidInput(
+                        "projection batch needs compatible write views from the same pool".into(),
+                    ));
+                }
+                for (local, packed_row) in range.clone().enumerate() {
+                    metadata[packed_row * 2] = dst.row() as i32;
+                    metadata[packed_row * 2 + 1] = (dst.positions().start + local) as i32;
+                }
+            }
+            let metadata = api::copy_host_vec_to_device(&Arc::new(metadata))
+                .execute(exec)?
+                .reshape(&[rows, 2])?;
+            // SAFETY: the views retain this mapping on exec, and the kernel only reads it.
+            let table = DevicePointer::<i32>::from_cu_deviceptr(first.slot_table_ptr() as u64);
+            kernels::qkv_to_cache(
+                api::zeros::<f32>(&[rows, INPUT_DIM]).partition([TILE, TILE]),
+                x.clone(),
+                self.layers[3].clone(),
+                self.layers[4].clone(),
+                self.layers[5].clone(),
+                first.k_mut_ptr(),
+                first.v_mut_ptr(),
+                table,
+                metadata,
+                first.table_width() as i32,
+            )
+            .generics(vec!["4".into(), "4".into(), "4".into()])
+            .map(|(q, ..)| q)
+            .unpartition()
+            .execute(first.execution_context())?
+        };
         let views = batch
             .iter()
-            .map(|input| input.kv.layer_view(0))
+            .map(|input| input.kv.read_view(0))
             .collect::<Result<Vec<_>, _>>()?;
-        let attention = NaiveAttention.forward(qkv[0].clone(), &views, query_ranges, exec)?;
+        let attention = NaiveAttention.forward(Arc::new(q), &views, query_ranges, exec)?;
         let h = Arc::new(
             kernels::residual(
                 api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),
@@ -501,7 +529,7 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
     fn forward(
         &self,
         q: Arc<Tensor<f32>>,
-        views: &[NaiveLayerView<'_>],
+        views: &[NaiveReadView<'_>],
         query_ranges: &[Range<usize>],
         exec: &ExecutionContext,
     ) -> Result<Arc<Tensor<f32>>, ModelError> {
@@ -520,12 +548,12 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
         // Per packed query: context row, logical history start, exclusive causal end.
         let mut metadata = vec![0i32; rows * 3];
         for (view, range) in views.iter().zip(query_ranges) {
-            if !Arc::ptr_eq(view.k, first.k)
-                || !Arc::ptr_eq(view.v, first.v)
-                || !Arc::ptr_eq(view.slot_table, first.slot_table)
-                || view.k.shape()[1] != INPUT_DIM as i32
+            if view.k_ptr() != first.k_ptr()
+                || view.v_ptr() != first.v_ptr()
+                || view.slot_table_ptr() != first.slot_table_ptr()
+                || view.head_dim() != INPUT_DIM
                 || range.end > rows
-                || range.len() > view.read_range.len()
+                || range.len() > view.positions().len()
             {
                 return Err(ModelError::InvalidInput(
                     "attention batch needs compatible views from the same pool".into(),
@@ -533,9 +561,9 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
             }
             view.retain(exec)?;
             for (local, row) in range.clone().enumerate() {
-                metadata[row * 3] = view.row as i32;
-                metadata[row * 3 + 1] = view.read_range.start as i32;
-                metadata[row * 3 + 2] = (view.read_range.end - range.len() + local + 1) as i32;
+                metadata[row * 3] = view.row() as i32;
+                metadata[row * 3 + 1] = view.positions().start as i32;
+                metadata[row * 3 + 2] = (view.positions().end - range.len() + local + 1) as i32;
             }
         }
         // SAFETY: the same submission has already updated every mapping and written KV.
@@ -543,12 +571,13 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
             let metadata = api::copy_host_vec_to_device(&Arc::new(metadata))
                 .execute(exec)?
                 .reshape(&[rows, 3])?;
+            let (k, v, table) = first.tensors();
             kernels::attention(
                 api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),
                 q,
-                first.k.clone(),
-                first.v.clone(),
-                first.slot_table.clone(),
+                k.clone(),
+                v.clone(),
+                table.clone(),
                 metadata,
             )
             .map(|(out, ..)| out)
@@ -583,6 +612,104 @@ mod kernels {
         out.store(
             weights.partition(shape![1, 16]).load([id, 0]) / divisor.broadcast(shape![1, 16]),
         );
+    }
+
+    /// Compute Q/K/V together; only Q is materialized as a temporary tensor.
+    /// K/V accumulators scatter directly into mapped cache slots. Invalid packed rows
+    /// are masked, so padding cannot overwrite another context or an unused slot.
+    #[cutile::entry()]
+    pub(super) unsafe fn qkv_to_cache<const BM: i32, const BN: i32, const BK: i32>(
+        q: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, 16] }>,
+        wq: &Tensor<f32, { [16, 16] }>,
+        wk: &Tensor<f32, { [16, 16] }>,
+        wv: &Tensor<f32, { [16, 16] }>,
+        cache_k_ptr: *mut f32,
+        cache_v_ptr: *mut f32,
+        slot_table_base: *const i32,
+        metadata: &Tensor<i32, { [-1, 2] }>,
+        table_width: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let part_x = x.partition(shape![BM, BK]);
+        let part_q = wq.partition(shape![BK, BN]);
+        let part_k = wk.partition(shape![BK, BN]);
+        let part_v = wv.partition(shape![BK, BN]);
+        let mut q_values: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        let mut k_values: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        let mut v_values: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        for i in 0i32..(16 / BK) {
+            let inputs = part_x.load([pid.0, i]);
+            q_values = mma(inputs, part_q.load([i, pid.1]), q_values);
+            k_values = mma(inputs, part_k.load([i, pid.1]), k_values);
+            v_values = mma(inputs, part_v.load([i, pid.1]), v_values);
+        }
+        q.store(q_values);
+
+        let context_rows: Tile<i32, { [BM] }> = metadata
+            .partition(shape![BM, 1])
+            .load([pid.0, 0])
+            .reshape(shape![BM]);
+        let positions: Tile<i32, { [BM] }> = metadata
+            .partition(shape![BM, 1])
+            .load([pid.0, 1])
+            .reshape(shape![BM]);
+        let padding_marker: Tile<i32, { [BM] }> = constant(-1i32, shape![BM]);
+        let valid = lt_tile(padding_marker, context_rows);
+        let table_offsets = context_rows * table_width.broadcast(shape![BM]) + positions;
+        let tp: PointerTile<*const i32, { [] }> = pointer_to_tile(slot_table_base);
+        let tp: PointerTile<*const i32, { [1] }> = tp.reshape(shape![1]);
+        let tp: PointerTile<*const i32, { [BM] }> = tp.broadcast(shape![BM]);
+        let tp: PointerTile<*const i32, { [BM] }> = tp.offset_tile(table_offsets);
+        let (slots, _token): (Tile<i32, { [BM] }>, Token) = unsafe {
+            load_ptr_tko(
+                tp,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid),
+                Some(0i32),
+                None,
+                Latency::<1>,
+            )
+        };
+        let row_offsets = slots * 16i32.broadcast(shape![BM]);
+        let row_offsets: Tile<i32, { [BM, BN] }> =
+            row_offsets.reshape(shape![BM, 1]).broadcast(shape![BM, BN]);
+        let columns: Tile<i32, { [BN] }> = iota(shape![BN]);
+        let columns = columns + (pid.1 * BN).broadcast(shape![BN]);
+        let columns: Tile<i32, { [BM, BN] }> =
+            columns.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
+        let offsets = row_offsets + columns;
+        let mask: Tile<bool, { [BM, BN] }> = valid.reshape(shape![BM, 1]).broadcast(shape![BM, BN]);
+        let kp: PointerTile<*mut f32, { [] }> = pointer_to_tile(cache_k_ptr);
+        let kp: PointerTile<*mut f32, { [1, 1] }> = kp.reshape(shape![1, 1]);
+        let kp: PointerTile<*mut f32, { [BM, BN] }> = kp.broadcast(shape![BM, BN]);
+        let kp: PointerTile<*mut f32, { [BM, BN] }> = kp.offset_tile(offsets);
+        let vp: PointerTile<*mut f32, { [] }> = pointer_to_tile(cache_v_ptr);
+        let vp: PointerTile<*mut f32, { [1, 1] }> = vp.reshape(shape![1, 1]);
+        let vp: PointerTile<*mut f32, { [BM, BN] }> = vp.broadcast(shape![BM, BN]);
+        let vp: PointerTile<*mut f32, { [BM, BN] }> = vp.offset_tile(offsets);
+        // tko = Token-Ordered: these stores use computed addresses and value dependencies.
+        unsafe {
+            store_ptr_tko(
+                kp,
+                k_values,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None,
+                Latency::<1>,
+            );
+            store_ptr_tko(
+                vp,
+                v_values,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None,
+                Latency::<1>,
+            );
+        }
     }
 
     #[cutile::entry()]
@@ -838,6 +965,88 @@ mod tests {
         Ok(())
     }
 
+    /// Check every fused K/V element, old prefixes, mixed context rows, and masked padding.
+    #[tokio::test]
+    async fn fused_projection_writes_only_mapped_tokens() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = SimpleMLPEngine::random(0).await?;
+        let policy = model.weight_policy.clone();
+        let pool = pool(&policy).await?;
+        let initial = pool.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        let mut contexts = [
+            KVContext::new(pool.clone())?,
+            KVContext::new(pool.clone())?,
+            KVContext::new(pool.clone())?,
+        ];
+        model
+            .forward(&[1, 2, 3], &mut contexts[0], policy.clone())
+            .await?;
+        model
+            .forward(&[7], &mut contexts[1], policy.clone())
+            .await?;
+        let histories: [&[u32]; 3] = [&[1, 2, 3, 4, 5], &[7, 8], &[9, 10]];
+        // Suffixes have lengths 2, 1, 2: five real packed rows and three padding rows.
+        let inputs = contexts
+            .iter_mut()
+            .zip(histories)
+            .map(|(kv, token_ids)| ModelInput { token_ids, kv })
+            .collect();
+        let outputs = model.forward_batch(inputs, policy.clone()).await?;
+        let mut used_slots = std::collections::HashSet::new();
+        let mut cache = None;
+        for (index, (kv, tokens)) in contexts.iter().zip(histories).enumerate() {
+            close(
+                outputs[index],
+                cpu_reference(tokens, &weights, model.config.input_divisor),
+            );
+            let view = kv.read_view(0)?;
+            // SAFETY: readbacks only read completed KV, and view retains its context lease.
+            let (k, v, table) = unsafe { view.tensors() };
+            let indices = table.clone().to_host_vec().schedule(&policy)?.await?;
+            let keys = k.clone().to_host_vec().schedule(&policy)?.await?;
+            let values = v.clone().to_host_vec().schedule(&policy)?.await?;
+            for (position, &token) in tokens.iter().enumerate() {
+                let slot = indices[view.row() * view.table_width() + position] as usize;
+                assert!(used_slots.insert(slot));
+                for column in 0..INPUT_DIM {
+                    let expected_k: f32 = (0..INPUT_DIM)
+                        .map(|i| {
+                            weights[2][token as usize * INPUT_DIM + i] / model.config.input_divisor
+                                * weights[4][i * INPUT_DIM + column]
+                        })
+                        .sum();
+                    let expected_v: f32 = (0..INPUT_DIM)
+                        .map(|i| {
+                            weights[2][token as usize * INPUT_DIM + i] / model.config.input_divisor
+                                * weights[5][i * INPUT_DIM + column]
+                        })
+                        .sum();
+                    close(keys[slot * INPUT_DIM + column], expected_k);
+                    close(values[slot * INPUT_DIM + column], expected_v);
+                }
+            }
+            cache = Some((keys, values));
+        }
+        let (keys, values) = cache.unwrap();
+        for slot in 0..pool.config().num_slots {
+            if !used_slots.contains(&slot) {
+                assert!(keys[slot * INPUT_DIM..(slot + 1) * INPUT_DIM]
+                    .iter()
+                    .all(|&v| v == 0.0));
+                assert!(values[slot * INPUT_DIM..(slot + 1) * INPUT_DIM]
+                    .iter()
+                    .all(|&v| v == 0.0));
+            }
+        }
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn attention_reads_logical_windows_without_pending_append() -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
@@ -850,14 +1059,12 @@ mod tests {
             .await?;
         assert!(!kv.is_pending());
         let (indices, cached_values) = {
-            let view = kv.layer_view(0)?;
+            let view = kv.read_view(0)?;
+            // SAFETY: only reading completed KV; the view lives through both readbacks.
+            let (_, v, table) = unsafe { view.tensors() };
             (
-                view.slot_table
-                    .clone()
-                    .to_host_vec()
-                    .schedule(&policy)?
-                    .await?,
-                view.v.clone().to_host_vec().schedule(&policy)?.await?,
+                table.clone().to_host_vec().schedule(&policy)?.await?,
+                v.clone().to_host_vec().schedule(&policy)?.await?,
             )
         };
         let q = Arc::new(
@@ -868,7 +1075,7 @@ mod tests {
         for window in [0..5, 2..5] {
             let values = with_context(|exec| {
                 value((|| -> Result<Vec<f32>, ModelError> {
-                    let view = pool.layer_view(kv.state(), 0, window.clone())?;
+                    let view = pool.read_view(kv.state(), 0, window.clone())?;
                     let out = NaiveAttention.forward(q.clone(), &[view], &[0..1], exec)?;
                     // SAFETY: the outer future establishes completion before host reads.
                     unsafe { Ok(out.to_host_vec().execute(exec)?) }
