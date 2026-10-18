@@ -145,6 +145,13 @@ The Naive pool uploads one packed mapping update and launches one `bind_batch`
 kernel per batch; the single-context prepare API remains available.
 These ranges measure CPU work and submission, not GPU completion or the outer await.
 
+The attention MLP reuses six floating-point scratch buffers per workspace.
+A submission exclusively checks out an exact-shape workspace for its device;
+in-flight ownership and tensor handles prevent reuse until completion.
+The idle cache retains at most four workspaces. GEMM/matvec start accumulators
+at zero, so reused output buffers need no per-batch clearing. Input/metadata
+uploads and the final pageable host readback retain their existing behavior.
+
 The initial [results and commands](../profiling/simple_mlp_attn/RESULTS.md) include
 three unprofiled runs, CUDA kernel/API summaries, and a directly openable
 [Nsight Systems report](../profiling/simple_mlp_attn/uniform-b5-t16.nsys-rep).

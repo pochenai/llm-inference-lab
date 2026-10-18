@@ -27,6 +27,7 @@ use cutile::{
 };
 
 use super::{AttentionBackend, Model, ModelError, ModelInput, ModelOutput};
+mod workspace;
 #[cfg(test)]
 use crate::runner::kv_pool::KVContext;
 use crate::runner::kv_pool::{NaiveKVPool, NaiveReadView};
@@ -34,6 +35,7 @@ use crate::{
     runner::loader::{GenerationConfig, WeightLoader},
     types::{BatchIn, SamplingConfig},
 };
+use workspace::WorkspacePool;
 
 pub const INPUT_DIM: usize = 16;
 const TILE: usize = 4;
@@ -105,6 +107,7 @@ pub struct SimpleMLPEngine {
     weight_policy: Arc<dyn SchedulingPolicy>,
     // MLP weights, embedding, and Q/K/V projection matrices (see WEIGHT_NAMES).
     layers: Vec<Arc<Tensor<f32>>>,
+    workspaces: Arc<WorkspacePool>,
 }
 
 impl SimpleMLPEngine {
@@ -164,6 +167,7 @@ impl SimpleMLPEngine {
                 generation_config,
                 weight_policy: policy,
                 layers,
+                workspaces: Arc::default(),
             })
         }
         .await;
@@ -223,6 +227,7 @@ impl SimpleMLPEngine {
             }),
             weight_policy: policy,
             layers,
+            workspaces: Arc::default(),
         })
     }
 
@@ -351,9 +356,10 @@ impl SimpleMLPEngine {
         exec: &ExecutionContext,
     ) -> Result<Vec<f32>, ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"submit_batch");
+        let workspace = self.workspaces.acquire(rows, exec)?;
         let packed_token_ids = api::copy_host_vec_to_device(&packed_token_ids).execute(exec)?;
         let x = kernels::embedding(
-            api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),
+            value(workspace.x).partition([1, INPUT_DIM]),
             packed_token_ids,
             self.layers[2].clone(),
             self.config.input_divisor,
@@ -395,7 +401,7 @@ impl SimpleMLPEngine {
             // SAFETY: the views retain this mapping on exec, and the kernel only reads it.
             let table = DevicePointer::<i32>::from_cu_deviceptr(first.slot_table_ptr() as u64);
             kernels::qkv_to_cache(
-                api::zeros::<f32>(&[rows, INPUT_DIM]).partition([TILE, TILE]),
+                value(workspace.q).partition([TILE, TILE]),
                 x.clone(),
                 self.layers[3].clone(),
                 self.layers[4].clone(),
@@ -415,10 +421,16 @@ impl SimpleMLPEngine {
             .iter()
             .map(|input| input.kv.read_view(0))
             .collect::<Result<Vec<_>, _>>()?;
-        let attention = NaiveAttention.forward(Arc::new(q), &views, query_ranges, exec)?;
+        let attention = NaiveAttention.forward_into(
+            Arc::new(q),
+            &views,
+            query_ranges,
+            workspace.attention,
+            exec,
+        )?;
         let h = Arc::new(
             kernels::residual(
-                api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),
+                value(workspace.residual).partition([1, INPUT_DIM]),
                 x,
                 attention,
             )
@@ -427,7 +439,7 @@ impl SimpleMLPEngine {
             .execute(exec)?,
         );
         let hidden = kernels::gemm(
-            api::zeros::<f32>(&[rows, INPUT_DIM]).partition([TILE, TILE]),
+            value(workspace.hidden).partition([TILE, TILE]),
             h,
             self.layers[0].clone(),
         )
@@ -437,7 +449,7 @@ impl SimpleMLPEngine {
             .generics(vec!["4".into(), "4".into()])
             .map(|(hidden,)| hidden);
         Ok(kernels::matvec(
-            api::zeros::<f32>(&[rows]).partition([TILE]),
+            value(workspace.output).partition([TILE]),
             hidden.unpartition(),
             self.layers[1].clone(),
         )
@@ -534,6 +546,21 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
         query_ranges: &[Range<usize>],
         exec: &ExecutionContext,
     ) -> Result<Arc<Tensor<f32>>, ModelError> {
+        // SAFETY: the caller owns exec and establishes completion.
+        let out = unsafe { api::zeros::<f32>(&[q.shape()[0] as usize, INPUT_DIM]).execute(exec)? };
+        self.forward_into(q, views, query_ranges, out, exec)
+    }
+}
+
+impl NaiveAttention {
+    fn forward_into(
+        &self,
+        q: Arc<Tensor<f32>>,
+        views: &[NaiveReadView<'_>],
+        query_ranges: &[Range<usize>],
+        out: Tensor<f32>,
+        exec: &ExecutionContext,
+    ) -> Result<Arc<Tensor<f32>>, ModelError> {
         let first = views
             .first()
             .ok_or_else(|| ModelError::InvalidInput("empty attention batch".into()))?;
@@ -574,7 +601,7 @@ impl AttentionBackend<NaiveKVPool> for NaiveAttention {
                 .reshape(&[rows, 3])?;
             let (k, v, table) = first.tensors();
             kernels::attention(
-                api::zeros::<f32>(&[rows, INPUT_DIM]).partition([1, INPUT_DIM]),
+                value(out).partition([1, INPUT_DIM]),
                 q,
                 k.clone(),
                 v.clone(),
@@ -792,7 +819,7 @@ mod kernels {
         let part_x = x.partition(shape![BM, BK]);
         let part_y = y.partition(shape![BK, BN]);
         let pid = get_tile_block_id();
-        let mut tile_z = z.load();
+        let mut tile_z: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
         for i in 0i32..(K / BK) {
             tile_z = mma(part_x.load([pid.0, i]), part_y.load([i, pid.1]), tile_z);
         }
@@ -815,7 +842,7 @@ mod kernels {
         let part_x = x.partition(shape![BM, BK]);
         let part_y = y.partition(shape![BK]);
         let pid = get_tile_block_id();
-        let mut tile_z = z.load().reshape(shape![BM, 1]);
+        let mut tile_z: Tile<f32, { [BM, 1] }> = constant(0.0f32, shape![BM, 1]);
         for i in 0i32..(K / BK) {
             tile_z = mma(
                 part_x.load([pid.0, i]),
