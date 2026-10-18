@@ -54,12 +54,9 @@ pub trait Model<P: KVPool>: Send + Sync {
         (packed_token_ids, query_ranges)
     }
 
-    /// Reserve a same-pool batch of uncached suffixes and enqueue mappings before submit on the
-    /// same exec. The callback must submit every KV cache update required by this
-    /// forward; caller should ensure every layer call this function.
-    /// The framework does not inspect network topology or verify cache coverage.
-    /// Await successful GPU completion before committing KV. The callback must not
-    /// prepare appends again. Cancellation/failure leaves them uncommitted.
+    /// Prepare mappings for a same-pool batch before submitting K/V work on exec.
+    /// Await successful GPU completion before committing logical progress. The
+    /// callback must submit all required layers; failure leaves appends uncommitted.
     fn execute_append_batch<T: Send>(
         batch: &mut [ModelInput<'_, P>],
         policy: &Arc<dyn SchedulingPolicy>,

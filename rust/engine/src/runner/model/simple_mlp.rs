@@ -22,15 +22,14 @@ use cuda_async::{
 };
 use cutile::{
     api,
-    tensor::{Reshape, Tensor, Unpartition},
+    tensor::{Reshape, Tensor, TensorView as DeviceTensorView, Unpartition},
     tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
 };
 
 use super::{AttentionBackend, Model, ModelError, ModelInput, ModelOutput};
 mod workspace;
-#[cfg(test)]
-use crate::runner::kv_pool::KVContext;
-use crate::runner::kv_pool::{NaiveKVPool, NaiveReadView};
+use crate::runner::kv_pool::{KVContext, NaiveKVPool, NaiveMappingPlan, NaiveReadView};
+use crate::runner::upload::UploadPool;
 use crate::{
     runner::loader::{GenerationConfig, WeightLoader},
     types::{BatchIn, SamplingConfig},
@@ -108,6 +107,7 @@ pub struct SimpleMLPEngine {
     // MLP weights, embedding, and Q/K/V projection matrices (see WEIGHT_NAMES).
     layers: Vec<Arc<Tensor<f32>>>,
     workspaces: Arc<WorkspacePool>,
+    input_uploads: Arc<UploadPool>,
 }
 
 impl SimpleMLPEngine {
@@ -168,6 +168,7 @@ impl SimpleMLPEngine {
                 weight_policy: policy,
                 layers,
                 workspaces: Arc::default(),
+                input_uploads: Arc::default(),
             })
         }
         .await;
@@ -228,6 +229,7 @@ impl SimpleMLPEngine {
             weight_policy: policy,
             layers,
             workspaces: Arc::default(),
+            input_uploads: Arc::default(),
         })
     }
 
@@ -330,55 +332,82 @@ impl SimpleMLPEngine {
         if rows > i32::MAX as usize / INPUT_DIM {
             return Err(ModelError::InvalidInput("packed batch is too large".into()));
         }
-        let values = Self::execute_append_batch(&mut batch, &policy, |batch, exec| {
-            // SAFETY: one awaited future owns the whole submission. All buffers and
-            // logical allocation leases are retained before their GPU accesses.
-            unsafe {
-                self.submit_batch(batch, Arc::new(packed_token_ids), &query_ranges, rows, exec)
-            }
-        })
-        .await?;
+        let values =
+            Self::execute_packed_append_batch(&mut batch, &policy, |batch, mapping, exec| {
+                // SAFETY: one awaited future owns the whole submission. All buffers and
+                // logical allocation leases are retained before their GPU accesses.
+                unsafe {
+                    self.submit_batch(
+                        batch,
+                        Arc::new(packed_token_ids),
+                        &query_ranges,
+                        rows,
+                        mapping,
+                        exec,
+                    )
+                }
+            })
+            .await?;
         Ok(query_ranges
             .iter()
             .map(|range| values[range.end - 1])
             .collect())
     }
 
-    /// Submit one packed batch; no host wait occurs between requests or layers.
-    /// execute_append_batch has already reserved KV and enqueued mapping updates;
-    /// this callback submits the model's computation on that same exec.
+    /// Naive-specific path: reserve first, then let submit pack the deferred mapping
+    /// with model inputs. Generic Model::execute_append_batch still prepares mappings
+    /// immediately and has no mapping-plan type in its interface.
+    async fn execute_packed_append_batch<T: Send>(
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        policy: &Arc<dyn SchedulingPolicy>,
+        submit: impl FnOnce(
+                &mut [ModelInput<'_, NaiveKVPool>],
+                &NaiveMappingPlan,
+                &ExecutionContext,
+            ) -> Result<T, ModelError>
+            + Send,
+    ) -> Result<T, ModelError> {
+        let output = with_context(|exec| {
+            value((|| {
+                let mut appends: Vec<_> = batch
+                    .iter_mut()
+                    .map(|input| {
+                        let count = input.token_ids.len() - input.kv.ready_len();
+                        (&mut *input.kv, count)
+                    })
+                    .collect();
+                let mapping = KVContext::reserve_append_batch(&mut appends, exec)?;
+                submit(batch, &mapping, exec)
+            })())
+        })
+        .schedule(policy)?
+        .await??;
+        for input in batch {
+            input.kv.commit_append()?;
+        }
+        Ok(output)
+    }
+
+    /// Build one upload from the backend mapping payload, IDs, and query metadata.
+    /// Bind precedes every cache access on exec; the final pageable readback is unchanged.
     unsafe fn submit_batch(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         packed_token_ids: Arc<Vec<i32>>,
         query_ranges: &[Range<usize>],
         rows: usize,
+        mapping: &NaiveMappingPlan,
         exec: &ExecutionContext,
     ) -> Result<Vec<f32>, ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"submit_batch");
         let workspace = self.workspaces.acquire(rows, exec)?;
-        let packed_token_ids = api::copy_host_vec_to_device(&packed_token_ids).execute(exec)?;
-        let x = kernels::embedding(
-            value(workspace.x).partition([1, INPUT_DIM]),
-            packed_token_ids,
-            self.layers[2].clone(),
-            self.config.input_divisor,
-        )
-        .first()
-        .unpartition()
-        .execute(exec)?;
-        let x = Arc::new(x);
-        let q = {
-            // Views retain cache buffers/mapping/leases on exec before the fused launch.
-            // They borrow each context exclusively until this projection is submitted.
+        let (k_ptr, v_ptr, table, table_width, metadata) = {
             let destinations = batch
                 .iter_mut()
                 .map(|input| input.kv.write_view(0, exec))
                 .collect::<Result<Vec<_>, _>>()?;
             let first = &destinations[0];
-            // Per packed row: context row and absolute token position in that context.
-            // A negative context row marks padding, which must never write any KV slot.
-            let mut metadata = vec![-1i32; rows * 2];
+            let mut metadata = NaiveAttention::empty_metadata(rows);
             for (dst, range) in destinations.iter().zip(query_ranges) {
                 if dst.k_mut_ptr().cu_deviceptr() != first.k_mut_ptr().cu_deviceptr()
                     || dst.v_mut_ptr().cu_deviceptr() != first.v_mut_ptr().cu_deviceptr()
@@ -391,40 +420,70 @@ impl SimpleMLPEngine {
                     ));
                 }
                 for (local, packed_row) in range.clone().enumerate() {
-                    metadata[packed_row * 2] = dst.row() as i32;
-                    metadata[packed_row * 2 + 1] = (dst.positions().start + local) as i32;
+                    metadata[packed_row * 3] = dst.row() as i32;
+                    metadata[packed_row * 3 + 1] = (dst.positions().start + local) as i32;
                 }
             }
-            let metadata = api::copy_host_vec_to_device(&Arc::new(metadata))
-                .execute(exec)?
-                .reshape(&[rows, 2])?;
-            // SAFETY: the views retain this mapping on exec, and the kernel only reads it.
-            let table = DevicePointer::<i32>::from_cu_deviceptr(first.slot_table_ptr() as u64);
-            kernels::qkv_to_cache(
-                value(workspace.q).partition([TILE, TILE]),
-                x.clone(),
-                self.layers[3].clone(),
-                self.layers[4].clone(),
-                self.layers[5].clone(),
+            // Views retain buffers and state leases on exec. The returned pointers
+            // remain valid after the Rust views drop, until GPU completion.
+            (
                 first.k_mut_ptr(),
                 first.v_mut_ptr(),
-                table,
-                metadata,
+                DevicePointer::<i32>::from_cu_deviceptr(first.slot_table_ptr() as u64),
                 first.table_width() as i32,
+                metadata,
             )
-            .generics(vec!["4".into(), "4".into(), "4".into()])
-            .map(|(q, ..)| q)
-            .unpartition()
-            .execute(first.execution_context())?
         };
         let views = batch
             .iter()
             .map(|input| input.kv.read_view(0))
             .collect::<Result<Vec<_>, _>>()?;
-        let attention = NaiveAttention.forward_into(
+        let ids_start = mapping.payload().len();
+        let metadata_start = ids_start + packed_token_ids.len();
+        let mut payload = Vec::with_capacity(metadata_start + metadata.len());
+        payload.extend_from_slice(mapping.payload());
+        payload.extend_from_slice(&packed_token_ids);
+        payload.extend(metadata);
+        let count = payload.len();
+        let upload = self
+            .input_uploads
+            .upload(Arc::new(payload), &[count], exec)?;
+        let ids = upload.slice(&[ids_start..metadata_start])?;
+        let metadata_flat = upload.slice(&[metadata_start..count])?;
+        let metadata = metadata_flat.view(&[rows, 3])?;
+        // One copy precedes bind and every model kernel on the same exec.
+        mapping.submit(&upload, 0, exec)?;
+        let x = Arc::new(
+            kernels::embedding(
+                value(workspace.x).partition([1, INPUT_DIM]),
+                &ids,
+                self.layers[2].clone(),
+                self.config.input_divisor,
+            )
+            .first()
+            .unpartition()
+            .execute(exec)?,
+        );
+        let q = kernels::qkv_to_cache(
+            value(workspace.q).partition([TILE, TILE]),
+            x.clone(),
+            self.layers[3].clone(),
+            self.layers[4].clone(),
+            self.layers[5].clone(),
+            k_ptr,
+            v_ptr,
+            table,
+            &metadata,
+            table_width,
+        )
+        .generics(vec!["4".into(), "4".into(), "4".into()])
+        .map(|(q, ..)| q)
+        .unpartition()
+        .execute(exec)?;
+        let attention = NaiveAttention.submit_prepared(
             Arc::new(q),
             &views,
-            query_ranges,
+            &metadata,
             workspace.attention,
             exec,
         )?;
@@ -573,8 +632,8 @@ impl NaiveAttention {
             ));
         }
         let rows = q.shape()[0] as usize;
-        // Per packed query: context row, logical history start, exclusive causal end.
-        let mut metadata = vec![0i32; rows * 3];
+        // Same layout as projection: row, absolute position, history start.
+        let mut metadata = Self::empty_metadata(rows);
         for (view, range) in views.iter().zip(query_ranges) {
             if view.k_ptr() != first.k_ptr()
                 || view.v_ptr() != first.v_ptr()
@@ -587,31 +646,60 @@ impl NaiveAttention {
                     "attention batch needs compatible views from the same pool".into(),
                 ));
             }
-            view.retain(exec)?;
             for (local, row) in range.clone().enumerate() {
                 metadata[row * 3] = view.row() as i32;
-                metadata[row * 3 + 1] = view.positions().start as i32;
-                metadata[row * 3 + 2] = (view.positions().end - range.len() + local + 1) as i32;
+                metadata[row * 3 + 1] = (view.positions().end - range.len() + local) as i32;
+                metadata[row * 3 + 2] = view.positions().start as i32;
             }
         }
-        // SAFETY: the same submission has already updated every mapping and written KV.
-        let out = unsafe {
-            let metadata = api::copy_host_vec_to_device(&Arc::new(metadata))
-                .execute(exec)?
-                .reshape(&[rows, 3])?;
-            let (k, v, table) = first.tensors();
-            kernels::attention(
-                value(out).partition([1, INPUT_DIM]),
-                q,
-                k.clone(),
-                v.clone(),
-                table.clone(),
-                metadata,
-            )
-            .map(|(out, ..)| out)
-            .unpartition()
-            .execute(exec)?
-        };
+        // SAFETY: validated views and query metadata describe the same batch.
+        unsafe {
+            let metadata = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(metadata))
+                    .execute(exec)?
+                    .reshape(&[rows, 3])?,
+            );
+            let metadata_view = metadata.view(&[rows, 3])?;
+            self.submit_prepared(q, views, &metadata_view, out, exec)
+        }
+    }
+
+    fn empty_metadata(rows: usize) -> Vec<i32> {
+        let mut metadata = vec![-1i32; rows * 3];
+        for entry in metadata.chunks_exact_mut(3) {
+            entry[2] = 0;
+        }
+        metadata
+    }
+
+    /// Caller validates common cache storage and row/window bounds before uploading
+    /// metadata. Mapping and K/V writes precede this launch on the same exec.
+    unsafe fn submit_prepared(
+        &self,
+        q: Arc<Tensor<f32>>,
+        views: &[NaiveReadView<'_>],
+        metadata: &DeviceTensorView<'_, i32>,
+        out: Tensor<f32>,
+        exec: &ExecutionContext,
+    ) -> Result<Arc<Tensor<f32>>, ModelError> {
+        let first = views
+            .first()
+            .ok_or_else(|| ModelError::InvalidInput("empty attention batch".into()))?;
+        for view in views {
+            view.retain(exec)?;
+        }
+        let (k, v, table) = first.tensors();
+        let out = kernels::attention(
+            value(out).partition([1, INPUT_DIM]),
+            q,
+            k.clone(),
+            v.clone(),
+            table.clone(),
+            metadata,
+        )
+        .map(|(out, ..)| out)
+        .unpartition()
+        .execute(exec)?;
         Ok(Arc::new(out))
     }
 }
@@ -655,7 +743,7 @@ mod kernels {
         cache_k_ptr: *mut f32,
         cache_v_ptr: *mut f32,
         slot_table_base: *const i32,
-        metadata: &Tensor<i32, { [-1, 2] }>,
+        metadata: &Tensor<i32, { [-1, 3] }>,
         table_width: i32,
     ) {
         let pid = get_tile_block_id();
@@ -760,15 +848,16 @@ mod kernels {
         let history_start: i32 = tile_to_scalar(
             metadata
                 .partition(shape![1, 1])
-                .load([i, 1])
-                .reshape(shape![]),
-        );
-        let history_end: i32 = tile_to_scalar(
-            metadata
-                .partition(shape![1, 1])
                 .load([i, 2])
                 .reshape(shape![]),
         );
+        let position: i32 = tile_to_scalar(
+            metadata
+                .partition(shape![1, 1])
+                .load([i, 1])
+                .reshape(shape![]),
+        );
+        let history_end = position + 1;
         if history_end > history_start {
             let query = q.partition(shape![1, 16]).load([i, 0]);
             let mut maximum: Tile<f32, { [1, 1] }> = constant(f32::NEG_INFINITY, shape![1, 1]);

@@ -189,10 +189,27 @@ impl<P: KVPool> KVContext<P> {
         appends: &mut [(&mut Self, usize)],
         exec: &ExecutionContext,
     ) -> ContextResult<()> {
-        let _range = crate::profiling::ScopedRange::new(c"prepare_append_batch");
-        let Some((first, _)) = appends.first() else {
+        if appends.is_empty() {
             return Ok(());
-        };
+        }
+        Self::prepare_batch_with(appends, exec, |pool, states, exec| {
+            pool.prepare_append_batch(states, exec)
+        })
+    }
+
+    pub(super) fn prepare_batch_with<T>(
+        appends: &mut [(&mut Self, usize)],
+        exec: &ExecutionContext,
+        prepare: impl FnOnce(
+            &P,
+            &mut [(&mut P::ContextState, Range<usize>)],
+            &ExecutionContext,
+        ) -> Result<T>,
+    ) -> ContextResult<T> {
+        let _range = crate::profiling::ScopedRange::new(c"prepare_append_batch");
+        let (first, _) = appends
+            .first()
+            .ok_or_else(|| KVContextError::InvalidState("empty append batch".into()))?;
         let pool = first.pool.clone();
         for (context, count) in appends.iter() {
             if !Arc::ptr_eq(&pool, &context.pool) {
@@ -223,11 +240,11 @@ impl<P: KVPool> KVContext<P> {
                 )
             })
             .collect();
-        pool.prepare_append_batch(&mut states, exec)?;
+        let output = prepare(&pool, &mut states, exec)?;
         for (context, _) in appends {
             context.allocated_len = context.pending.as_ref().unwrap().end;
         }
-        Ok(())
+        Ok(output)
     }
 
     /// View all reserved positions, including history and the current pending append.

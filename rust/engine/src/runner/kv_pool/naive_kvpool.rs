@@ -10,11 +10,13 @@ use cuda_async::{
 };
 use cutile::{
     api,
-    tensor::{Reshape, Tensor, TensorView},
+    tensor::{Tensor, TensorView},
     tile_kernel::TileKernel,
 };
 
-use super::{BufferMetrics, KVPool, KVPoolError, KVPoolMetrics};
+use crate::runner::upload::UploadPool;
+
+use super::{BufferMetrics, KVContext, KVContextError, KVPool, KVPoolError, KVPoolMetrics};
 
 type Result<T> = std::result::Result<T, KVPoolError>;
 
@@ -68,6 +70,66 @@ pub struct NaiveKVPool {
     slot_table: Arc<Tensor<i32>>,
     config: NaiveKVPoolConfig,
     allocation: Arc<Mutex<Allocation>>,
+    mapping_uploads: Arc<UploadPool>,
+}
+
+/// Opaque mapping payload and its GPU destination, produced during CPU reservation.
+pub(in crate::runner) struct NaiveMappingPlan {
+    updates: Vec<i32>,
+    table: Arc<Tensor<i32>>,
+}
+
+impl NaiveMappingPlan {
+    pub(in crate::runner) fn payload(&self) -> &[i32] {
+        &self.updates
+    }
+
+    /// Submit on the same still-active exec that reserved the slots. The payload
+    /// must be uploaded unchanged at offset; dependent K/V work uses this exec too.
+    pub(in crate::runner) unsafe fn submit(
+        &self,
+        upload: &Arc<Tensor<i32>>,
+        offset: usize,
+        exec: &ExecutionContext,
+    ) -> Result<()> {
+        if self.updates.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(self.updates.len())
+            .filter(|&end| end <= upload.size())
+            .ok_or_else(|| KVPoolError::InvalidInput("mapping payload exceeds upload".into()))?;
+        if upload.shape().len() != 1
+            || upload.device_id() != self.table.device_id()
+            || exec.get_device_id() != self.table.device_id()
+        {
+            return Err(KVPoolError::InvalidInput(
+                "mapping upload shape or device differs".into(),
+            ));
+        }
+        let count = self.updates.len() / 2;
+        let flat = upload.slice(&[offset..end])?;
+        let updates = flat.view(&[2, count])?;
+        exec.retain(self.table.clone())?;
+        kernels::bind_batch(self.table.device_pointer(), &updates)
+            .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
+            .grid((count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
+            .execute(exec)?;
+        Ok(())
+    }
+}
+
+impl KVContext<NaiveKVPool> {
+    /// Naive-only deferred reservation for packing mapping and model uploads.
+    /// Submit the plan before K/V access; commit only after successful GPU completion.
+    pub(in crate::runner) fn reserve_append_batch(
+        appends: &mut [(&mut Self, usize)],
+        exec: &ExecutionContext,
+    ) -> std::result::Result<NaiveMappingPlan, KVContextError> {
+        Self::prepare_batch_with(appends, exec, |pool, states, exec| {
+            pool.reserve_append_batch(states, exec)
+        })
+    }
 }
 
 struct Allocation {
@@ -245,6 +307,7 @@ impl NaiveKVPool {
             layers,
             slot_table,
             config,
+            mapping_uploads: Arc::default(),
             allocation: Arc::new(Mutex::new(Allocation {
                 free_rows: (0..config.max_rows).rev().collect(),
                 free_slots: (0..config.num_slots as i32).rev().collect(),
@@ -325,6 +388,27 @@ impl NaiveKVPool {
         Ok(new_slots)
     }
 
+    /// Reserve slots on CPU, leaving the upload/bind to the returned backend plan.
+    pub(in crate::runner) fn reserve_append_batch(
+        &self,
+        appends: &mut [(&mut NaiveContextState, Range<usize>)],
+        exec: &ExecutionContext,
+    ) -> Result<NaiveMappingPlan> {
+        let mut offsets = Vec::new();
+        let mut slot_ids = Vec::new();
+        for (state, positions) in appends {
+            let slots = self.reserve_append(state, positions.clone(), exec)?;
+            let base = state.lease.row * self.config.max_seq_len;
+            offsets.extend(positions.clone().map(|position| (base + position) as i32));
+            slot_ids.extend(slots);
+        }
+        offsets.extend(slot_ids);
+        Ok(NaiveMappingPlan {
+            updates: offsets,
+            table: self.slot_table.clone(),
+        })
+    }
+
     fn validate_state(&self, state: &NaiveContextState) -> Result<()> {
         if !Arc::ptr_eq(&self.allocation, &state.lease.allocation) {
             return Err(KVPoolError::InvalidInput(
@@ -383,7 +467,10 @@ impl KVPool for NaiveKVPool {
         let new_slots = self.reserve_append(state, positions.clone(), exec)?;
         // SAFETY: exec owns the submission; its caller establishes completion.
         unsafe {
-            let indices = api::copy_host_vec_to_device(&Arc::new(new_slots)).execute(exec)?;
+            let count = new_slots.len();
+            let indices = self
+                .mapping_uploads
+                .upload(Arc::new(new_slots), &[count], exec)?;
             // The raw GPU pointer passed to bind carries no ownership: retain the
             // table until submission completion. Arc::clone does not copy GPU data.
             exec.retain(self.slot_table.clone())?;
@@ -408,37 +495,24 @@ impl KVPool for NaiveKVPool {
         Ok(())
     }
 
-    /// Upload all [destination offsets; slot IDs] together and scatter in one launch.
+    /// Compatibility path for callers that want reservation and immediate submission.
     fn prepare_append_batch(
         &self,
         appends: &mut [(&mut Self::ContextState, Range<usize>)],
         exec: &ExecutionContext,
     ) -> Result<()> {
-        if appends.is_empty() {
+        let mapping = self.reserve_append_batch(appends, exec)?;
+        if mapping.payload().is_empty() {
             return Ok(());
         }
-        let mut offsets = Vec::new();
-        let mut slot_ids = Vec::new();
-        for (state, positions) in appends {
-            let slots = self.reserve_append(state, positions.clone(), exec)?;
-            let base = state.lease.row * self.config.max_seq_len;
-            offsets.extend(positions.clone().map(|position| (base + position) as i32));
-            slot_ids.extend(slots);
-        }
-        let count = slot_ids.len();
-        // Shape [2, count]: first row is table offsets, second row is slot IDs.
-        offsets.extend(slot_ids);
-        // SAFETY: exec retains all state leases and the table until completion.
-        // Later model work uses this same exec, so it observes the mapping updates.
+        // SAFETY: the same exec retains the upload and all reservations until completion.
         unsafe {
-            let updates = api::copy_host_vec_to_device(&Arc::new(offsets))
-                .execute(exec)?
-                .reshape(&[2, count])?;
-            exec.retain(self.slot_table.clone())?;
-            kernels::bind_batch(self.slot_table.device_pointer(), updates)
-                .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
-                .grid((count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
-                .execute(exec)?;
+            let upload = self.mapping_uploads.upload(
+                Arc::new(mapping.payload().to_vec()),
+                &[mapping.payload().len()],
+                exec,
+            )?;
+            mapping.submit(&upload, 0, exec)?;
         }
         Ok(())
     }
@@ -704,6 +778,111 @@ mod tests {
         device_operation::{value, with_context},
     };
     use cutile::tensor::{Reshape, ToHostVec};
+
+    /// CPU reservation is separate from GPU binding; the plan consumes only its
+    /// subrange in a larger upload, including an unaligned prefix and tile tail.
+    #[tokio::test]
+    async fn deferred_mapping_binds_only_after_submit_from_packed_subrange() -> Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_slots: 512,
+                max_rows: 2,
+                max_seq_len: 256,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let uploads = Arc::new(UploadPool::default());
+        let initial = pool.metrics();
+        let mut contexts = [KVContext::new(pool.clone())?, KVContext::new(pool.clone())?];
+        let counts = [129, 3];
+        let table = with_context(|exec| {
+            value((|| -> Result<_> {
+                let mut appends: Vec<_> = contexts.iter_mut().zip(counts).collect();
+                let plan = KVContext::reserve_append_batch(&mut appends, exec)?;
+                for (context, count) in contexts.iter().zip(counts) {
+                    assert_eq!(context.ready_len(), 0);
+                    assert_eq!(context.allocated_len(), count);
+                }
+                // SAFETY: this read and later bind are ordered on the same exec.
+                let before = unsafe { pool.slot_table.clone().to_host_vec().execute(exec)? };
+                assert!(
+                    before.iter().all(|&slot| slot == 0),
+                    "reservation submitted GPU mapping work"
+                );
+                let mut packed = vec![12345i32; 7];
+                packed.extend_from_slice(plan.payload());
+                packed.extend([54321; 5]);
+                let len = packed.len();
+                // SAFETY: the uploaded plan is unchanged and all work uses exec.
+                unsafe {
+                    let upload = uploads.upload(Arc::new(packed), &[len], exec)?;
+                    assert!(plan.submit(&upload, usize::MAX, exec).is_err());
+                    plan.submit(&upload, 7, exec)?;
+                    Ok(pool.slot_table.clone().to_host_vec().execute(exec)?)
+                }
+            })())
+        })
+        .schedule(&policy)?
+        .await??;
+        let mut expected = vec![0i32; 2 * 256];
+        for context in &contexts {
+            let state = context.state();
+            let slots = state.lease.slots.lock().unwrap();
+            let base = state.lease.row * 256;
+            expected[base..base + slots.len()].copy_from_slice(&slots);
+        }
+        assert_eq!(table, expected);
+        for context in &mut contexts {
+            context.commit_append()?;
+        }
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    /// Dropping an unsubmitted plan on failure never advances logical progress or
+    /// recycles reserved slots before the submission releases its state leases.
+    #[tokio::test]
+    async fn unsubmitted_mapping_plan_failure_releases_pending_reservations() -> Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_slots: 4,
+                max_rows: 2,
+                max_seq_len: 4,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let result = with_context(|exec| {
+            value((|| -> Result<()> {
+                let plan = KVContext::reserve_append_batch(&mut [(&mut a, 2), (&mut b, 1)], exec)?;
+                assert_eq!(a.ready_len(), 0);
+                assert_eq!(b.ready_len(), 0);
+                drop(plan);
+                a.release();
+                b.release();
+                assert_eq!(pool.metrics().layers.assigned_bytes, 3 * 2 * 4 * 4);
+                anyhow::bail!("injected failure before mapping submit")
+            })())
+        })
+        .schedule(&policy)?
+        .await?;
+        assert!(result.is_err());
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
 
     /// Batch mappings cover multiple rows, nonzero append starts, and partial tiles.
     #[tokio::test]

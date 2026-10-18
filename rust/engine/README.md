@@ -141,16 +141,28 @@ tracing selects hardware trace where supported; GPU metrics sample device 0.
 Profiling can perturb timings, so compare wall times without the profiler.
 NVTX ranges label the synchronous `prepare_append_batch`, `submit_batch`, and
 `commit_append` calls. Prepare/submit occur per batch; commit occurs per request.
-The Naive pool uploads one packed mapping update and launches one `bind_batch`
-kernel per batch; the single-context prepare API remains available.
+The Naive pool reserves slots on CPU and returns its concrete `NaiveMappingPlan`.
+This deferred-upload API is specific to Naive; the public `KVPool` trait only
+exposes the ordinary preparation contract.
+The model packs that plan's payload with token IDs and shared query metadata,
+then performs one upload before bind and model kernels. The single-context
+prepare API and automatic batch prepare API remain available.
 These ranges measure CPU work and submission, not GPU completion or the outer await.
+On the packed path, prepare covers CPU reservation only; submit includes upload
+and bind, so compare combined phases or full model latency across versions.
 
 The attention MLP reuses six floating-point scratch buffers per workspace.
 A submission exclusively checks out an exact-shape workspace for its device;
 in-flight ownership and tensor handles prevent reuse until completion.
 The idle cache retains at most four workspaces. GEMM/matvec start accumulators
 at zero, so reused output buffers need no per-batch clearing. Input/metadata
-uploads and the final pageable host readback retain their existing behavior.
+uploads use a separate integer buffer pool (at most four idle buffers per pool).
+KV mapping updates, token IDs, and shared query metadata occupy separate views
+of one reused device upload allocation, with no device-side copy between views.
+QKV and attention share `[context row, absolute position, history start]`
+metadata; attention derives its causal end as position + 1. The packed batch
+upload is submitted before bind and embedding. The final pageable host
+readback retains its existing behavior.
 
 The initial [results and commands](../profiling/simple_mlp_attn/RESULTS.md) include
 three unprofiled runs, CUDA kernel/API summaries, and a directly openable
