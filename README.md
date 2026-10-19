@@ -16,8 +16,8 @@ learning units; speculative decoding and the later plan remain unchanged.
 | 1 | [Model loader, formats, and storage](d1_model_formats/README.md) | ✅ Implemented |
 | 2 | [Scheduler/Runner framework + minimal GEMM/ReLU MLP](rust/engine/README.md), 预备知识 [Nvidia cutile-rs tutorials](https://nvlabs.github.io/cutile-rs/main/index.html) | ✅ Baseline implemented |
 | 3 | KVPool/KVContext, token-slot indirection, attention, and fused KV writes | ✅ Baseline implemented |
-| 4 | CUDA Graph, reusable workspace, and stable-address replay | ⏭ Next |
-| 5 | Step-level generation, continuous batching, and chunked prefill | ⬜ Planned |
+| 4 | CUDA Graph, pooled workspace/replay, and mapped host output | ✅ Baseline implemented |
+| 5 | Step-level generation, continuous batching, and chunked prefill | ⏭ Next |
 | 6 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
 | 7 | Quantization on the toy engine | ⬜ Planned |
 | 8 | Qwen2.5-0.5B-Instruct: real architecture and additional operators | ⬜ Planned |
