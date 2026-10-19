@@ -362,13 +362,19 @@ impl SimpleMLPEngine {
     ///   input from UploadPool. Each pool allocates on a miss and recycles only after
     ///   completion; later batches need not receive the same GPU addresses.
     /// - Graph checks out a GraphInstance. Only a cache miss allocates its private
-    ///   packed input and six scratch buffers, then warms and captures them. Every
-    ///   replay uses those same addresses, overwriting input contents without going
+    ///   GPU input, five GPU scratch buffers, and mapped host output, then warms
+    ///   and captures them. Every replay uses those same addresses, overwriting
+    ///   input contents without going
     ///   through WorkspacePool, UploadPool, or KVPool's mapping_uploads.
-    /// CPU mapping/IDs/metadata and the host readback Vec are allocated per batch
-    /// in either mode. Both paths share model weights and KVPool's stable K/V and
-    /// slot_table backing allocations; row/slot contents change. Request leases
-    /// survive GPU completion but are never cached in graphs.
+    /// Graph output is fixed mapped host memory: the final kernel writes through
+    /// its GPU alias, so replay needs no DtoH command. CPU access waits for the
+    /// outer exec to complete; a short inline poll budget avoids notification
+    /// overhead, with DeviceFuture providing the fallback for longer work.
+    /// CPU mapping/IDs/metadata and the returned host Vec are allocated per batch
+    /// in either mode. Eager reads GPU output back into that Vec; graph copies its
+    /// completed mapped output into it on CPU. Both paths share model weights and
+    /// KVPool's stable K/V and slot_table backing allocations; row/slot contents
+    /// change. Request leases survive GPU completion but are never cached in graphs.
     async fn forward_batch(
         &self,
         mut batch: Vec<ModelInput<'_, NaiveKVPool>>,
@@ -612,6 +618,8 @@ impl SimpleMLPEngine {
             kernels::relu((&mut buffers.hidden).partition([TILE, TILE]))
                 .generics(vec!["4".into(), "4".into()]),
         )?;
+        // Same matvec in both modes. Eager supplies a GPU-memory output tensor;
+        // graph supplies a Tensor wrapping mapped host RAM's device alias.
         recorder.record(
             kernels::matvec(
                 (&mut buffers.output).partition([TILE]),
@@ -667,7 +675,7 @@ impl SimpleMLPEngine {
                 .map_err(cuda_async::error::DeviceError::from)?;
             let input =
                 Arc::new(api::copy_host_vec_to_device(&prepared.payload).sync_on(&capture_stream)?);
-            let mut buffers = graph::allocate(rows, &capture_stream)?;
+            let (mut buffers, output) = graph::allocate(rows, &capture_stream)?;
             // Warm JIT/modules outside capture using this batch's valid payload.
             // All kernels overwrite outputs; repeating current-append KV writes
             // does not advance ready_len or change the mathematical result.
@@ -700,7 +708,8 @@ impl SimpleMLPEngine {
             Ok(GraphInstance {
                 key,
                 input,
-                buffers,
+                _buffers: buffers,
+                output,
                 graph,
             })
         })?;
@@ -710,6 +719,10 @@ impl SimpleMLPEngine {
             value(unsafe { lease.execute(prepared.payload.clone(), run) })
         });
         let output = cuda_async::device_future::DeviceFuture::scheduled(operation, exec).await??;
+        // Exhausting the inline poll budget is not a completion signal. This
+        // await also covers asynchronous fallback before any CPU host-pointer read.
+        // SAFETY: await establishes visibility of the graph's writes to mapped RAM.
+        let output = unsafe { output.read() };
         for input in batch {
             input.kv.commit_append()?;
         }
@@ -1136,6 +1149,8 @@ mod kernels {
                 tile_z,
             );
         }
+        // Store through the caller's output address. On the graph path this
+        // writes mapped host RAM over the interconnect, without a DtoH command.
         z.store(tile_z.reshape(shape![BM]));
     }
 }
@@ -1168,6 +1183,127 @@ mod tests {
                 initial,
                 "graph retained a request state lease"
             );
+        }
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (1, 3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_mapped_output_matches_ragged_prefill_and_repeated_append(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = SimpleMLPEngine::random(0).await?.with_cuda_graphs();
+        let policy = model.weight_policy.clone();
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_slots: 512,
+                max_rows: 8,
+                max_seq_len: 512,
+                ..NaiveKVPoolConfig::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        let mut contexts = (0..5)
+            .map(|_| KVContext::new(pool.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut histories: Vec<Vec<u32>> = [1, 8, 17, 33, 257]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| (0..len).map(|p| ((i * 31 + p * 7) % 256) as u32).collect())
+            .collect();
+        for round in 0..3 {
+            if round != 0 {
+                for (i, tokens) in histories.iter_mut().enumerate() {
+                    let start = tokens.len();
+                    tokens.extend((start..start + 2).map(|p| ((i * 31 + p * 7) % 256) as u32));
+                }
+            }
+            let output = model
+                .forward_batch(
+                    contexts
+                        .iter_mut()
+                        .zip(&histories)
+                        .map(|(kv, tokens)| ModelInput {
+                            kv,
+                            token_ids: tokens,
+                        })
+                        .collect(),
+                    policy.clone(),
+                )
+                .await?;
+            for ((actual, tokens), context) in output.into_iter().zip(&histories).zip(&contexts) {
+                close(
+                    actual,
+                    cpu_reference(tokens, &weights, model.config.input_divisor),
+                );
+                assert_eq!(context.ready_len(), tokens.len());
+            }
+        }
+        // One large prefill instance and one padded decode instance reused twice.
+        assert_eq!(model.graphs.as_ref().unwrap().stats(), (2, 3));
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    /// Large graphs exceed the inline budget on this workload. New data on every
+    /// replay must reach the host before returning, including notification completion.
+    #[tokio::test]
+    async fn graph_mapped_output_replays_long_stateless_inputs() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = SimpleMLPEngine::random(0).await?.with_cuda_graphs();
+        let policy = model.weight_policy.clone();
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                max_rows: 8,
+                ..NaiveKVPoolConfig::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut weights = Vec::new();
+        for weight in &model.layers {
+            weights.push(weight.clone().to_host_vec().schedule(&policy)?.await?);
+        }
+        for round in 0..3 {
+            let histories: Vec<Vec<u32>> = (0..5)
+                .map(|i| {
+                    (0..512)
+                        .map(|p| ((round * 17 + i * 37 + p * 11) % 256) as u32)
+                        .collect()
+                })
+                .collect();
+            let mut contexts = (0..5)
+                .map(|_| KVContext::new(pool.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let output = model
+                .forward_batch(
+                    contexts
+                        .iter_mut()
+                        .zip(&histories)
+                        .map(|(kv, tokens)| ModelInput {
+                            kv,
+                            token_ids: tokens,
+                        })
+                        .collect(),
+                    policy.clone(),
+                )
+                .await?;
+            for (actual, tokens) in output.into_iter().zip(&histories) {
+                close(
+                    actual,
+                    cpu_reference(tokens, &weights, model.config.input_divisor),
+                );
+            }
+            drop(contexts);
+            assert_eq!(pool.metrics(), initial);
         }
         assert_eq!(model.graphs.as_ref().unwrap().stats(), (1, 3));
         Ok(())

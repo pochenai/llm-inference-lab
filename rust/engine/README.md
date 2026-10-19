@@ -161,21 +161,30 @@ KV mapping updates, token IDs, and shared query metadata occupy separate views
 of one reused device upload allocation, with no device-side copy between views.
 QKV and attention share `[context row, absolute position, history start]`
 metadata; attention derives its causal end as position + 1. The packed batch
-upload is submitted before bind and embedding. The final pageable host
-readback retains its existing behavior.
+upload is submitted before bind and embedding. Eager execution retains its
+pageable host readback.
 
 CUDA Graph replay is optional: enable it with
 `SimpleMLPEngine::random(0).await?.with_cuda_graphs()` (or after `load`/`new`).
 The profiling example accepts `--cuda-graph`; experiment commands and measurements
 belong in the local results file linked below. Eager execution remains the default.
-Each graph owns fixed input and scratch allocations and captures bind plus the
-seven model kernels through `CudaGraph::scope`. Scratch consists of ordinary
-owned tensors borrowed by each recorded operation; no scratch alias handles are
-created for warmup or capture. Eager execution and capture share the same kernel
-definitions, with capture restricted to `GraphNode` operations. Each replay
-uploads the new packed payload, launches once,
-and performs the existing pageable readback. CPU reservation, upload, readback,
-and KV commit remain outside capture; logical progress advances after completion.
+Each graph owns fixed GPU input, five GPU scratch allocations, and a mapped
+page-locked host output. It captures bind plus the seven model kernels through
+`CudaGraph::scope`, borrowing ordinary tensor handles for each operation. Eager
+execution and capture share the same kernel definitions, with capture restricted
+to `GraphNode` operations. The final matvec writes its output through the host
+allocation's CUDA device alias, eliminating a separate DtoH command for these
+small scalar outputs. This still transfers data over the interconnect; it does
+not move intermediate computation into host memory.
+
+Each replay uploads the packed payload using the original pageable HtoD path,
+then launches once. It polls for completion inline for at most 2 ms before
+falling back to the existing DeviceFuture completion mechanism. This favors
+latency for short graphs at the cost of occupying the calling CPU thread during
+polling; no global runtime setting is changed. After outer completion, the CPU
+copies the mapped result into the returned Vec and commits KV progress. A result
+lease keeps the mapped storage and instance alive until consumption. CPU
+reservation and upload remain outside capture. Eager execution is unchanged.
 
 Graphs are captured lazily for a packed shape, KV backing store, and weight
 identity. A new instance allocates its private buffers and warms kernels on a
