@@ -15,7 +15,8 @@ use cutile::{
     tensor::Tensor,
 };
 
-use super::{workspace::Buffers, ModelError, INPUT_DIM};
+use super::super::ModelError;
+use super::{engine::INPUT_DIM, workspace::Buffers};
 
 const MAX_IDLE_GRAPHS: usize = 4;
 // Short graphs finish inline without a reactor/wakeup round trip. Longer work
@@ -27,21 +28,21 @@ const INLINE_COMPLETION_BUDGET: Duration = Duration::from_millis(2);
 /// Addresses and launch geometry baked into a graph; request data is not a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GraphKey {
-    pub device: usize,
-    pub rows: usize,
-    pub mapping_words: usize,
-    pub payload_words: usize,
-    pub cache: [usize; 3],
-    pub weights: [usize; 6],
+    pub(super) device: usize,
+    pub(super) rows: usize,
+    pub(super) mapping_words: usize,
+    pub(super) payload_words: usize,
+    pub(super) cache: [usize; 3],
+    pub(super) weights: [usize; 6],
 }
 
 /// Private fixed buffers. Capture owners never include a request's KV state lease.
 pub(super) struct GraphInstance {
-    pub key: GraphKey,
-    pub input: Arc<Tensor<i32>>,
-    pub _buffers: Buffers<Tensor<f32>>,
-    pub output: Arc<MappedOutput>,
-    pub graph: CudaGraph<()>,
+    pub(super) key: GraphKey,
+    pub(super) input: Arc<Tensor<i32>>,
+    pub(super) _buffers: Buffers<Tensor<f32>>,
+    pub(super) output: Arc<MappedOutput>,
+    pub(super) graph: CudaGraph<()>,
 }
 
 #[derive(Default)]
@@ -53,7 +54,7 @@ pub(super) struct GraphPool {
 
 impl GraphPool {
     /// Called outside DeviceOp execution: capture acquires its own execution lock.
-    pub fn acquire(
+    pub(super) fn acquire(
         self: &Arc<Self>,
         key: GraphKey,
         build: impl FnOnce() -> Result<GraphInstance, ModelError>,
@@ -79,7 +80,7 @@ impl GraphPool {
     }
 
     #[cfg(test)]
-    pub fn stats(&self) -> (usize, usize) {
+    pub(super) fn stats(&self) -> (usize, usize) {
         (
             self.captures.load(Ordering::Relaxed),
             self.replays.load(Ordering::Relaxed),
@@ -96,7 +97,7 @@ pub(super) struct GraphLease {
 impl GraphLease {
     /// Caller owns exec. Upload and replay use its stream; output stores target
     /// mapped host memory. Never read that memory until the outer exec completes.
-    pub unsafe fn execute(
+    pub(super) unsafe fn execute(
         self: &Arc<Self>,
         payload: Arc<Vec<i32>>,
         exec: &ExecutionContext,
@@ -153,7 +154,7 @@ impl Readback {
     /// The outer execution context must have completed before reading GPU stores.
     /// The lease keeps host/device aliases alive and prevents instance recycling
     /// even if completion used the asynchronous fallback.
-    pub unsafe fn read(self) -> Vec<f32> {
+    pub(super) unsafe fn read(self) -> Vec<f32> {
         let output = &self.lease.instance.as_ref().unwrap().output;
         // Both source and destination are CPU RAM: copy completed values from
         // the pinned allocation into an ordinary Vec, not from GPU memory.

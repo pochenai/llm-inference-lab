@@ -5,44 +5,78 @@ use cuda_async::{
     device_operation::{DeviceOp, ExecutionContext},
     error::DeviceError,
 };
-use cutile::{api, cuda_core::memcpy_htod_async, tensor::Tensor};
+use cutile::{
+    api,
+    cuda_core::{memcpy_htod_async, DType},
+    tensor::Tensor,
+};
 
 const MAX_IDLE_BUFFERS: usize = 4;
 
 /// Reusable integer upload destinations, exclusively leased per submission.
 #[derive(Default)]
-pub(super) struct UploadPool {
-    idle: Mutex<Vec<Arc<Tensor<i32>>>>,
+pub(super) struct UploadPool<T: DType = i32> {
+    idle: Mutex<Vec<Arc<Tensor<T>>>>,
+    host_idle: Mutex<Vec<Arc<Vec<T>>>>,
 }
 
-impl UploadPool {
+impl<T: DType> UploadPool<T> {
+    /// Copy a borrowed slice into reusable owned staging memory. Only cache-exclusive
+    /// buffers can be refilled; exec retains each upload source through completion.
+    /// Cache hits reuse the staging Vec and its Arc owner; capacity grows only as needed.
+    pub unsafe fn upload_slice(
+        self: &Arc<Self>,
+        data: &[T],
+        exec: &ExecutionContext,
+    ) -> Result<Arc<Tensor<T>>, DeviceError> {
+        let source = {
+            let mut idle = self.host_idle.lock().unwrap();
+            if let Some(source) = idle.iter_mut().find_map(|entry| {
+                let buffer = Arc::get_mut(entry)?;
+                buffer.clear();
+                buffer.extend_from_slice(data);
+                Some(entry.clone())
+            }) {
+                source
+            } else {
+                let source = Arc::new(data.to_vec());
+                if idle.len() < MAX_IDLE_BUFFERS {
+                    idle.push(source.clone());
+                }
+                source
+            }
+        };
+        self.upload(source, &[data.len()], exec)
+    }
+
     /// Caller owns exec and must establish GPU completion. All consumers must run
     /// on exec until it finishes; source/destination owners survive cancellation.
     pub unsafe fn upload(
         self: &Arc<Self>,
-        data: Arc<Vec<i32>>,
+        data: Arc<impl AsRef<[T]> + Send + Sync + 'static>,
         shape: &[usize],
         exec: &ExecutionContext,
-    ) -> Result<Arc<Tensor<i32>>, DeviceError> {
+    ) -> Result<Arc<Tensor<T>>, DeviceError> {
+        let values: &[T] = data.as_ref().as_ref();
         let elements = shape.iter().try_fold(1usize, |n, &dim| {
             n.checked_mul(dim)
                 .filter(|&n| dim > 0 && n <= i32::MAX as usize)
         });
-        if elements != Some(data.len()) || data.is_empty() {
+        if elements != Some(values.len()) || values.is_empty() {
             return Err(DeviceError::Internal("invalid integer upload shape".into()));
         }
         let cached = {
             let mut idle = self.idle.lock().unwrap();
             idle.iter()
                 .position(|tensor| {
-                    tensor.size() == data.len() && tensor.device_id() == exec.get_device_id()
+                    tensor.size() == values.len() && tensor.device_id() == exec.get_device_id()
                 })
                 .map(|index| idle.swap_remove(index))
         };
         let tensor = match cached {
             Some(tensor) => tensor,
             // Initialize once on a miss. Upload overwrites every element each use.
-            None => Arc::new(api::zeros::<i32>(&[data.len()]).execute(exec)?),
+            None => Arc::new(api::zeros::<T>(&[values.len()]).execute(exec)?),
         };
         let lease = Arc::new(UploadLease {
             tensor: Some(tensor),
@@ -52,8 +86,8 @@ impl UploadPool {
         exec.retain(data.clone())?;
         memcpy_htod_async(
             lease.device_ptr(),
-            data.as_ptr(),
-            data.len(),
+            values.as_ptr(),
+            values.len(),
             exec.get_cuda_stream(),
         )?;
         let mut stride = 1i32;
@@ -73,14 +107,14 @@ impl UploadPool {
     }
 }
 
-struct UploadLease {
-    tensor: Option<Arc<Tensor<i32>>>,
-    pool: Arc<UploadPool>,
+struct UploadLease<T: DType> {
+    tensor: Option<Arc<Tensor<T>>>,
+    pool: Arc<UploadPool<T>>,
 }
 
 // SAFETY: the original tensor owns a fixed allocation with stable pointer, byte
 // length, and device ordinal for this lease's lifetime.
-unsafe impl DeviceAllocation for UploadLease {
+unsafe impl<T: DType> DeviceAllocation for UploadLease<T> {
     fn device_ptr(&self) -> u64 {
         self.tensor
             .as_ref()
@@ -96,7 +130,7 @@ unsafe impl DeviceAllocation for UploadLease {
     }
 }
 
-impl Drop for UploadLease {
+impl<T: DType> Drop for UploadLease<T> {
     fn drop(&mut self) {
         let mut idle = self.pool.idle.lock().unwrap();
         if idle.len() == MAX_IDLE_BUFFERS {
@@ -114,6 +148,51 @@ mod tests {
         device_operation::{value, with_context},
     };
     use cutile::tensor::ToHostVec;
+
+    #[tokio::test]
+    async fn borrowed_u32_upload_reuses_owned_staging_after_completion() -> Result<(), DeviceError>
+    {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = Arc::new(UploadPool::<u32>::default());
+        let mut host_pointer = None;
+        let mut device_pointer = None;
+        for mut input in [[1u32, 151935, 3, 4], [151645, 8, 7, 6]] {
+            let expected = input;
+            let (actual, pointer) = with_context(|exec| {
+                value((|| -> Result<_, DeviceError> {
+                    // SAFETY: upload leases both buffers until outer completion.
+                    let tensor = unsafe { pool.upload_slice(&input, exec)? };
+                    assert!(pool
+                        .host_idle
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|buffer| Arc::strong_count(buffer) > 1));
+                    // Source ownership is independent of the caller after upload.
+                    input.fill(0);
+                    let pointer = tensor.device_pointer().cu_deviceptr();
+                    let actual = unsafe { tensor.to_host_vec().execute(exec)? };
+                    Ok((actual, pointer))
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            assert_eq!(actual, expected);
+            let idle = pool.host_idle.lock().unwrap();
+            assert_eq!(idle.len(), 1);
+            let source = idle[0].as_ptr();
+            if let Some(previous) = host_pointer {
+                assert_eq!(source, previous);
+            }
+            if let Some(previous) = device_pointer {
+                assert_eq!(pointer, previous);
+            }
+            host_pointer = Some(source);
+            device_pointer = Some(pointer);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn uploads_reuse_storage_with_new_contents_and_shapes() -> Result<(), DeviceError> {

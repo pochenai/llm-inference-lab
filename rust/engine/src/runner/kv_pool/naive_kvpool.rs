@@ -30,6 +30,7 @@ pub struct NaiveKVPoolConfig {
     /// Maximum resident contexts; mapping rows are all preallocated at startup.
     pub max_rows: usize,
     pub max_seq_len: usize,
+    /// Stored K/V vector width per token; a backend may flatten kv_heads * head_dim here.
     pub head_dim: usize,
 }
 

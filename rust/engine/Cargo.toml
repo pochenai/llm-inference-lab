@@ -11,6 +11,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+futures = "0.3"
 dashmap = "6"
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -25,5 +26,6 @@ serde_json = "1"
 nvtx-sys = { version = "2", default-features = false }
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
 libloading = "0.8.9"
 tempfile = "3"

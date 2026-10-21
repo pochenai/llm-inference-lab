@@ -6,7 +6,8 @@ use cuda_async::{
 };
 use cutile::{api, tensor::Tensor};
 
-use super::{ModelError, INPUT_DIM};
+use super::super::ModelError;
+use super::engine::INPUT_DIM;
 
 // Bound retained memory across shape changes; in-flight checkouts are independent.
 const MAX_IDLE_WORKSPACES: usize = 4;
@@ -19,12 +20,12 @@ struct Workspace {
 
 /// One writable tensor handle per scratch allocation, private to this submission.
 pub(super) struct Buffers<T> {
-    pub x: T,
-    pub q: T,
-    pub attention: T,
-    pub residual: T,
-    pub hidden: T,
-    pub output: T,
+    pub(super) x: T,
+    pub(super) q: T,
+    pub(super) attention: T,
+    pub(super) residual: T,
+    pub(super) hidden: T,
+    pub(super) output: T,
 }
 
 #[derive(Default)]
@@ -35,7 +36,7 @@ pub(super) struct WorkspacePool {
 impl WorkspacePool {
     /// Borrow exact-shape scratch for one submission. Never share a checkout between
     /// batches. Allocation/initialization occurs only on a miss, normally in warmup.
-    pub unsafe fn acquire(
+    pub(super) unsafe fn acquire(
         self: &Arc<Self>,
         rows: usize,
         exec: &ExecutionContext,

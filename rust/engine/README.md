@@ -203,3 +203,64 @@ three unprofiled runs, CUDA kernel/API summaries, and a directly openable
 [Nsight Systems report](../profiling/simple_mlp_attn/uniform-b5-t16.nsys-rep).
 These local profiling artifacts are ignored by Git. The example uses libloading
 only as a dev dependency to resolve CUDA profiler APIs without a WSL linker path.
+
+## Qwen2.5-0.5B-Instruct: single-request correctness baseline
+
+`Qwen2Engine` loads a local Hugging Face checkpoint using the existing WeightLoader.
+The initial backend converts checkpoint weights to FP32 once and implements all
+numerical operators in cuTile: embedding, checkpoint-layout linear projections,
+RMSNorm, Q/K bias and split-half RoPE, causal GQA over mapped KV slots, residual,
+SwiGLU, the tied/untied LM head, and two-stage GPU greedy argmax. It does not invoke
+PyTorch, cuBLAS, or a Python model for inference. The optional Python script is an
+independent CPU/FP32 reference only.
+
+The new `CausalModel<P>` capability defines `next_token` and the framework-owned
+`generate_greedy` loop. Models supply a single step and EOS recognition; the shared
+loop returns a lazy `Stream<Item = Result<u32, ModelError>>`, appends raw token IDs
+before yielding, enforces the output limit, and yields EOS once before stopping.
+An error is yielded once and ends the stream. The example uses `try_collect` for
+a single response; incremental consumers can poll each token without allocating
+an output Vec. Dropping an unpolled stream does nothing; dropping between items
+preserves history/KV for continuation. Dropping an in-flight step may leave a
+pending append, requiring context release. CausalModel::execute_step exposes the safe prepare/await/commit boundary to backend
+implementers, while the same internal helper serves existing batch models. A sampled
+token enters CPU history before its KV is computed by the next step. Qwen's GQA
+backend implements the existing AttentionBackend contract; KVPool/ReadView/WriteView
+are reused, flattening two 64-dimensional KV heads into a 128-wide token vector.
+No operator-trait hierarchy or alternate cache allocator is required for this baseline.
+Token and diagnostic-logit readbacks enqueue asynchronous D2H copies into reusable
+pinned host buffers on the same execution context. The outer scheduled future awaits
+completion before KV commit and CPU reads; the submission retains both source and
+destination on cancellation. The Qwen forward path does not synchronize the stream
+or expose CPU readback data inside the submission callback.
+
+This example directly exercises CausalModel on one request. The existing Model,
+Scheduler/Runner response path and toy MLP remain unchanged; adapting the Runner to
+schedule causal steps is separate work. Qwen currently uses eager execution and
+fresh intermediates, not the toy model's specialized CUDA Graph/workspace path.
+This is a numerical/lifecycle baseline, not an optimized throughput result. Initial
+support requires full causal attention, unscaled RoPE, and 64-dimensional heads.
+The example supplies the explicit two-message Qwen2 chat template and uses pure
+greedy decoding (no repetition penalty or stochastic sampling).
+
+```bash
+# Point to an existing complete HF snapshot; no model download is performed.
+QWEN2_MODEL_DIR=/home/po/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- "$QWEN2_MODEL_DIR" --max-new-tokens 32
+
+# Independent reference: use an interpreter with installed CPU-capable torch/Transformers.
+env -u LD_LIBRARY_PATH PYENV_VERSION=3.14.3 python rust/engine/examples/qwen2_reference.py "$QWEN2_MODEL_DIR" --max-new-tokens 32 --output-dir rust/engine/artifacts/qwen2
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- "$QWEN2_MODEL_DIR" --max-new-tokens 32 --reference-dir rust/engine/artifacts/qwen2
+
+# Optional real-checkpoint regression: full/chunked prefill logits, decode and release.
+QWEN2_MODEL_DIR="$QWEN2_MODEL_DIR" QWEN2_REFERENCE_DIR="$PWD/rust/engine/artifacts/qwen2" cargo test --manifest-path rust/Cargo.toml --offline --release -p engine real_checkpoint_matches_reference_and_chunked_kv -- --ignored --nocapture
+```
+
+On revision `7ae5576`, CPU torch 2.9.1 / Transformers 5.3.0 FP32 eager references
+and cuTile greedy IDs matched for English and Chinese prompts. First-position
+vocabulary-wide max absolute logit errors were approximately `4.53e-5` and `3.19e-5`.
+The English run stopped at EOS after ten generated IDs and produced
+`Hello! How can I assist you today?`. The example asserts token agreement,
+logit error below `1e-3`, and KV allocation release. Local logs and reference data
+are under `rust/engine/artifacts/qwen2*` (ignored by Git). Timings include eager
+allocation and possible JIT and must not be interpreted as steady-state serving latency.

@@ -16,7 +16,8 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
+use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
 use cutile::cuda_core::Device;
 use engine::{
@@ -31,63 +32,30 @@ use engine::{
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+/// Profile uniform batches through Scheduler, Runner, and the attention MLP.
+#[derive(Parser)]
+#[command(
+    after_help = "Batch size 5 fills the Scheduler dispatch limit; smaller batches include its 100ms collection window."
+)]
 struct Options {
+    /// Number of requests per batch (1..=5).
+    #[arg(long, default_value_t = 5)]
     batch_size: usize,
+    /// Number of prompt tokens per request (1..=512).
+    #[arg(long, default_value_t = 16)]
     tokens: usize,
+    /// Number of warmup batches; must be positive.
+    #[arg(long, default_value_t = 3)]
     warmup: usize,
+    /// Number of measured batches; must be positive.
+    #[arg(long, default_value_t = 20)]
     iterations: usize,
+    /// Enable the CUDA profiler capture range after warmup.
+    #[arg(long)]
     profile: bool,
+    /// Enable CUDA Graph execution.
+    #[arg(long)]
     cuda_graph: bool,
-}
-
-impl Options {
-    fn parse() -> Result<Self> {
-        let mut options = Self {
-            batch_size: 5,
-            tokens: 16,
-            warmup: 3,
-            iterations: 20,
-            profile: false,
-            cuda_graph: false,
-        };
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            if arg == "--cuda-graph" {
-                options.cuda_graph = true;
-                continue;
-            }
-            if arg == "--profile" {
-                options.profile = true;
-                continue;
-            }
-            if arg == "--help" {
-                println!("simple_mlp_attn [--batch-size 1..5] [--tokens 1..512] [--warmup N] [--iterations N] [--profile] [--cuda-graph]");
-                println!("Batch size 5 fills the Scheduler dispatch limit; smaller batches include its 100ms collection window.");
-                std::process::exit(0);
-            }
-            let value: usize = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))?
-                .parse()?;
-            match arg.as_str() {
-                "--batch-size" => options.batch_size = value,
-                "--tokens" => options.tokens = value,
-                "--warmup" => options.warmup = value,
-                "--iterations" => options.iterations = value,
-                _ => bail!("unknown option {arg}"),
-            }
-        }
-        ensure!(
-            (1..=5).contains(&options.batch_size),
-            "batch size must be 1..5"
-        );
-        ensure!((1..=512).contains(&options.tokens), "tokens must be 1..512");
-        ensure!(
-            options.warmup > 0 && options.iterations > 0,
-            "warmup and iterations must be positive"
-        );
-        Ok(options)
-    }
 }
 
 /// Example-only timing excludes Scheduler queueing/tokenization and Runner decoding.
@@ -154,7 +122,16 @@ fn median(samples: &mut [f64]) -> f64 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let options = Options::parse()?;
+    let options = Options::parse();
+    ensure!(
+        (1..=5).contains(&options.batch_size),
+        "batch size must be 1..5"
+    );
+    ensure!((1..=512).contains(&options.tokens), "tokens must be 1..512");
+    ensure!(
+        options.warmup > 0 && options.iterations > 0,
+        "warmup and iterations must be positive"
+    );
     let device = Device::new(0)?;
     // SAFETY: load the installed CUDA driver and its documented no-argument profiler APIs.
     // Dynamic loading avoids requiring a link-time libcuda.so search path under WSL.

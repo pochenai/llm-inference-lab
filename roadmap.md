@@ -2,6 +2,13 @@
 
 更新日期：2026-10-19。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
 
+# next weekroad map
+补最小 step 接口和 greedy 生成循环。
+提前跑通 Qwen2.5-0.5B-Instruct 的单请求浮点生成，用参考实现验证 logits 和 tokens。
+测短/长 prefill、单请求 decode、普通 batch decode，找到真实瓶颈。
+再选择量化/算子优化，或者最小 continuous batching。
+Chunked prefill、radix、复杂调度策略由对应负载触发。
+
 ## 1. 目标、投入与学习边界
 
 **Goal: learn inference mechanisms by extending one working engine: start with the smallest MLP, validate execution and state-management techniques on that model, then support Qwen2.5-0.5B-Instruct. Each phase leaves a reproducible baseline; production completeness and performance records are not required.**

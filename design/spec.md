@@ -367,6 +367,55 @@ tokens. Runner checks full-history length against max_seq_len per request.
 Cached logits or final-token replay are future work. A real multi-layer model repeats the shared
 projection/cache-write/attention/FFN stage per attention layer inside the same execution boundary.
 
+## Causal model stepping capability
+
+The scalar demo's Model API stays unchanged. CausalModel adds the token-ID stepping
+capability needed for a real decoder without forcing a vocabulary head into the toy
+MLP or placing a model-specific generation loop in every implementation.
+
+```rust
+pub trait CausalModel<P: KVPool>: Send + Sync {
+    /// Framework-controlled reserve -> submit -> await -> commit for one context.
+    fn execute_step<T: Send>(input: ModelInput<'_, P>,
+        policy: &Arc<dyn SchedulingPolicy>,
+        submit: impl FnOnce(&mut ModelInput<'_, P>, &ExecutionContext)
+            -> Result<T, ModelError> + Send)
+        -> impl Future<Output = Result<T, ModelError>> + Send;
+    /// Compute the nonempty uncached suffix and return GPU greedy argmax.
+    /// The common submission helper waits for GPU success before committing KV.
+    fn next_token(&self, tokens: &[u32], kv: &mut KVContext<P>,
+        policy: Arc<dyn SchedulingPolicy>)
+        -> impl Future<Output = Result<u32, ModelError>> + Send;
+    fn is_eos(&self, token: u32) -> bool;
+    /// Lazy framework stream: step -> append CPU token -> yield, including EOS once.
+    fn generate_greedy(&self, tokens: &mut Vec<u32>, kv: &mut KVContext<P>,
+        max_new_tokens: usize, policy: Arc<dyn SchedulingPolicy>)
+        -> impl Stream<Item = Result<u32, ModelError>> + Send;
+}
+```
+
+After one greedy step, KV covers the input history. The newly selected token is
+appended only to CPU history, so `tokens.len() == kv.ready_len() + 1` after generation.
+A continuation computes that suffix along with any subsequently appended input.
+The caller owns history/context and releases it; the model owns read-only weights.
+The stream advances only when polled and ends after EOS, the output limit, or one
+error. Consumers can incrementally decode items or collect them for a single response.
+Dropping between items allows continuation; dropping an in-flight step may leave
+KV pending, requiring release. No output-token Vec is allocated by the stream itself.
+
+Qwen2Engine uses this contract directly in the single-request example. It loads
+BF16 checkpoint values into FP32 storage, implements its GQA backend through the
+existing AttentionBackend trait, and uses NaiveKVPool with a flat per-token KV
+vector of `kv_heads * head_dim` elements (128 for two 64-dimensional heads).
+Token/logit D2H copies use reusable pinned host buffers retained by ExecutionContext.
+Submission only enqueues the copies; the outer Future awaits successful completion,
+commits KV, and then exposes host values. Cancellation retains in-flight resources;
+neither stack destinations nor explicit stream synchronization are used for readback.
+No common KV API changes are required. Its eager cuTile kernels provide the real
+model correctness baseline. Scheduler/Runner step dispatch, Qwen graph capture,
+and further operator abstractions are subsequent integration work rather than
+implicit capabilities of this first example.
+
 # KV Cache state and APIs
 
 ## KVPool: common storage contract
