@@ -9,7 +9,10 @@ use cutile::{
     tensor::Tensor,
 };
 
-use super::engine::Qwen2Config;
+use super::{
+    engine::Qwen2Config,
+    metrics::{next_instance, WorkspaceInstruments, WorkspaceMetrics},
+};
 use crate::ModelError;
 
 // Keep the usual prefill/decode pair; never cache a checkout still in flight.
@@ -45,10 +48,72 @@ struct Workspace {
 /// returns here when its last GPU/handle owner releases it, without an in-use list.
 #[derive(Default)]
 pub(super) struct WorkspacePool {
-    idle: Mutex<Vec<Workspace>>,
+    state: Mutex<PoolState>,
+}
+
+struct PoolState {
+    idle: Vec<Workspace>,
+    metrics: WorkspaceMetrics,
+    instruments: WorkspaceInstruments,
+}
+
+impl Default for PoolState {
+    fn default() -> Self {
+        let model_instance = next_instance();
+        Self {
+            idle: Vec::new(),
+            metrics: WorkspaceMetrics {
+                model_instance,
+                ..Default::default()
+            },
+            instruments: WorkspaceInstruments::new(model_instance),
+        }
+    }
+}
+
+impl Drop for PoolState {
+    fn drop(&mut self) {
+        self.instruments.close();
+    }
+}
+
+impl PoolState {
+    fn checkout(&mut self, bytes: usize) {
+        self.metrics.checkout(bytes);
+        self.instruments.checkout(bytes);
+    }
+
+    fn publish(&self) {
+        self.instruments.publish(&self.metrics);
+    }
+
+    /// The caller publishes after the complete ownership transfer, not mid-eviction.
+    fn evict(&mut self, index: usize) {
+        let workspace = self.idle.remove(index);
+        self.metrics.idle_bytes -= workspace.bytes();
+        self.metrics.idle_workspaces -= 1;
+        self.instruments.evictions.increment(1);
+        self.metrics.update_peaks();
+    }
+
+    fn clear_idle(&mut self) {
+        while !self.idle.is_empty() {
+            self.evict(self.idle.len() - 1);
+        }
+    }
+}
+
+impl Workspace {
+    fn bytes(&self) -> usize {
+        self.floats.num_bytes() + self.integers.num_bytes()
+    }
 }
 
 impl WorkspacePool {
+    pub(super) fn metrics(&self) -> WorkspaceMetrics {
+        self.state.lock().unwrap().metrics
+    }
+
     /// One exclusive checkout per forward. Disjoint buffers are reused between layers
     /// on exec's stream; producers overwrite every valid element before consumers read.
     pub(super) unsafe fn acquire(
@@ -63,44 +128,79 @@ impl WorkspacePool {
         let vocab = config.vocab_size;
         let blocks = vocab.div_ceil(256);
         let (floats, integers) = element_counts(rows, config)?;
+        let required = (floats + integers) * 4;
         let cached = {
-            let mut idle = self.idle.lock().unwrap();
-            let index = idle
+            let mut state = self.state.lock().unwrap();
+            let index = state
+                .idle
                 .iter()
                 .position(|w| w.rows == rows && w.floats.device_id() == exec.get_device_id());
-            let cached = index.map(|index| idle.swap_remove(index));
-            // Bound stale shapes while keeping the usual prefill/decode pair.
-            if cached.is_none() && idle.len() == MAX_IDLE_WORKSPACES {
-                idle.clear();
-            }
+            let cached = match index {
+                Some(index) => {
+                    let workspace = state.idle.swap_remove(index);
+                    state.metrics.idle_bytes -= workspace.bytes();
+                    state.metrics.idle_workspaces -= 1;
+                    state.instruments.cache_hits.increment(1);
+                    state.checkout(required);
+                    Some(workspace)
+                }
+                None => {
+                    state.instruments.cache_misses.increment(1);
+                    if state.idle.len() == MAX_IDLE_WORKSPACES {
+                        state.clear_idle();
+                    }
+                    None
+                }
+            };
+            state.publish();
             cached
         };
+        let cache_hit = cached.is_some();
         let workspace = match cached {
             Some(workspace) => workspace,
             None => {
-                let required = (floats + integers) * 4;
-                if check_available(required, exec).is_err() {
-                    // Prefer this forward over retaining idle shapes under pressure.
-                    self.idle.lock().unwrap().clear();
-                    check_available(required, exec)?;
-                }
-                Workspace {
-                    rows,
-                    // SAFETY: all f32/i32 bit patterns are valid. No GPU consumer may
-                    // read a scratch region until its producer has completely written it.
-                    floats: Arc::new(
-                        Tensor::<f32>::uninitialized(floats)
-                            .execute(exec)?
-                            .assume_init(),
-                    ),
-                    integers: Arc::new(
-                        Tensor::<i32>::uninitialized(integers)
-                            .execute(exec)?
-                            .assume_init(),
-                    ),
+                let allocated = (|| -> Result<Workspace, ModelError> {
+                    if check_available(required, exec).is_err() {
+                        {
+                            let mut state = self.state.lock().unwrap();
+                            state.clear_idle();
+                            state.publish();
+                        }
+                        check_available(required, exec)?;
+                    }
+                    // SAFETY: producers overwrite every valid f32/i32 element before use.
+                    Ok(Workspace {
+                        rows,
+                        floats: Arc::new(
+                            Tensor::<f32>::uninitialized(floats)
+                                .execute(exec)?
+                                .assume_init(),
+                        ),
+                        integers: Arc::new(
+                            Tensor::<i32>::uninitialized(integers)
+                                .execute(exec)?
+                                .assume_init(),
+                        ),
+                    })
+                })();
+                let mut state = self.state.lock().unwrap();
+                match allocated {
+                    Ok(workspace) => {
+                        state.instruments.workspace_allocations.increment(1);
+                        state.checkout(required);
+                        state.publish();
+                        workspace
+                    }
+                    Err(error) => {
+                        state.instruments.checkout_failures.increment(1);
+                        state.publish();
+                        return Err(error);
+                    }
                 }
             }
         };
+        tracing::debug!(target: "engine::qwen2", event = "workspace_checkout", rows,
+            scratch_bytes = required, cache_hit);
         let lease = Arc::new(WorkspaceLease {
             workspace: Some(workspace),
             pool: self.clone(),
@@ -187,11 +287,25 @@ struct WorkspaceLease {
 
 impl Drop for WorkspaceLease {
     fn drop(&mut self) {
-        let mut idle = self.pool.idle.lock().unwrap();
-        if idle.len() == MAX_IDLE_WORKSPACES {
-            idle.remove(0);
+        let workspace = self.workspace.take().unwrap();
+        let bytes = workspace.bytes();
+        let mut state = self.pool.state.lock().unwrap();
+        state.metrics.in_use_bytes -= bytes;
+        state.metrics.in_use_workspaces -= 1;
+        if state.idle.len() == MAX_IDLE_WORKSPACES {
+            state.evict(0);
         }
-        idle.push(self.workspace.take().unwrap());
+        state.metrics.idle_bytes += bytes;
+        state.metrics.idle_workspaces += 1;
+        state.idle.push(workspace);
+        state.metrics.update_peaks();
+        state.publish();
+        let metrics = state.metrics;
+        drop(state);
+        tracing::debug!(target: "engine::qwen2", event = "workspace_returned",
+            in_use_bytes = metrics.in_use_bytes, idle_bytes = metrics.idle_bytes,
+            resident_bytes = metrics.resident_bytes, peak_in_use_bytes = metrics.peak_in_use_bytes,
+            peak_idle_bytes = metrics.peak_idle_bytes, peak_resident_bytes = metrics.peak_resident_bytes);
     }
 }
 
@@ -254,6 +368,100 @@ mod tests {
         device_operation::{value, with_context},
     };
 
+    /// Capture absolute resident snapshots, including intermediate publications.
+    #[derive(Clone, Default)]
+    struct ResidentRecorder {
+        samples: Arc<Mutex<Vec<f64>>>,
+    }
+
+    impl metrics::GaugeFn for ResidentRecorder {
+        fn increment(&self, _value: f64) {
+            unreachable!("resource snapshots use set");
+        }
+        fn decrement(&self, _value: f64) {
+            unreachable!("resource snapshots use set");
+        }
+        fn set(&self, value: f64) {
+            self.samples.lock().unwrap().push(value);
+        }
+    }
+
+    impl metrics::Recorder for ResidentRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "qwen2_workspace_resident_bytes" {
+                metrics::Gauge::from_arc(Arc::new(self.clone()))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_idle_cache_return_publishes_only_complete_resident_state(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let config = config();
+        let recorder = ResidentRecorder::default();
+        let pool = metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::default()));
+        let mut buffers = with_context(|exec| {
+            // SAFETY: exclusive checkouts survive outer completion through their handles.
+            value(
+                (0..3)
+                    .map(|_| unsafe { pool.acquire(3, &config, exec) })
+                    .collect::<Result<Vec<_>, _>>(),
+            )
+        })
+        .schedule(&policy)?
+        .await??;
+        let bytes = pool.metrics().peak_forward_bytes;
+        drop(buffers.pop());
+        drop(buffers.pop());
+        assert_eq!(pool.metrics().resident_bytes, bytes * 3);
+        recorder.samples.lock().unwrap().clear();
+        // Evict one of two idle workspaces and cache the returning third one.
+        drop(buffers);
+        let samples = recorder.samples.lock().unwrap().clone();
+        assert_eq!(samples, vec![(bytes * 2) as f64]);
+        assert_eq!(pool.metrics().resident_bytes, bytes * 2);
+        Ok(())
+    }
+
     fn config() -> Qwen2Config {
         serde_json::from_value(serde_json::json!({
             "model_type": "qwen2", "vocab_size": 151936, "hidden_size": 896,
@@ -282,7 +490,8 @@ mod tests {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
         let config = config();
-        let pool = Arc::new(WorkspacePool::default());
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let pool = metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::default()));
         let a = with_context(|exec| {
             value((|| -> Result<_, ModelError> {
                 // Oversized scratch is rejected without attempting an allocation.
@@ -295,17 +504,17 @@ mod tests {
                     b.x.device_pointer().cu_deviceptr()
                 );
                 drop(b);
-                assert!(pool.idle.lock().unwrap().is_empty());
+                assert!(pool.state.lock().unwrap().idle.is_empty());
                 Ok(a)
             })())
         })
         .schedule(&policy)?
         .await??;
         // b has completed; a's escaped handle still prevents its workspace recycling.
-        assert_eq!(pool.idle.lock().unwrap().len(), 1);
+        assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
         let pointer = a.x.device_pointer().cu_deviceptr();
         drop(a);
-        assert_eq!(pool.idle.lock().unwrap().len(), 2);
+        assert_eq!(pool.state.lock().unwrap().idle.len(), 2);
         let (a, b) = with_context(|exec| {
             // SAFETY: checkouts are exclusive, and completion is awaited.
             value(unsafe {
@@ -330,14 +539,66 @@ mod tests {
             value((|| -> Result<(), ModelError> {
                 let buffers = unsafe { pool.acquire(3, &config, exec)? };
                 drop(buffers);
-                assert_eq!(pool.idle.lock().unwrap().len(), 1);
+                assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
                 Err(ModelError::Execution("injected failure".into()))
             })())
         })
         .schedule(&policy)?
         .await?;
         assert!(failed.is_err());
-        assert_eq!(pool.idle.lock().unwrap().len(), 2);
+        assert_eq!(pool.state.lock().unwrap().idle.len(), 2);
+        let metrics = pool.metrics();
+        let bytes = metrics.peak_forward_bytes;
+        assert_eq!(metrics.in_use_bytes, 0);
+        assert_eq!(metrics.peak_in_use_bytes, bytes * 2);
+        assert_eq!(metrics.idle_bytes, bytes * 2);
+        assert_eq!(metrics.peak_idle_bytes, bytes * 2);
+        assert_eq!(metrics.peak_resident_bytes, bytes * 2);
+        let exported = recorder.snapshotter().snapshot().into_vec();
+        let get = |name: &str| {
+            &exported
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .unwrap()
+                .3
+        };
+        use metrics_util::debugging::DebugValue;
+        assert_eq!(
+            get("qwen2_workspace_cache_hits_total"),
+            &DebugValue::Counter(3)
+        );
+        assert_eq!(
+            get("qwen2_workspace_cache_misses_total"),
+            &DebugValue::Counter(2)
+        );
+        assert_eq!(
+            get("qwen2_workspace_allocations_total"),
+            &DebugValue::Counter(2)
+        );
+        assert_eq!(
+            get("qwen2_workspace_in_use_bytes"),
+            &DebugValue::Gauge(0.0.into())
+        );
+        assert_eq!(
+            get("qwen2_workspace_idle_bytes"),
+            &DebugValue::Gauge(((bytes * 2) as f64).into())
+        );
+        assert_eq!(
+            get("qwen2_workspace_forward_bytes"),
+            &DebugValue::Histogram(vec![(bytes as f64).into(); 5])
+        );
+        drop(pool);
+        let closed = recorder.snapshotter().snapshot().into_vec();
+        for (key, _, _, value) in closed {
+            if [
+                "qwen2_workspace_idle_bytes",
+                "qwen2_workspace_resident_bytes",
+            ]
+            .contains(&key.key().name())
+            {
+                assert_eq!(value, DebugValue::Gauge(0.0.into()));
+            }
+        }
         Ok(())
     }
 }

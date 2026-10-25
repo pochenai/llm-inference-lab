@@ -71,6 +71,8 @@ pub enum RunnerReply {
     Delta(LLMResponse),
     Finished {
         request_id: RequestId,
+        /// Actual accepted model tokens, including EOS and buffered/non-visible text.
+        generated_tokens: usize,
         result: Result<(), EngineError>,
     },
 }

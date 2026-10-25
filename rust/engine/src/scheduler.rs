@@ -1,3 +1,7 @@
+mod observer;
+
+pub use observer::{MetricsObserver, RequestStats, SchedulerObserver};
+
 use crate::{error::EngineError, types::*};
 use dashmap::DashMap;
 use futures::{stream, Stream, TryStreamExt};
@@ -23,6 +27,9 @@ const BATCH_WAIT: Duration = Duration::from_millis(100);
 
 struct PendingRequest {
     reply_tx: mpsc::UnboundedSender<Result<Option<LLMResponse>, EngineError>>,
+    request_id: RequestId,
+    started: Instant,
+    first_text: Option<Duration>,
 }
 
 type Requests = Arc<DashMap<RequestId, PendingRequest>>;
@@ -31,6 +38,7 @@ type Requests = Arc<DashMap<RequestId, PendingRequest>>;
 pub struct Scheduler {
     command_tx: mpsc::UnboundedSender<RunnerCommand>,
     requests: Requests,
+    observers: Arc<[Arc<dyn SchedulerObserver>]>,
     next_id: Arc<AtomicU64>,
     next_session_id: Arc<AtomicU64>,
     cancel_token: CancellationToken,
@@ -45,25 +53,42 @@ impl Scheduler {
         runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
         batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
     ) -> Self {
+        Self::new_with_observers(cancel_token, runner_command_tx, batch_reply_rx, Vec::new())
+    }
+
+    /// Attach observers once at construction; clones share the same plugins.
+    pub fn new_with_observers(
+        cancel_token: CancellationToken,
+        runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
+        batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
+        observers: Vec<Arc<dyn SchedulerObserver>>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let requests = Arc::new(DashMap::new());
+        let observers: Arc<[Arc<dyn SchedulerObserver>]> = observers.into();
         let task_tracker = TaskTracker::new();
         let tasks = vec![
             task_tracker
                 .spawn(Self::run_dispatch_batch(
                     command_rx,
                     runner_command_tx,
-                    requests.clone(),
+                    cancel_token.clone(),
                 ))
                 .abort_handle(),
             task_tracker
-                .spawn(Self::run_recv_resp(batch_reply_rx, requests.clone()))
+                .spawn(Self::run_recv_resp(
+                    batch_reply_rx,
+                    requests.clone(),
+                    cancel_token.clone(),
+                    observers.clone(),
+                ))
                 .abort_handle(),
         ];
         task_tracker.close();
         Self {
             command_tx,
             requests,
+            observers,
             next_id: Arc::new(AtomicU64::new(0)),
             next_session_id: Arc::new(AtomicU64::new(0)),
             cancel_token,
@@ -80,7 +105,7 @@ impl Scheduler {
         }
         self.task_tracker.wait().await;
         // Clear only after all tasks stop inserting pending requests.
-        self.requests.clear();
+        Self::fail_pending(&self.requests, &self.observers);
     }
 
     /// Collect the same incremental stream exposed by execute_stream.
@@ -110,14 +135,28 @@ impl Scheduler {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = request.with_request_id(request_id);
         let (reply_tx, response_rx) = mpsc::unbounded_channel();
-        self.requests
-            .insert(request_id, PendingRequest { reply_tx });
-        if self
-            .command_tx
-            .send(RunnerCommand::Execute(vec![request]))
-            .is_err()
+        let pending = PendingRequest {
+            reply_tx,
+            request_id,
+            started: Instant::now(),
+            first_text: None,
+        };
+        self.observers.request_received(request_id);
+        self.requests.insert(request_id, pending);
+        if self.cancel_token.is_cancelled()
+            || self
+                .command_tx
+                .send(RunnerCommand::Execute(vec![request]))
+                .is_err()
         {
-            self.requests.remove(&request_id);
+            if let Some((_, request)) = self.requests.remove(&request_id) {
+                Self::finish_request(
+                    request,
+                    None,
+                    Err(EngineError::ChannelClosed),
+                    &self.observers,
+                );
+            }
             return Err(EngineError::ChannelClosed);
         }
         let cancel = self.cancel_token.clone();
@@ -126,8 +165,9 @@ impl Scheduler {
             |(mut rx, cancel)| async move {
                 let response = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => return Err(EngineError::ChannelClosed),
+                    // Preserve already-routed terminal results when Runner disconnects.
                     response = rx.recv() => response.ok_or(EngineError::ChannelClosed)??,
+                    _ = cancel.cancelled() => return Err(EngineError::ChannelClosed),
                 };
                 Ok(response.map(|response| (response, (rx, cancel))))
             },
@@ -168,10 +208,36 @@ impl Scheduler {
         }
     }
 
+    fn finish_request(
+        request: PendingRequest,
+        generated_tokens: Option<usize>,
+        result: Result<(), EngineError>,
+        observers: &impl SchedulerObserver,
+    ) {
+        let stats = RequestStats {
+            elapsed: request.started.elapsed(),
+            time_to_first_text: request.first_text,
+            generated_tokens,
+        };
+        observers.request_finished(request.request_id, &stats, &result);
+        let _ = request.reply_tx.send(result.map(|()| None));
+    }
+
+    /// Remove ownership before callbacks; plugins may re-enter admission without
+    /// holding a DashMap shard lock. Only used after routing stops or admission fails.
+    fn fail_pending(requests: &Requests, observers: &impl SchedulerObserver) {
+        let ids: Vec<_> = requests.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            if let Some((_, request)) = requests.remove(&id) {
+                Self::finish_request(request, None, Err(EngineError::ChannelClosed), observers);
+            }
+        }
+    }
+
     async fn run_dispatch_batch(
         mut command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
         runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
-        requests: Requests,
+        cancel_token: CancellationToken,
     ) {
         let mut submissions = Vec::with_capacity(MAX_DISPATCH_SIZE);
         let mut sessions = HashSet::new();
@@ -230,35 +296,319 @@ impl Scheduler {
         }
         .await;
         if result.is_err() {
-            requests.clear();
+            // Routing owns completion callbacks, preserving per-request event order.
+            cancel_token.cancel();
         }
     }
 
     async fn run_recv_resp(
         mut batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
         requests: Requests,
+        cancel_token: CancellationToken,
+        observers: Arc<[Arc<dyn SchedulerObserver>]>,
     ) {
-        while let Some(output) = batch_reply_rx.recv().await {
+        loop {
+            let output = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => break,
+                output = batch_reply_rx.recv() => match output { Some(output) => output, None => break },
+            };
             match output {
                 RunnerReply::Delta(response) => {
-                    if let Some(request) = requests.get(&response.request_id) {
+                    if let Some((id, mut request)) = requests.remove(&response.request_id) {
+                        let first_text =
+                            if !response.output.is_empty() && request.first_text.is_none() {
+                                let elapsed = request.started.elapsed();
+                                request.first_text = Some(elapsed);
+                                Some(elapsed)
+                            } else {
+                                None
+                            };
+                        // Own the entry while notifying; no routing-map lock spans callbacks.
+                        observers.text_delta(&response, first_text);
                         let _ = request.reply_tx.send(Ok(Some(response)));
+                        requests.insert(id, request);
                     }
                 }
-                RunnerReply::Finished { request_id, result } => {
+                RunnerReply::Finished {
+                    request_id,
+                    generated_tokens,
+                    result,
+                } => {
                     if let Some((_, request)) = requests.remove(&request_id) {
-                        let _ = request.reply_tx.send(result.map(|()| None));
+                        Self::finish_request(request, Some(generated_tokens), result, &observers);
                     }
                 }
             }
         }
-        requests.clear();
+        // Reject admissions racing with transport closure, then finish every pending request.
+        cancel_token.cancel();
+        Self::fail_pending(&requests, &observers);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    enum Observation {
+        Received {
+            request_id: RequestId,
+        },
+        Delta {
+            request_id: RequestId,
+            output: String,
+            first_text: Option<Duration>,
+        },
+        Finished {
+            request_id: RequestId,
+            stats: RequestStats,
+            success: bool,
+        },
+    }
+
+    impl Observation {
+        fn request_id(&self) -> RequestId {
+            match self {
+                Self::Received { request_id }
+                | Self::Delta { request_id, .. }
+                | Self::Finished { request_id, .. } => *request_id,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ObserverLog(std::sync::Mutex<Vec<Observation>>);
+
+    impl SchedulerObserver for ObserverLog {
+        fn request_received(&self, request_id: RequestId) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Observation::Received { request_id });
+        }
+        fn text_delta(&self, response: &LLMResponse, first_text: Option<Duration>) {
+            self.0.lock().unwrap().push(Observation::Delta {
+                request_id: response.request_id,
+                output: response.output.clone(),
+                first_text,
+            });
+        }
+        fn request_finished(
+            &self,
+            request_id: RequestId,
+            stats: &RequestStats,
+            result: &Result<(), EngineError>,
+        ) {
+            self.0.lock().unwrap().push(Observation::Finished {
+                request_id,
+                stats: *stats,
+                success: result.is_ok(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn observers_measure_tokens_and_first_text_even_when_consumer_drops(
+    ) -> Result<(), EngineError> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let metrics = metrics::with_local_recorder(&recorder, MetricsObserver::default);
+        let log = Arc::new(ObserverLog::default());
+        let cancel = CancellationToken::new();
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (replies, reply_rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new_with_observers(
+            cancel.child_token(),
+            commands,
+            reply_rx,
+            vec![Arc::new(metrics), log.clone()],
+        );
+        let worker = tokio::spawn(async move {
+            while let Some(RunnerCommand::Execute(batch)) = rx.recv().await {
+                for request in batch {
+                    let request_id = request.assigned_request_id();
+                    let chunks: &[&str] = match request.input.as_str() {
+                        "good" => &["", "你", "好"],
+                        "empty" => &[""],
+                        "bad" => &["partial"],
+                        _ => &["ignored"],
+                    };
+                    for &chunk in chunks {
+                        replies
+                            .send(RunnerReply::Delta(LLMResponse {
+                                request_id,
+                                output: chunk.into(),
+                            }))
+                            .unwrap();
+                    }
+                    // These counts deliberately differ from text-delta counts.
+                    let generated_tokens = match request.input.as_str() {
+                        "good" => 5,
+                        "empty" => 0,
+                        "bad" => 2,
+                        _ => 4,
+                    };
+                    let result = if request.input == "bad" {
+                        Err(EngineError::InvalidInput("partial failure".into()))
+                    } else {
+                        Ok(())
+                    };
+                    replies
+                        .send(RunnerReply::Finished {
+                            request_id,
+                            generated_tokens,
+                            result,
+                        })
+                        .unwrap();
+                }
+            }
+        });
+        drop(scheduler.execute_stream(SessionRequest::new(None, "dropped".into()))?);
+        let clone = scheduler.clone();
+        let (good, empty, bad) = tokio::join!(
+            clone.execute(SessionRequest::new(None, "good".into())),
+            scheduler.execute(SessionRequest::new(None, "empty".into())),
+            scheduler.execute(SessionRequest::new(None, "bad".into())),
+        );
+        assert_eq!(good?.output, "你好");
+        assert_eq!(empty?.output, "");
+        assert!(matches!(bad, Err(EngineError::InvalidInput(_))));
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        worker.await.unwrap();
+        let events = log.0.lock().unwrap();
+        for id in 0..4 {
+            let request_events: Vec<_> = events
+                .iter()
+                .filter(|event| event.request_id() == id)
+                .collect();
+            assert!(matches!(
+                request_events.first(),
+                Some(Observation::Received { .. })
+            ));
+            let Some(Observation::Finished { stats, success, .. }) = request_events.last() else {
+                panic!("missing finish")
+            };
+            assert_eq!(
+                request_events
+                    .iter()
+                    .filter(|event| matches!(event, Observation::Finished { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(*success, stats.generated_tokens != Some(2));
+            let first: Vec<_> = request_events
+                .iter()
+                .filter_map(|event| match event {
+                    Observation::Delta {
+                        first_text: Some(elapsed),
+                        output,
+                        ..
+                    } => {
+                        assert!(!output.is_empty());
+                        Some(*elapsed)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(first.len(), usize::from(stats.generated_tokens != Some(0)));
+            assert_eq!(stats.time_to_first_text, first.first().copied());
+            if let Some(elapsed) = stats.time_to_first_text {
+                assert!(elapsed <= stats.elapsed);
+            }
+            assert!(stats.tokens_per_second().is_some());
+        }
+        let exported = recorder.snapshotter().snapshot().into_vec();
+        let get = |name: &str| {
+            &exported
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .unwrap()
+                .3
+        };
+        assert_eq!(get("engine_requests_total"), &DebugValue::Counter(4));
+        assert_eq!(
+            get("engine_request_failures_total"),
+            &DebugValue::Counter(1)
+        );
+        assert_eq!(
+            get("engine_generated_tokens_total"),
+            &DebugValue::Counter(11)
+        );
+        assert_eq!(
+            get("engine_output_text_bytes_total"),
+            &DebugValue::Counter(20)
+        );
+        assert_eq!(
+            get("engine_requests_in_flight"),
+            &DebugValue::Gauge(0.0.into())
+        );
+        for name in [
+            "engine_time_to_first_text_seconds",
+            "engine_request_output_tokens_per_second",
+        ] {
+            let DebugValue::Histogram(values) = get(name) else {
+                panic!("histogram")
+            };
+            assert_eq!(values.len(), 3);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observers_finish_once_with_unknown_tokens_on_shutdown_and_disconnect(
+    ) -> Result<(), EngineError> {
+        for cause in ["cancel", "reply_closed", "dispatch_closed"] {
+            let cancel = CancellationToken::new();
+            let (commands, rx) = mpsc::unbounded_channel();
+            let (replies, reply_rx) = mpsc::unbounded_channel();
+            let log = Arc::new(ObserverLog::default());
+            let scheduler = Scheduler::new_with_observers(
+                cancel.child_token(),
+                commands,
+                reply_rx,
+                vec![log.clone()],
+            );
+            let stream = scheduler.execute_stream(SessionRequest::new(None, "pending".into()))?;
+            futures::pin_mut!(stream);
+            replies
+                .send(RunnerReply::Delta(LLMResponse {
+                    request_id: 0,
+                    output: "partial".into(),
+                }))
+                .unwrap();
+            assert_eq!(stream.try_next().await?.unwrap().output, "partial");
+            match cause {
+                "cancel" => cancel.cancel(),
+                "reply_closed" => drop(replies),
+                _ => drop(rx),
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), stream.try_next())
+                    .await
+                    .unwrap(),
+                Err(EngineError::ChannelClosed)
+            ));
+            tokio::time::timeout(Duration::from_secs(5), scheduler.wait_stopped())
+                .await
+                .unwrap();
+            assert!(scheduler
+                .execute_stream(SessionRequest::new(None, "late".into()))
+                .is_err());
+            let events = log.0.lock().unwrap();
+            assert_eq!(events.len(), 3);
+            let Observation::Finished { stats, success, .. } = events.last().unwrap() else {
+                panic!("finish")
+            };
+            assert!(!success);
+            assert_eq!(stats.generated_tokens, None);
+            assert!(stats.time_to_first_text.is_some());
+            assert_eq!(stats.tokens_per_second(), None);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn streams_deliver_before_completion_and_route_terminal_errors() -> Result<(), EngineError>
@@ -302,7 +652,11 @@ mod tests {
                     Ok(())
                 };
                 replies
-                    .send(RunnerReply::Finished { request_id, result })
+                    .send(RunnerReply::Finished {
+                        request_id,
+                        generated_tokens: 0,
+                        result,
+                    })
                     .unwrap();
             }
         });
@@ -362,7 +716,11 @@ mod tests {
                         Ok(())
                     };
                     reply_tx
-                        .send(RunnerReply::Finished { request_id, result })
+                        .send(RunnerReply::Finished {
+                            request_id,
+                            generated_tokens: 0,
+                            result,
+                        })
                         .unwrap();
                 }
             }
@@ -406,7 +764,7 @@ mod tests {
                 .unwrap();
         }
         drop(tx);
-        Scheduler::run_dispatch_batch(rx, batch_tx, Arc::new(DashMap::new())).await;
+        Scheduler::run_dispatch_batch(rx, batch_tx, CancellationToken::new()).await;
         let mut sizes = Vec::new();
         let mut observed = Vec::new();
         while let Some(RunnerCommand::Execute(batch)) = batch_rx.recv().await {
@@ -454,6 +812,7 @@ mod tests {
                     if reply_tx
                         .send(RunnerReply::Finished {
                             request_id: id,
+                            generated_tokens: 0,
                             result: Ok(()),
                         })
                         .is_err()
@@ -512,7 +871,7 @@ mod tests {
         .with_request_id(3)]))
             .unwrap();
         drop(tx);
-        Scheduler::run_dispatch_batch(rx, runner_tx, Arc::new(DashMap::new())).await;
+        Scheduler::run_dispatch_batch(rx, runner_tx, CancellationToken::new()).await;
         let mut observed = Vec::new();
         while let Some(command) = runner_rx.recv().await {
             match command {

@@ -229,12 +229,48 @@ forwards `Some(text)` and keeps generating on `None`. There is no application-le
 flush or replacement-character synthesis. If generation stops with an undecodable
 fragment, the response contains only chunks already emitted by the library; it
 may differ from batch decoding's replacement characters. Token history is preserved.
-Finished carries only completion/error statuses for one request.
+Finished carries completion/error status and the actual generated-token count for one request.
 Finished is emitted after that request's state cleanup, before any peer's next step.
 The execution methods return unit and send all results through the reply channel.
 An error terminates that request's stream; earlier deltas remain delivered. `execute` collects the same stream into
 one response. Output channels are buffered; dropping the stream stops delivery
 without cancelling generation.
+
+Scheduler observers can be attached with
+`Scheduler::new_with_observers(cancel, commands, replies, Vec<Arc<dyn SchedulerObserver>>)`.
+The existing `new` constructor attaches none. Clones share observers. Synchronous,
+nonblocking hooks observe admission, text deltas and completion outside pending-map
+locks; they do not return scheduling decisions. `[T]` implements collection notification and `Arc<T>` forwards to its inner value.
+Scheduler stores `Arc<[Arc<dyn SchedulerObserver>]>`; one method call notifies the
+collection. Vec method calls can dereference to the slice implementation. Completion-only closures implement the same trait directly. Admitted requests finish once
+on success, validation/execution error, shutdown or transport failure, even if the
+consumer dropped its stream. Fatal Runner transport failure closes admission;
+already-routed terminal replies remain readable. Shutdown still requires `wait_stopped`.
+
+Completion supplies a named `RequestStats` struct: admission-to-finish `elapsed`,
+optional first **nonempty** text latency, and Runner's actual generated-token count
+(including EOS and tokens not yet decoded into visible text). Interrupted requests
+without a terminal Runner report have an unknown token count (`None`), not zero.
+Request TPS is generated tokens divided by total request time; it includes queueing,
+prefill, generation and text decoding, and differs from model-only decode TPS.
+Time ends at server-side completion, without waiting for a slow consumer to poll.
+
+`MetricsObserver::default()` emits `engine_requests_total`, failures,
+generated-token/text-byte counters, an in-flight gauge, request-duration histograms labelled
+by success/error, first-text latency, and successful-request output TPS. Empty text
+does not record a first-text observation. Failed/unknown-count requests do not
+record successful TPS. These metrics aggregate across attached schedulers, without
+request/session labels. Construct the observer after installing the application's
+recorder; no recorder/exporter is installed here. The Qwen example attaches this
+plugin and a completion-only closure for its JSON summary, replacing local timers.
+Exact queue time is not reported because Runner does not yet emit a start event.
+
+```rust,ignore
+let scheduler = Scheduler::new_with_observers(
+    cancel, commands, replies,
+    vec![Arc::new(MetricsObserver::default())],
+);
+```
 
 ```rust,ignore
 use futures::TryStreamExt;
@@ -279,17 +315,97 @@ exclude weights, KV, input uploads, pinned readbacks, and other idle/in-flight
 workspaces. Qwen CUDA Graph capture remains subsequent work.
 This is a numerical/lifecycle baseline, not an optimized throughput result. Initial
 support requires full causal attention, unscaled RoPE, and 64-dimensional heads.
+Qwen emits standard `metrics` instruments without extending `CausalModel`:
+
+| Metric | Type |
+|---|---|
+| `qwen2_steps_total`, `qwen2_input_tokens_total` | Counter, labelled `phase=prefill/decode` |
+| `qwen2_failed_steps_total` | Counter |
+| `qwen2_step_wall_duration_seconds`, `qwen2_host_submit_duration_seconds` | Histogram, labelled by phase |
+| `qwen2_batch_duration_seconds`, `qwen2_batch_size` | Histogram |
+| `qwen2_workspace_forward_bytes` | Histogram |
+| `qwen2_workspace_{cache_hits,cache_misses,allocations,checkout_failures,evictions}_total` | Counter |
+| `qwen2_workspace_*_bytes`, `qwen2_workspace_*_workspaces` | Gauge for current/peak ownership |
+
+Every instrument carries a `model_instance` label identifying one loaded model
+lifetime, so concurrent model instances cannot overwrite each other's gauges.
+Request/session IDs are never labels. Handles register once at model/pool creation
+and are reused through execution and release. Workspace gauge publication follows
+the pool's locked transition order; destruction sets current resource gauges to
+zero while retaining historical peaks/counters. Scheduler request/first-text times
+are histograms in its MetricsObserver; benchmark CUDA pool peaks are gauges.
+
+No exporter, HTTP endpoint, external service or global recorder is installed.
+Applications may install their recorder **before loading the model**. Without one,
+`metrics` handles are no-ops; cached handles do not switch recorders afterwards.
+Tests use `metrics-util::debugging::DebuggingRecorder` as a dev-only in-memory
+recorder to check actual counters, gauge transitions and histogram observations.
+
+Qwen execution totals are maintained only by Counter/Histogram handles. There is
+no `Qwen2Metrics` accumulator or per-engine last-step timing: simultaneous batches
+share those instruments, and their overlapping durations must not be interpreted
+as elapsed wall time for an individual batch. Prefill means empty KV or a multi-token
+suffix; decode means one token with existing KV. Durations cover CPU preparation,
+submission, GPU/D2H completion and host result handling, excluding Scheduler work.
+`step_wall_seconds` spans the entire model step through GPU/D2H completion,
+KV commit and CPU output access. `host_submit_seconds` is returned in the private
+`StepOutput` for that invocation: host wall time inside submit, including scratch,
+input uploads, JIT and CUDA calls, without awaiting GPU completion. It excludes
+KV mapping preparation and later host output access. GPU execution can overlap
+host submission, so subtracting them does not yield pure GPU kernel time. Failed
+steps increment the failure counter and have no successful submission-duration
+sample; tracing leaves that duration unavailable. Cold JIT,
+warmup and diagnostic observations are included; cancelled futures do not emit
+completed-step observations.
+
+`Qwen2Engine::workspace_metrics()` returns only current/peak pool ownership,
+independent of a recorder: in-use/idle/resident bytes, current workspace counts and
+maximum single-forward allocation. These are shared **model-wide** resource states,
+not one batch's result. Sizes exclude allocator padding/reservations. GPU leases
+and escaped handles delay recycling. Cache hits/misses, allocations, failures and
+evictions increment Counter handles directly, without duplicate snapshot counters.
+
+The benchmark times each of its own awaited calls. It does not subtract shared
+engine counters before/after a batch. Its `workspace_pool` JSON field is explicitly
+a model-wide resource snapshot and can include other concurrent work; it is not a
+per-batch allocation or lifetime delta. Internal submission timing is available as
+a histogram (and structured tracing), not reconstructed from engine totals.
+
+`qwen2 --trace-steps` enables structured `tracing` JSON events on stderr for steps,
+batches and scratch checkout/return. The library does not install a subscriber;
+logs are disabled unless the caller enables one. Keep detailed logging off when
+sampling latency. The main Qwen example also reports `time_to_first_text_seconds`
+from Scheduler observers (null if no visible text), end-to-end
+elapsed time, actual generated tokens and request output TPS. This includes queueing/tokenization/text decoding and differs from
+model-only prefill latency. The Qwen-only benchmark bypasses Scheduler/text decoding to
+isolate model execution and creates fresh KV for every warmup/measured sample:
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml --offline -p engine --bench qwen2 --no-run
+mkdir -p rust/profiling/qwen2
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2 -- --model-dir "$QWEN2_MODEL_DIR" --tokens 4096 --decode-steps 8 --warmup 1 --iterations 3 --validate-chunked > rust/profiling/qwen2/t4096.jsonl
+```
+
+It uses deterministic repeated token IDs, reports prefill/decode tokens/s,
+per-step decode p50/p95, CUDA default-pool used/reserved high-water marks and
+workspace metrics. Warmup samples are labelled and excluded from the summary.
+Full/chunked validation runs afterwards and compares every final-position logit,
+next-token IDs and KV release. CUDA pool metrics include weights/KV/workspace but
+exclude other processes and non-pool CUDA allocations; they are not device-wide
+peak VRAM. The default three measured iterations are a diagnostic sample, not a
+statistically robust throughput study.
+
 The example supplies the explicit two-message Qwen2 chat template and uses pure
 greedy decoding (no repetition penalty or stochastic sampling).
 
 ```bash
 # Point to an existing complete HF snapshot; no model download is performed.
 QWEN2_MODEL_DIR=/home/po/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775
-cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- "$QWEN2_MODEL_DIR" --max-new-tokens 32
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir "$QWEN2_MODEL_DIR" --max-new-tokens 32
 
 # Independent reference: use an interpreter with installed CPU-capable torch/Transformers.
 env -u LD_LIBRARY_PATH PYENV_VERSION=3.14.3 python rust/engine/examples/qwen2_reference.py "$QWEN2_MODEL_DIR" --max-new-tokens 32 --output-dir rust/engine/artifacts/qwen2
-cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- "$QWEN2_MODEL_DIR" --max-new-tokens 32 --reference-dir rust/engine/artifacts/qwen2
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir "$QWEN2_MODEL_DIR" --max-new-tokens 32 --reference-dir rust/engine/artifacts/qwen2
 
 # Optional real-checkpoint regression: full/chunked prefill logits, decode and release.
 QWEN2_MODEL_DIR="$QWEN2_MODEL_DIR" QWEN2_REFERENCE_DIR="$PWD/rust/engine/artifacts/qwen2" cargo test --manifest-path rust/Cargo.toml --offline --release -p engine real_checkpoint_matches_reference_and_chunked_kv -- --ignored --nocapture

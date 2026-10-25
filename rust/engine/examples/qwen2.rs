@@ -1,6 +1,6 @@
 //! Qwen2.5-0.5B-Instruct through Scheduler -> Runner -> cuTile model.
 //! From the repository root (MODEL_DIR is the existing HF snapshot directory):
-//! cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- MODEL_DIR
+//! cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir MODEL_DIR
 //! Match --max-new-tokens to the reference run; e.g. --max-new-tokens 32
 //! --reference-dir rust/engine/artifacts/qwen2 validates CPU reference logits and generated text.
 
@@ -14,11 +14,16 @@ use engine::runner::{
     model_runner::RunnerBuilder,
 };
 use engine::{
-    scheduler::Scheduler,
+    scheduler::{MetricsObserver, RequestStats, Scheduler},
     types::{SamplingConfig, SessionRequest},
     CausalModel,
 };
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser)]
 struct Args {
     /// Local Hugging Face checkpoint directory.
+    #[arg(long)]
     model_dir: PathBuf,
     /// User message to include in the chat template.
     #[arg(long, default_value = "Say hello.")]
@@ -36,6 +42,9 @@ struct Args {
     /// Directory containing reference.json and logits.f32 for validation.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
+    /// Emit per-step/batch JSON metrics to stderr (includes cold JIT).
+    #[arg(long)]
+    trace_steps: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,13 +54,25 @@ async fn main() -> Result<()> {
         prompt,
         max_new_tokens,
         reference_dir,
+        trace_steps,
     } = Args::parse();
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_max_level(if trace_steps {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
+        .try_init()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let max_new = max_new_tokens.get();
     let device = Device::new(0)?;
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
     let model = Qwen2Engine::load(&model_dir, &policy).await?;
-    eprintln!("Loaded model in {:.2}s", load_start.elapsed().as_secs_f64());
+    tracing::info!(target: "engine::qwen2", event = "model_loaded",
+        seconds = load_start.elapsed().as_secs_f64());
     // Explicit two-message Qwen2 template; raw prompt text alone is not an instruct input.
     let formatted = format!(
         "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
@@ -110,7 +131,24 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (replies, reply_rx) = mpsc::unbounded_channel();
-    let scheduler = Scheduler::new(cancel.child_token(), commands, reply_rx);
+    let request_stats = Arc::new(Mutex::new(None));
+    let captured = request_stats.clone();
+    let scheduler = Scheduler::new_with_observers(
+        cancel.child_token(),
+        commands,
+        reply_rx,
+        vec![
+            Arc::new(MetricsObserver::default()),
+            // This optional completion-only observer keeps the CLI's JSON summary.
+            Arc::new(
+                move |_id: u64,
+                      stats: &RequestStats,
+                      _result: &Result<(), engine::error::EngineError>| {
+                    *captured.lock().unwrap() = Some(*stats);
+                },
+            ),
+        ],
+    );
     let owned_pool = pool.clone();
     let runner = RunnerBuilder::default()
         .with_model_factory(move || async move { Ok(model) })
@@ -124,13 +162,16 @@ async fn main() -> Result<()> {
         max_new_tokens: Some(max_new),
         ..Default::default()
     });
-    let start = Instant::now();
     let result = scheduler.execute(request).await;
-    let elapsed = start.elapsed().as_secs_f64();
     cancel.cancel();
     scheduler.wait_stopped().await;
     task.await?;
     let response = result?;
+    let stats = request_stats
+        .lock()
+        .unwrap()
+        .take()
+        .expect("completion observer ran before delivery");
     if let Some(dir) = reference_dir {
         let reference: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("reference.json"))?)?;
@@ -143,8 +184,9 @@ async fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::json!({"model":"Qwen2.5-0.5B-Instruct","compute_dtype":"f32","input_ids":input_ids,
-        "request_id":response.request_id,"text":response.output,"elapsed_seconds":elapsed,
-        "validation":comparison,"kv_released":true})
+        "request_id":response.request_id,"text":response.output,"elapsed_seconds":stats.elapsed.as_secs_f64(),
+        "time_to_first_text_seconds":stats.time_to_first_text.map(|elapsed| elapsed.as_secs_f64()),
+        "generated_tokens":stats.generated_tokens,"tokens_per_second":stats.tokens_per_second(),"validation":comparison,"kv_released":true})
     );
     Ok(())
 }

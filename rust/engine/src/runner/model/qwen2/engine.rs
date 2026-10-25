@@ -43,6 +43,7 @@
 
 use super::{
     kernels,
+    metrics::{Instruments, WorkspaceMetrics},
     readback::{enqueue_readback, Readback, ReadbackCache},
     workspace::WorkspacePool,
 };
@@ -59,10 +60,19 @@ use cutile::{
     tile_kernel::TileKernel,
 };
 use serde::Deserialize;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
 type Weight = Arc<Tensor<f32>>;
+
+/// One invocation's outputs: GPU readbacks before outer completion, CPU values after it.
+struct StepOutput<Token, Logits> {
+    token: Token,
+    logits: Option<Logits>,
+    /// Host wall time inside submit: scratch/input preparation, JIT and CUDA calls.
+    /// Excludes KV mapping, GPU-completion waiting, KV commit and host result access.
+    host_submit_seconds: f64,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Qwen2Config {
@@ -111,6 +121,7 @@ pub struct Qwen2Engine {
     eos: Vec<u32>,
     attention: GqaAttention,
     workspaces: Arc<WorkspacePool>,
+    instruments: Instruments,
     input_uploads: Arc<UploadPool<u32>>,
     token_readbacks: ReadbackCache<i32>,
     logit_readbacks: ReadbackCache<f32>,
@@ -263,7 +274,7 @@ impl Qwen2Engine {
                 )
                 .await?,
             });
-            eprintln!("Loaded Qwen2 layer {}/{}", i + 1, config.num_hidden_layers);
+            tracing::debug!(target: "engine::qwen2", event = "layer_loaded", layer = i + 1, layers = config.num_hidden_layers);
         }
         let eos = match loader.generation_config()?.and_then(|g| g.eos_token_id) {
             Some(EosTokenId::One(id)) => vec![id],
@@ -274,8 +285,11 @@ impl Qwen2Engine {
             q_heads: config.num_attention_heads,
             kv_heads: config.num_key_value_heads,
         };
+        let workspaces: Arc<WorkspacePool> = Arc::default();
+        let instruments = Instruments::new(workspaces.metrics().model_instance);
         Ok(Self {
-            workspaces: Arc::default(),
+            instruments,
+            workspaces,
             input_uploads: Arc::default(),
             token_readbacks: Default::default(),
             logit_readbacks: Default::default(),
@@ -289,6 +303,12 @@ impl Qwen2Engine {
             layers,
             eos,
         })
+    }
+
+    /// Resource-pool snapshot shared by every request on this model instance.
+    /// Current/peak ownership cannot be attributed to a particular concurrent batch.
+    pub fn workspace_metrics(&self) -> WorkspaceMetrics {
+        self.workspaces.metrics()
     }
 
     pub fn config(&self) -> &Qwen2Config {
@@ -318,8 +338,8 @@ impl Qwen2Engine {
         kv: &mut KVContext<NaiveKVPool>,
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Result<(u32, Vec<f32>), ModelError> {
-        let (token, logits) = self.step(tokens, kv, policy, true).await?;
-        Ok((token, logits.unwrap()))
+        let output = self.step(tokens, kv, policy, true).await?;
+        Ok((output.token, output.logits.unwrap()))
     }
 
     async fn step(
@@ -328,7 +348,33 @@ impl Qwen2Engine {
         kv: &mut KVContext<NaiveKVPool>,
         policy: Arc<dyn SchedulingPolicy>,
         read_logits: bool,
-    ) -> Result<(u32, Option<Vec<f32>>), ModelError> {
+    ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
+        let rows = tokens.len().saturating_sub(kv.ready_len());
+        let prefill = kv.ready_len() == 0 || rows > 1;
+        let start = Instant::now();
+        let result = self.step_inner(tokens, kv, policy, read_logits).await;
+        // Whole step wall time, including GPU/D2H completion, KV commit and CPU output access.
+        let step_wall_seconds = start.elapsed().as_secs_f64();
+        let host_submit_seconds = result
+            .as_ref()
+            .ok()
+            .map(|output| output.host_submit_seconds);
+        self.instruments
+            .step(prefill, rows, step_wall_seconds, host_submit_seconds);
+        tracing::debug!(target: "engine::qwen2", event = "step_completed",
+            phase = if prefill { "prefill" } else { "decode" },
+            input_tokens = rows, context_tokens = tokens.len(), step_wall_seconds, host_submit_seconds,
+            diagnostic_logits = read_logits, success = result.is_ok());
+        result
+    }
+
+    async fn step_inner(
+        &self,
+        tokens: &[u32],
+        kv: &mut KVContext<NaiveKVPool>,
+        policy: Arc<dyn SchedulingPolicy>,
+        read_logits: bool,
+    ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
         if kv.is_pending()
             || tokens.len() <= kv.ready_len()
             || tokens.len() > kv.max_seq_len()
@@ -345,21 +391,25 @@ impl Qwen2Engine {
             token_ids: tokens,
             kv,
         };
-        let (token, logits) = Self::execute_append_batch(&mut [input], &policy, |batch, exec| {
+        let output = Self::execute_append_batch(&mut [input], &policy, |batch, exec| {
             let input = &mut batch[0];
             // SAFETY: every GPU access, including D2H, belongs to this submission.
             unsafe { self.submit(input.token_ids, input.kv, read_logits, exec) }
         })
         .await?;
         // Outer completion includes D2H; only now expose host references.
-        let token = token.as_slice()[0] as u32;
+        let token = output.token.as_slice()[0] as u32;
         if token as usize >= self.config.vocab_size {
             return Err(ModelError::Execution(
                 "non-finite logits or invalid argmax".into(),
             ));
         }
-        let logits = logits.map(|values| values.as_slice().to_vec());
-        Ok((token, logits))
+        let logits = output.logits.map(|values| values.as_slice().to_vec());
+        Ok(StepOutput {
+            token,
+            logits,
+            host_submit_seconds: output.host_submit_seconds,
+        })
     }
 
     unsafe fn submit(
@@ -368,7 +418,8 @@ impl Qwen2Engine {
         kv: &mut KVContext<NaiveKVPool>,
         read_logits: bool,
         exec: &ExecutionContext,
-    ) -> Result<(Readback<i32>, Option<Readback<f32>>), ModelError> {
+    ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
+        let submit_started = Instant::now();
         let start = kv.ready_len();
         let rows = tokens.len() - start;
         // reuse the same buffer
@@ -502,7 +553,12 @@ impl Qwen2Engine {
         } else {
             None
         };
-        Ok((token, values))
+        // All work is enqueued; the caller still awaits GPU/D2H completion.
+        Ok(StepOutput {
+            token,
+            logits: values,
+            host_submit_seconds: submit_started.elapsed().as_secs_f64(),
+        })
     }
 
     unsafe fn linear(
@@ -657,15 +713,21 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Vec<Result<u32, ModelError>> {
+        let start = Instant::now();
+        let batch_size = batch.len();
         // shortcut: serialize Qwen batch items until the attention kernel supports packed contexts.
         let mut outputs = Vec::with_capacity(batch.len());
         for input in batch {
             outputs.push(
                 self.step(input.token_ids, input.kv, policy.clone(), false)
                     .await
-                    .map(|(token, _)| token),
+                    .map(|output| output.token),
             );
         }
+        self.instruments
+            .batch(batch_size, start.elapsed().as_secs_f64());
+        tracing::debug!(target: "engine::qwen2", event = "batch_completed", batch_size,
+            batch_wall_seconds = start.elapsed().as_secs_f64(), failed = outputs.iter().filter(|v| v.is_err()).count());
         outputs
     }
 
@@ -712,6 +774,7 @@ mod tests {
     use cuda_async::scheduling_policies::SingleStream;
     use cutile::cuda_core::Device;
     use cutile::tensor::{IntoPartition, Unpartition};
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn linear_epilogue_bias_matches_cpu_with_partial_row_tile() -> Result<(), ModelError> {
@@ -856,9 +919,12 @@ mod tests {
             .await;
         assert!(invalid[0].is_err());
         assert!(!full.is_pending());
-        let (first, actual) = model
-            .step_with_logits(&tokens, &mut full, policy.clone())
-            .await?;
+        let step_started = Instant::now();
+        let output = model.step(&tokens, &mut full, policy.clone(), true).await?;
+        assert!(output.host_submit_seconds.is_finite() && output.host_submit_seconds > 0.0);
+        assert!(output.host_submit_seconds <= step_started.elapsed().as_secs_f64());
+        let first = output.token;
+        let actual = output.logits.unwrap();
         assert_eq!(first, expected_ids[0]);
         assert_eq!(actual.len(), expected.len());
         for (&a, &b) in actual.iter().zip(&expected) {
@@ -868,6 +934,7 @@ mod tests {
             );
         }
         assert_eq!(full.ready_len(), tokens.len());
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
         full.release();
         assert_eq!(pool.metrics(), initial);
         let mut chunked = KVContext::new(pool.clone())?;
@@ -994,7 +1061,20 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (replies, reply_rx) = tokio::sync::mpsc::unbounded_channel();
-        let scheduler = crate::scheduler::Scheduler::new(cancel.child_token(), commands, reply_rx);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let scheduler = crate::scheduler::Scheduler::new_with_observers(
+            cancel.child_token(),
+            commands,
+            reply_rx,
+            vec![Arc::new(
+                move |_id: u64,
+                      stats: &crate::scheduler::RequestStats,
+                      _result: &Result<(), crate::error::EngineError>| {
+                    captured.lock().unwrap().push(*stats);
+                },
+            )],
+        );
         let owned_pool = pool.clone();
         let runner = crate::runner::model_runner::RunnerBuilder::default()
             .with_model_factory(move || async move { Ok(model) })
@@ -1031,6 +1111,23 @@ mod tests {
         scheduler.wait_stopped().await;
         task.await?;
         result?;
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0].generated_tokens, Some(expected_ids.len()));
+        assert_eq!(observed[1].generated_tokens, Some(turn_len));
+        assert_eq!(observed[2].generated_tokens, Some(1));
+        assert!(observed[0].time_to_first_text.is_some());
+        assert!(observed[1].time_to_first_text.is_some());
+        assert_eq!(
+            observed[2].time_to_first_text.is_some(),
+            !expected_text.is_empty()
+        );
+        for stats in observed.iter() {
+            if let Some(first) = stats.time_to_first_text {
+                assert!(first <= stats.elapsed);
+            }
+            assert!(stats.tokens_per_second().is_some_and(|tps| tps > 0.0));
+        }
         assert_eq!(pool.metrics(), initial);
         Ok(())
     }

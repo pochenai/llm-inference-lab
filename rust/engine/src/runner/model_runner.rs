@@ -156,6 +156,11 @@ pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
     sessions: DashMap<SessionId, SessionEntry<P>>,
 }
 
+struct SessionProgress {
+    token_count: usize,
+    ready_len: usize,
+}
+
 struct SessionState<P: KVPool> {
     tokens: Arc<Vec<u32>>,
     kv: KVContext<P>,
@@ -230,7 +235,10 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
             .iter()
             .map(|state| {
                 let state = state.as_ref().unwrap();
-                (state.tokens.len(), state.kv.ready_len())
+                SessionProgress {
+                    token_count: state.tokens.len(),
+                    ready_len: state.kv.ready_len(),
+                }
             })
             .collect();
         for (state, request) in states.iter_mut().zip(&encoded) {
@@ -275,6 +283,9 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 };
                 let request_id = encoded[index].assigned_request_id();
                 let generated = errors[index].is_none();
+                let generated_tokens = state.tokens.len()
+                    - original_progress[index].token_count
+                    - encoded[index].input.len();
                 drop(decoders[index].take());
                 let result = match errors[index].take().or_else(|| decode_errors[index].take()) {
                     Some(error) => Err(error.into()),
@@ -290,19 +301,23 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                     }
                 };
                 let mut guard = guards[index].take().unwrap();
-                let (old_len, old_ready) = original_progress[index];
+                let progress = &original_progress[index];
                 if generated {
                     state.sampling = encoded[index].sampling.as_ref().unwrap().clone();
                     *guard = Some(state);
-                } else if !state.kv.is_pending() && state.kv.ready_len() == old_ready {
-                    Arc::make_mut(&mut state.tokens).truncate(old_len);
+                } else if !state.kv.is_pending() && state.kv.ready_len() == progress.ready_len {
+                    Arc::make_mut(&mut state.tokens).truncate(progress.token_count);
                     *guard = Some(state);
                 } else {
                     drop(state);
                 }
                 // Unlock persistent sessions and release temporary contexts before announcing completion.
                 drop(guard);
-                let _ = replies.send(RunnerReply::Finished { request_id, result });
+                let _ = replies.send(RunnerReply::Finished {
+                    request_id,
+                    generated_tokens,
+                    result,
+                });
             }
             active.clear();
             let mut inputs: Vec<_> = states
@@ -455,6 +470,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                     Err(error) => {
                         let _ = replies.send(RunnerReply::Finished {
                             request_id,
+                            generated_tokens: 0,
                             result: Err(error),
                         });
                         continue;
@@ -491,6 +507,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 drop(guard);
                 let _ = replies.send(RunnerReply::Finished {
                     request_id: request.assigned_request_id(),
+                    generated_tokens: 0,
                     result: Err(KVPoolError::CapacityExhausted(
                         "insufficient KV capacity for request".into(),
                     )
@@ -506,6 +523,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                         Err(error) => {
                             let _ = replies.send(RunnerReply::Finished {
                                 request_id: request.assigned_request_id(),
+                                generated_tokens: 0,
                                 result: Err(error.into()),
                             });
                             continue;
@@ -593,7 +611,9 @@ mod tests {
                             .1;
                         result.as_mut().unwrap().output.push_str(&response.output);
                     }
-                    RunnerReply::Finished { request_id, result } => {
+                    RunnerReply::Finished {
+                        request_id, result, ..
+                    } => {
                         assert!(finished.insert(request_id));
                         if let Err(error) = result {
                             results

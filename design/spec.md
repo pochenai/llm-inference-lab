@@ -134,7 +134,7 @@ sequenceDiagram
         opt Stateless request completes
             R->>K: release temporary context
         end
-        R-->>D: RunnerReply::Finished { request_id, result }
+        R-->>D: RunnerReply::Finished { request_id, generated_tokens, result }
         D-->>C: end that request's stream or emit error
     end
     end
@@ -174,7 +174,7 @@ impl<T> SessionRequest<T> {
 pub type BatchIn<T = String> = Vec<SessionRequest<T>>;
 pub enum RunnerReply {
     Delta(LLMResponse),
-    Finished { request_id: RequestId, result: Result<(), EngineError> },
+    Finished { request_id: RequestId, generated_tokens: usize, result: Result<(), EngineError> },
 }
 
 /// Public for channel wiring; applications call Scheduler instead of sending commands.
@@ -211,6 +211,10 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
 }
 
 impl Scheduler {
+    /// Attach synchronous observers for admission, deltas and one terminal event.
+    pub fn new_with_observers(cancel: CancellationToken,
+        commands: UnboundedSender<RunnerCommand>, replies: UnboundedReceiver<RunnerReply>,
+        observers: Vec<Arc<dyn SchedulerObserver>>) -> Self;
     /// Allocate a SessionId and return only after Runner creates its state.
     pub async fn open_session(&self) -> Result<SessionId, EngineError>;
     /// Flush preceding requests, then close on Runner and await acknowledgement.
@@ -222,6 +226,15 @@ impl Scheduler {
     pub async fn execute(&self, request: SessionRequest) -> Result<LLMResponse>;
 }
 ```
+
+SchedulerObserver hooks observe admission, text and completion outside routing-map
+locks; they cannot return scheduling decisions. Completion provides RequestStats
+with elapsed time, optional first nonempty text latency, and optional generated
+token count (unknown on cancellation/disconnection before Runner completion).
+MetricsObserver emits standard metrics handles; a completion closure can capture
+stats for a caller's summary. Request output TPS includes the entire request;
+Qwen prefill/decode and workspace metrics remain below Scheduler. No Runner start
+notification is added, so queue time is not separately measured.
 
 Session management and generation share one FIFO command queue. The dispatcher
 flushes pending requests before forwarding open/close, and Runner processes commands
@@ -392,14 +405,14 @@ internals, call decode again at completion, or synthesize replacement characters
 If generation stops while a fragment is still buffered, only the already-emitted
 chunks form the response; this can differ from batch decoding of incomplete UTF-8.
 CPU token history is retained independently of displayed text.
-RunnerReply::Finished carries one request ID and Result<(), EngineError> after
+RunnerReply::Finished carries one request ID, actual generated_tokens, and Result<(), EngineError> after
 that request's state cleanup. Stopped requests, including zero-output requests,
 finish before any peer's next step; temporary KV and session locks are released
 at that boundary. Validation/admission errors finish immediately. execute_batch
 and execute_model_batch return unit: all text and terminal results travel through
 the supplied reply channel, with no full-response intermediate. Scheduler routes
-text unchanged and ends each stream or emits one terminal error; it does not track
-text lengths or decode tails. Partial text already delivered cannot be retracted on failure.
+text unchanged and ends each stream or emits one terminal error; it does not decode
+text or maintain decoder tails. Partial text already delivered cannot be retracted on failure.
 Scheduler::execute collects this same stream into one final response. Streams are
 buffered, not GPU backpressure: dropping a consumer stops delivery but does not
 cancel generation. Scheduler/Runner shutdown still cancels outstanding work.
@@ -434,6 +447,16 @@ reuses disjoint scratch regions across all decoder layers on the same stream.
 Outputs fully overwrite their regions without zero-fill kernels. Scratch allocation
 checks its exact byte budget against available device/pool memory; completion and
 escaped-handle leases prevent early recycling, including on failure/cancellation.
+Qwen execution totals use Counter/Histogram handles directly; no parallel
+Qwen2Metrics accumulator or last-step timing is maintained. workspace_metrics()
+returns only shared model-wide current/peak resource ownership. Benchmark timing
+belongs to its own awaited calls; shared-counter deltas cannot identify a batch.
+The private StepOutput returns host_submit_seconds with this invocation's outputs,
+without an out-parameter. step_wall_seconds includes GPU/D2H completion and KV
+commit; host_submit_seconds covers synchronous host preparation/enqueueing only.
+They overlap GPU execution and cannot be subtracted to obtain pure kernel time.
+The application chooses a recorder before model load; no exporter is installed.
+Optional structured `tracing` events are enabled by the application subscriber.
 
 # KV Cache state and APIs
 
