@@ -15,8 +15,8 @@ use cutile::{
     tensor::Tensor,
 };
 
-use super::super::ModelError;
 use super::{engine::INPUT_DIM, workspace::Buffers};
+use crate::ModelError;
 
 const MAX_IDLE_GRAPHS: usize = 4;
 // Short graphs finish inline without a reactor/wakeup round trip. Longer work

@@ -1,5 +1,6 @@
 use crate::{error::EngineError, types::*};
 use dashmap::DashMap;
+use futures::{stream, Stream, TryStreamExt};
 use std::{
     collections::HashSet,
     sync::{
@@ -21,7 +22,7 @@ const MAX_DISPATCH_SIZE: usize = 5;
 const BATCH_WAIT: Duration = Duration::from_millis(100);
 
 struct PendingRequest {
-    reply_tx: oneshot::Sender<Result<LLMResponse, EngineError>>,
+    reply_tx: mpsc::UnboundedSender<Result<Option<LLMResponse>, EngineError>>,
 }
 
 type Requests = Arc<DashMap<RequestId, PendingRequest>>;
@@ -42,7 +43,7 @@ impl Scheduler {
     pub fn new(
         cancel_token: CancellationToken,
         runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
-        batch_reply_rx: mpsc::UnboundedReceiver<BatchReply>,
+        batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let requests = Arc::new(DashMap::new());
@@ -82,14 +83,33 @@ impl Scheduler {
         self.requests.clear();
     }
 
-    /// Allocate a fresh invocation ID at admission, shared across Scheduler clones.
+    /// Collect the same incremental stream exposed by execute_stream.
     pub async fn execute(&self, request: SessionRequest) -> Result<LLMResponse, EngineError> {
+        let responses = self.execute_stream(request)?;
+        futures::pin_mut!(responses);
+        let mut output: Option<LLMResponse> = None;
+        while let Some(response) = responses.try_next().await? {
+            match &mut output {
+                Some(output) => output.output.push_str(&response.output),
+                None => output = Some(response),
+            }
+        }
+        output.ok_or(EngineError::ChannelClosed)
+    }
+
+    /// Admit immediately and stream UTF-8 text deltas until completion or one error.
+    /// Dropping the stream stops delivery; it does not cancel the admitted request.
+    pub fn execute_stream(
+        &self,
+        request: SessionRequest,
+    ) -> Result<impl Stream<Item = Result<LLMResponse, EngineError>> + Send + 'static, EngineError>
+    {
         if self.cancel_token.is_cancelled() {
             return Err(EngineError::ChannelClosed);
         }
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = request.with_request_id(request_id);
-        let (reply_tx, response_rx) = oneshot::channel();
+        let (reply_tx, response_rx) = mpsc::unbounded_channel();
         self.requests
             .insert(request_id, PendingRequest { reply_tx });
         if self
@@ -100,7 +120,18 @@ impl Scheduler {
             self.requests.remove(&request_id);
             return Err(EngineError::ChannelClosed);
         }
-        response_rx.await.map_err(|_| EngineError::ChannelClosed)?
+        let cancel = self.cancel_token.clone();
+        Ok(stream::try_unfold(
+            (response_rx, cancel),
+            |(mut rx, cancel)| async move {
+                let response = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(EngineError::ChannelClosed),
+                    response = rx.recv() => response.ok_or(EngineError::ChannelClosed)??,
+                };
+                Ok(response.map(|response| (response, (rx, cancel))))
+            },
+        ))
     }
 
     /// Allocate an ID shared across clones and wait for Runner to create the session.
@@ -204,13 +235,20 @@ impl Scheduler {
     }
 
     async fn run_recv_resp(
-        mut batch_reply_rx: mpsc::UnboundedReceiver<BatchReply>,
+        mut batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
         requests: Requests,
     ) {
         while let Some(output) = batch_reply_rx.recv().await {
-            for (request_id, result) in output.results {
-                if let Some((_, request)) = requests.remove(&request_id) {
-                    let _ = request.reply_tx.send(result);
+            match output {
+                RunnerReply::Delta(response) => {
+                    if let Some(request) = requests.get(&response.request_id) {
+                        let _ = request.reply_tx.send(Ok(Some(response)));
+                    }
+                }
+                RunnerReply::Finished { request_id, result } => {
+                    if let Some((_, request)) = requests.remove(&request_id) {
+                        let _ = request.reply_tx.send(result.map(|()| None));
+                    }
                 }
             }
         }
@@ -223,6 +261,86 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn streams_deliver_before_completion_and_route_terminal_errors() -> Result<(), EngineError>
+    {
+        let cancel = CancellationToken::new();
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (replies, reply_rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(cancel.child_token(), commands, reply_rx);
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let permit = finish.clone();
+        let worker = tokio::spawn(async move {
+            let Some(RunnerCommand::Execute(batch)) = rx.recv().await else {
+                panic!("batch")
+            };
+            for request in &batch {
+                if request.input != "empty" {
+                    replies
+                        .send(RunnerReply::Delta(LLMResponse {
+                            request_id: request.assigned_request_id(),
+                            output: request.input.clone(),
+                        }))
+                        .unwrap();
+                }
+            }
+            permit.notified().await;
+            for request in batch {
+                let request_id = request.assigned_request_id();
+                let result = if request.input == "bad" {
+                    Err(EngineError::InvalidInput("after partial output".into()))
+                } else {
+                    replies
+                        .send(RunnerReply::Delta(LLMResponse {
+                            request_id,
+                            output: if request.input == "empty" {
+                                String::new()
+                            } else {
+                                " tail".into()
+                            },
+                        }))
+                        .unwrap();
+                    Ok(())
+                };
+                replies
+                    .send(RunnerReply::Finished { request_id, result })
+                    .unwrap();
+            }
+        });
+        let good = scheduler.execute_stream(SessionRequest::new(None, "good".into()))?;
+        let bad = scheduler.execute_stream(SessionRequest::new(None, "bad".into()))?;
+        let empty = scheduler.execute_stream(SessionRequest::new(None, "empty".into()))?;
+        futures::pin_mut!(good, bad, empty);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), good.try_next())
+                .await
+                .unwrap()?
+                .unwrap()
+                .output,
+            "good"
+        );
+        assert_eq!(bad.try_next().await?.unwrap().output, "bad");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), good.try_next())
+                .await
+                .is_err()
+        );
+        finish.notify_one();
+        assert_eq!(good.try_next().await?.unwrap().output, " tail");
+        assert!(good.try_next().await?.is_none());
+        assert!(matches!(
+            bad.try_next().await,
+            Err(EngineError::InvalidInput(_))
+        ));
+        assert!(bad.try_next().await?.is_none());
+        assert!(empty.try_next().await?.unwrap().output.is_empty());
+        assert!(empty.try_next().await?.is_none());
+        worker.await.unwrap();
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn per_request_errors_do_not_affect_other_callers() {
         let cancel = CancellationToken::new();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<RunnerCommand>();
@@ -230,22 +348,23 @@ mod tests {
         let scheduler = Scheduler::new(cancel.child_token(), request_tx, reply_rx);
         let worker = tokio::spawn(async move {
             while let Some(RunnerCommand::Execute(batch)) = request_rx.recv().await {
-                let results = batch
-                    .into_iter()
-                    .map(|request| {
-                        let id = request.assigned_request_id();
-                        let result = if request.input == "bad" {
-                            Err(EngineError::InvalidInput("bad request".into()))
-                        } else {
-                            Ok(LLMResponse {
-                                request_id: id,
+                for request in batch {
+                    let request_id = request.assigned_request_id();
+                    let result = if request.input == "bad" {
+                        Err(EngineError::InvalidInput("bad request".into()))
+                    } else {
+                        reply_tx
+                            .send(RunnerReply::Delta(LLMResponse {
+                                request_id,
                                 output: request.input,
-                            })
-                        };
-                        (id, result)
-                    })
-                    .collect();
-                reply_tx.send(BatchReply { results }).unwrap();
+                            }))
+                            .unwrap();
+                        Ok(())
+                    };
+                    reply_tx
+                        .send(RunnerReply::Finished { request_id, result })
+                        .unwrap();
+                }
             }
         });
         let (bad, good) = tokio::join!(
@@ -323,20 +442,24 @@ mod tests {
         let scheduler = Scheduler::new(cancel.child_token(), request_tx, reply_rx);
         let worker = tokio::spawn(async move {
             while let Some(RunnerCommand::Execute(batch)) = request_rx.recv().await {
-                let mut outputs = Vec::new();
                 for request in batch {
                     let id = request.assigned_request_id();
                     assert_eq!(request.session_id, Some(7));
-                    outputs.push((
-                        id,
-                        Ok(LLMResponse {
+                    reply_tx
+                        .send(RunnerReply::Delta(LLMResponse {
                             request_id: id,
                             output: request.input,
-                        }),
-                    ));
-                }
-                if reply_tx.send(BatchReply { results: outputs }).is_err() {
-                    break;
+                        }))
+                        .unwrap();
+                    if reply_tx
+                        .send(RunnerReply::Finished {
+                            request_id: id,
+                            result: Ok(()),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         });

@@ -1,11 +1,11 @@
 # Minimal inference engine
 
 A scheduler collects candidate requests; an independent model runner encodes inputs,
-executes a single-head causal-attention model on the GPU, and decodes a scalar
-result into text. Each token has a 16-dimensional embedding. Q/K/V projections,
+drives batched next-token steps on the GPU, and decodes generated tokens into text. Each token has a 16-dimensional embedding. Q/K/V projections,
 attention over cached K/V, a residual, and the existing bias-free `16 -> 16 -> 1`
-MLP run in f32. Sequence length is variable; the output is the last token's scalar.
-There is no positional encoding, LayerNorm, sampling, or autoregressive generation.
+MLP run in f32. The toy backend rounds/clamps its scalar output into token IDs
+0..255; it exercises autoregressive history/KV management without a vocabulary head.
+Qwen2.5 provides the real language-model baseline. Only greedy generation is supported.
 
 Run from the repository root:
 
@@ -34,8 +34,8 @@ Generated files are ignored by Git. Tensor names and shapes are:
 
 Numeric words `0..255` map to input token IDs. `input_divisor` scales embeddings
 (default 1); unknown words and empty inputs are rejected. The scalar result is
-spelled as output tokens for decoding. These output characters are not appended
-to the input history: this demo validates attention/KV rather than text generation.
+rounded/clamped to a numeric token ID. Runner appends every generated ID to history.
+Default generation is one token; requests may set max_new_tokens and EOS overrides.
 
 `KVPool` abstracts storage through `ContextState`, `ReadView`, and `WriteView`. `NaiveKVPool`
 preallocates per-layer K/V buffers and a GPU `[context_row, token_position]` slot
@@ -43,8 +43,8 @@ table. `KVContext` tracks completed and pending token ranges. The model receives
 full history plus a mutable context, computes only the uncached suffix, and uses
 the Runner's policy for one mapping/write/attention/MLP submission. It commits
 `ready_len` after that submission completes. Runner admits nonempty prompt deltas,
-checks the full sequence length, and calls Model::validate_input on new tokens.
-Model trusts idle contexts with an uncached suffix. This version does not cache
+checks the full sequence length, and calls CausalModel::validate_input on new tokens.
+CausalModel trusts idle contexts with an uncached suffix. This version does not cache
 logits or replay the final token.
 
 The Runner's private batch execution owns temporary contexts. The Runner's
@@ -92,7 +92,7 @@ support does not establish operator support; this model executes only in f32.
 Public interfaces cover application ingress, Runner construction/lifecycle,
 model/pool extension traits, and loader/export operations. Runner dispatch
 (`execute_batch`), decoding, and its assembly
-constructor are private. BatchReply bookkeeping is `pub(crate)`. Read/write view
+constructor are private. Tests collect the same RunnerReply events as Scheduler. Read/write view
 fields are private; their types stay public for trait signatures. Read views expose
 const pointers through safe accessors; writable handles require a distinct WriteView.
 KVContext selects only pending positions for write views and holds an exclusive
@@ -102,10 +102,10 @@ Kernel launchers are `pub(super)` inside private kernel modules. Tests use modul
 privacy rules rather than widening production APIs.
 
 
-ModelOutput contains request_id and a per-request result. Model::generate returns
-a Vec of these outputs, including an error on every affected request if shared GPU
-execution fails. BatchReply also contains only per-request results; Scheduler routes
-each success/error independently. Invalid input never fails otherwise valid peers.
+CausalModel::next_tokens returns one ordered Result<u32, ModelError> per input, including
+an error on every affected request if shared GPU execution fails. Request IDs stay
+in Runner rather than entering the model interface. RunnerReply separates text deltas
+from per-request completion/error statuses; Scheduler routes both independently. Invalid input never fails otherwise valid peers.
 Admission uses KVPool::can_append as a conservative capacity snapshot; reservation
 remains the pool's responsibility. Workspace-based batching is deferred.
 
@@ -124,7 +124,7 @@ change has correctness coverage; no throughput improvement is claimed.
 `examples/simple_mlp_attn.rs` runs uniform stateless requests through Scheduler and
 Runner using fixed-seed random weights, so it does not depend on exported model files.
 It checks identical finite outputs and verifies KV release after each batch. The
-example-only model wrapper measures Model::generate separately from end-to-end time.
+example-only model wrapper measures CausalModel::next_tokens separately from end-to-end time.
 
 ```bash
 cargo build --manifest-path rust/Cargo.toml --offline --release -p engine --example simple_mlp_attn
@@ -214,30 +214,69 @@ SwiGLU, the tied/untied LM head, and two-stage GPU greedy argmax. It does not in
 PyTorch, cuBLAS, or a Python model for inference. The optional Python script is an
 independent CPU/FP32 reference only.
 
-The new `CausalModel<P>` capability defines `next_token` and the framework-owned
-`generate_greedy` loop. Models supply a single step and EOS recognition; the shared
-loop returns a lazy `Stream<Item = Result<u32, ModelError>>`, appends raw token IDs
-before yielding, enforces the output limit, and yields EOS once before stopping.
-An error is yielded once and ends the stream. The example uses `try_collect` for
-a single response; incremental consumers can poll each token without allocating
-an output Vec. Dropping an unpolled stream does nothing; dropping between items
-preserves history/KV for continuation. Dropping an in-flight step may leave a
-pending append, requiring context release. CausalModel::execute_step exposes the safe prepare/await/commit boundary to backend
-implementers, while the same internal helper serves existing batch models. A sampled
-token enters CPU history before its KV is computed by the next step. Qwen's GQA
-backend implements the existing AttentionBackend contract; KVPool/ReadView/WriteView
-are reused, flattening two 64-dimensional KV heads into a 128-wide token vector.
-No operator-trait hierarchy or alternate cache allocator is required for this baseline.
-Token and diagnostic-logit readbacks enqueue asynchronous D2H copies into reusable
-pinned host buffers on the same execution context. The outer scheduled future awaits
-completion before KV commit and CPU reads; the submission retains both source and
-destination on cancellation. The Qwen forward path does not synchronize the stream
-or expose CPU readback data inside the submission callback.
+A single `CausalModel<P>` trait exposes `next_tokens(&mut [ModelInput], policy)`.
+Models own one numerical step and EOS recognition; all generation loops live in Runner.
+Single-input callers use a stack array; results remain an ordered Vec of per-input results.
+Models expose their matching tokenizer through `CausalModel::tokenizer()`.
+RunnerBuilder's model factory returns only the model; Runner borrows its tokenizer
+for encoding and decoding.
 
-This example directly exercises CausalModel on one request. The existing Model,
-Scheduler/Runner response path and toy MLP remain unchanged; adapting the Runner to
-schedule causal steps is separate work. Qwen currently uses eager execution and
-fresh intermediates, not the toy model's specialized CUDA Graph/workspace path.
+`Scheduler::execute_stream` admits a request and returns a
+`Stream<Item = Result<LLMResponse, EngineError>>`. Each response contains a text
+delta and the same request ID. Runner uses `tokenizer.decode_stream(true)` directly;
+the library owns buffering, UTF-8 assembly, and context-sensitive decoding. Runner
+forwards `Some(text)` and keeps generating on `None`. There is no application-level
+flush or replacement-character synthesis. If generation stops with an undecodable
+fragment, the response contains only chunks already emitted by the library; it
+may differ from batch decoding's replacement characters. Token history is preserved.
+Finished carries only completion/error statuses for one request.
+Finished is emitted after that request's state cleanup, before any peer's next step.
+The execution methods return unit and send all results through the reply channel.
+An error terminates that request's stream; earlier deltas remain delivered. `execute` collects the same stream into
+one response. Output channels are buffered; dropping the stream stops delivery
+without cancelling generation.
+
+```rust,ignore
+use futures::TryStreamExt;
+
+let chunks = scheduler.execute_stream(request)?;
+futures::pin_mut!(chunks);
+while let Some(chunk) = chunks.try_next().await? {
+    print!("{}", chunk.output);
+}
+```
+
+
+Runner drives batch steps, appends generated IDs to each session's history, removes
+finished requests from later steps, and stops at EOS or max_new_tokens (default 1).
+Admission budgets include all possible generated KV positions, excluding the final
+sampled token whose KV will be computed in a subsequent turn. Only pure greedy
+settings are supported. Mid-turn cancellation releases contexts; partial failed
+turns are invalidated if KV has advanced. Completed history survives text-decode errors.
+The Qwen example submits through Scheduler -> Runner; optional reference mode still
+reads diagnostic logits directly. Exact generated IDs and multi-turn Runner continuation
+are checked by the real-checkpoint regression. The CLI response contains text and request_id.
+
+Qwen currently serializes batch items through its existing one-context attention kernel;
+SimpleMLP retains packed GPU batches and CUDA Graph replay. Shared KV interfaces are unchanged.
+Token/logit readbacks enqueue asynchronous D2H into reusable pinned buffers and become
+readable only after outer completion. Dropping an in-flight model step may require
+context release; retained GPU leases prevent premature storage reuse.
+Qwen uses eager execution with an exclusive, exact-suffix-shape workspace per
+forward. Two backing allocations hold disjoint float/integer regions; all decoder
+layers reuse them in stream order. Every output is fully overwritten, so scratch
+needs no zero-fill kernel. The lease survives submission failure, cancellation,
+and escaped tensor handles; concurrent forwards receive different workspaces.
+The cache retains at most two idle workspaces (normally prefill/decode) and drops
+idle shapes under memory pressure. On a miss, scratch admission checks its exact
+size against device free memory plus unused execution-pool reservations after
+weights/KV allocation. This snapshot cannot reserve memory against other callers;
+allocation errors still propagate as per-request failures.
+For Qwen2.5-0.5B, scratch bytes are
+`4 * (suffix_tokens * 20352 + 154021)`: about 3.07 MiB for 32 tokens and
+318.59 MiB for 4096 tokens, independent of the decoder layer count. These figures
+exclude weights, KV, input uploads, pinned readbacks, and other idle/in-flight
+workspaces. Qwen CUDA Graph capture remains subsequent work.
 This is a numerical/lifecycle baseline, not an optimized throughput result. Initial
 support requires full causal attention, unscaled RoPE, and 64-dimensional heads.
 The example supplies the explicit two-message Qwen2 chat template and uses pure

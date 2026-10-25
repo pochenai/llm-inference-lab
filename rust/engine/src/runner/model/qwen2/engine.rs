@@ -41,21 +41,22 @@
 //! Greedy argmax -> next token ID
 //! ```
 
-use super::super::{AttentionBackend, CausalModel, ModelError, ModelInput};
 use super::{
     kernels,
     readback::{enqueue_readback, Readback, ReadbackCache},
+    workspace::WorkspacePool,
 };
 use crate::runner::{
     kv_pool::{KVContext, NaiveKVPool, NaiveKVPoolConfig, NaiveReadView},
     loader::{EosTokenId, WeightLoader},
     upload::UploadPool,
 };
+use crate::{AttentionBackend, CausalModel, ModelError, ModelInput};
 use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
-    tensor::{Reshape, Tensor, Unpartition},
-    tile_kernel::{PartitionOp, TileKernel},
+    tensor::{PartitionMut, Reshape, Tensor},
+    tile_kernel::TileKernel,
 };
 use serde::Deserialize;
 use std::{path::Path, sync::Arc};
@@ -109,6 +110,7 @@ pub struct Qwen2Engine {
     layers: Vec<Layer>,
     eos: Vec<u32>,
     attention: GqaAttention,
+    workspaces: Arc<WorkspacePool>,
     input_uploads: Arc<UploadPool<u32>>,
     token_readbacks: ReadbackCache<i32>,
     logit_readbacks: ReadbackCache<f32>,
@@ -273,6 +275,7 @@ impl Qwen2Engine {
             kv_heads: config.num_key_value_heads,
         };
         Ok(Self {
+            workspaces: Arc::default(),
             input_uploads: Arc::default(),
             token_readbacks: Default::default(),
             logit_readbacks: Default::default(),
@@ -290,9 +293,6 @@ impl Qwen2Engine {
 
     pub fn config(&self) -> &Qwen2Config {
         &self.config
-    }
-    pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
     }
 
     /// Flatten KV heads into NaiveKVPool's per-token vector; attention restores GQA heads.
@@ -345,7 +345,8 @@ impl Qwen2Engine {
             token_ids: tokens,
             kv,
         };
-        let (token, logits) = Self::execute_step(input, &policy, |input, exec| {
+        let (token, logits) = Self::execute_append_batch(&mut [input], &policy, |batch, exec| {
+            let input = &mut batch[0];
             // SAFETY: every GPU access, including D2H, belongs to this submission.
             unsafe { self.submit(input.token_ids, input.kv, read_logits, exec) }
         })
@@ -370,70 +371,132 @@ impl Qwen2Engine {
     ) -> Result<(Readback<i32>, Option<Readback<f32>>), ModelError> {
         let start = kv.ready_len();
         let rows = tokens.len() - start;
-        let h = self.config.hidden_size;
+        // reuse the same buffer
+        let mut scratch = self.workspaces.acquire(rows, &self.config, exec)?;
         let ids = self.input_uploads.upload_slice(&tokens[start..], exec)?;
-        let mut x = Arc::new(
-            kernels::embedding(
-                api::zeros::<f32>(&[rows, h]).partition([1, 256]),
-                ids,
-                self.embedding.clone(),
-            )
-            .map(|(out, ..)| out)
-            .unpartition()
-            .execute(exec)?,
-        );
+        kernels::embedding(
+            (&mut scratch.x).partition([1, 256]),
+            ids,
+            self.embedding.clone(),
+        )
+        .execute(exec)?;
+        // All layer accesses share exec's stream. A buffer is overwritten only after
+        // its last consumer; no scratch allocation grows with the number of layers.
         for (index, layer) in self.layers.iter().enumerate() {
-            let norm = self.normalize(x.clone(), layer.input_norm.clone(), rows, 0, exec)?;
-            let q = self.linear(norm.clone(), layer.q.clone(), None, exec)?;
-            let k = self.linear(norm.clone(), layer.k.clone(), None, exec)?;
-            let v = self.linear(norm, layer.v.clone(), Some(layer.v_bias.clone()), exec)?;
-            let q = self.rope(q, layer.q_bias.clone(), start, exec)?;
-            let k = self.rope(k, layer.k_bias.clone(), start, exec)?;
-            kv.store(index, k.slice(&[0..rows])?, v.slice(&[0..rows])?, exec)?;
-            let view = kv.read_view(index)?;
-            let attention = self.attention.forward(q, &[view], &[0..rows], exec)?;
-            let projected = self.linear(attention, layer.o.clone(), None, exec)?;
-            let residual = add(x, projected, exec)?;
-            let norm = self.normalize(residual.clone(), layer.post_norm.clone(), rows, 0, exec)?;
-            let gate = self.linear(norm.clone(), layer.gate.clone(), None, exec)?;
-            let up = self.linear(norm, layer.up.clone(), None, exec)?;
-            let activated = Arc::new(
-                kernels::swiglu(
-                    api::zeros::<f32>(&[rows, self.config.intermediate_size]).partition([1, 256]),
-                    gate,
-                    up,
-                )
-                .map(|(out, ..)| out)
-                .unpartition()
-                .execute(exec)?,
-            );
-            x = add(
-                residual,
-                self.linear(activated, layer.down.clone(), None, exec)?,
+            self.normalize(
+                &mut scratch.norm,
+                &scratch.x,
+                layer.input_norm.clone(),
+                0,
                 exec,
             )?;
+            self.linear(&mut scratch.q, &scratch.norm, layer.q.clone(), None, exec)?;
+            self.linear(&mut scratch.k, &scratch.norm, layer.k.clone(), None, exec)?;
+            self.linear(
+                &mut scratch.v,
+                &scratch.norm,
+                layer.v.clone(),
+                Some(layer.v_bias.clone()),
+                exec,
+            )?;
+            self.rope(
+                &mut scratch.rotated_q,
+                &scratch.q,
+                layer.q_bias.clone(),
+                start,
+                exec,
+            )?;
+            self.rope(
+                &mut scratch.rotated_k,
+                &scratch.k,
+                layer.k_bias.clone(),
+                start,
+                exec,
+            )?;
+            kv.store(
+                index,
+                scratch.rotated_k.slice(&[0..rows])?,
+                scratch.v.slice(&[0..rows])?,
+                exec,
+            )?;
+            let view = kv.read_view(index)?;
+            self.attention.forward_into(
+                &mut scratch.attention,
+                &scratch.rotated_q,
+                &[view],
+                &[0..rows],
+                exec,
+            )?;
+            // Q projection has no remaining consumers: reuse its buffer for O/down.
+            self.linear(
+                &mut scratch.q,
+                &scratch.attention,
+                layer.o.clone(),
+                None,
+                exec,
+            )?;
+            add(&mut scratch.residual, &scratch.x, &scratch.q, exec)?;
+            self.normalize(
+                &mut scratch.norm,
+                &scratch.residual,
+                layer.post_norm.clone(),
+                0,
+                exec,
+            )?;
+            self.linear(
+                &mut scratch.gate,
+                &scratch.norm,
+                layer.gate.clone(),
+                None,
+                exec,
+            )?;
+            self.linear(&mut scratch.up, &scratch.norm, layer.up.clone(), None, exec)?;
+            kernels::swiglu(
+                (&mut scratch.activated).partition([1, 256]),
+                &scratch.gate,
+                &scratch.up,
+            )
+            .execute(exec)?;
+            self.linear(
+                &mut scratch.q,
+                &scratch.activated,
+                layer.down.clone(),
+                None,
+                exec,
+            )?;
+            add(&mut scratch.x, &scratch.residual, &scratch.q, exec)?;
         }
-        let norm = self.normalize(x, self.norm.clone(), 1, rows - 1, exec)?;
-        let logits = self.linear(norm, self.lm_head.clone(), None, exec)?;
-        let flat = logits.reshape(&[self.config.vocab_size])?;
+        self.normalize(
+            &mut scratch.final_norm,
+            &scratch.x,
+            self.norm.clone(),
+            rows - 1,
+            exec,
+        )?;
+        self.linear(
+            &mut scratch.logits,
+            &scratch.final_norm,
+            self.lm_head.clone(),
+            None,
+            exec,
+        )?;
+        let flat = scratch.logits.reshape(&[self.config.vocab_size])?;
         let blocks = self.config.vocab_size.div_ceil(256);
-        let (maxima, indices, _, _) = kernels::argmax_blocks(
-            api::zeros::<f32>(&[blocks]).partition([1]),
-            api::zeros::<i32>(&[blocks]).partition([1]),
-            flat.clone(),
+        kernels::argmax_blocks(
+            (&mut scratch.maxima).partition([1]),
+            (&mut scratch.indices).partition([1]),
+            &flat,
             self.config.vocab_size as i32,
         )
         .execute(exec)?;
-        let winner = kernels::argmax_final(
-            api::zeros::<i32>(&[1]).partition([1]),
-            maxima.unpartition(),
-            indices.unpartition(),
+        kernels::argmax_final(
+            (&mut scratch.winner).partition([1]),
+            &scratch.maxima,
+            &scratch.indices,
             blocks as i32,
         )
-        .map(|(out, ..)| out)
-        .unpartition()
         .execute(exec)?;
-        let token = enqueue_readback(winner, &self.token_readbacks, exec)?;
+        let token = enqueue_readback(scratch.winner, &self.token_readbacks, exec)?;
         let values = if read_logits {
             Some(enqueue_readback(flat, &self.logit_readbacks, exec)?)
         } else {
@@ -444,76 +507,61 @@ impl Qwen2Engine {
 
     unsafe fn linear(
         &self,
-        x: Weight,
+        out: &mut Tensor<f32>,
+        x: &Tensor<f32>,
         w: Weight,
         bias: Option<Weight>,
         exec: &ExecutionContext,
-    ) -> Result<Weight, ModelError> {
-        let rows = x.shape()[0] as usize;
+    ) -> Result<(), ModelError> {
         let k = x.shape()[1] as usize;
         let has_bias = bias.is_some();
         // Bias-free specializations never read this existing rank-one weight.
         let bias = bias.unwrap_or_else(|| self.norm.clone());
-        Ok(Arc::new(
-            kernels::linear(
-                api::zeros::<f32>(&[rows, w.shape()[0] as usize]).partition([4, 32]),
-                x,
-                w,
-                bias,
-            )
+        kernels::linear(out.partition([4, 32]), x, w, bias)
             .generics(vec![k.to_string(), has_bias.to_string()])
-            .map(|(out, ..)| out)
-            .unpartition()
-            .execute(exec)?,
-        ))
+            .execute(exec)?;
+        Ok(())
     }
 
     unsafe fn normalize(
         &self,
-        x: Weight,
+        out: &mut Tensor<f32>,
+        x: &Tensor<f32>,
         w: Weight,
-        rows: usize,
         offset: usize,
         exec: &ExecutionContext,
-    ) -> Result<Weight, ModelError> {
+    ) -> Result<(), ModelError> {
         let width = self.config.hidden_size;
-        Ok(Arc::new(
-            kernels::rms_norm(
-                api::zeros::<f32>(&[rows, width]).partition([1, width.next_power_of_two()]),
-                x,
-                w,
-                self.config.rms_norm_eps,
-                width as i32,
-                offset as i32,
-            )
-            .generics(vec![width.next_power_of_two().to_string()])
-            .map(|(out, ..)| out)
-            .unpartition()
-            .execute(exec)?,
-        ))
+        kernels::rms_norm(
+            out.partition([1, width.next_power_of_two()]),
+            x,
+            w,
+            self.config.rms_norm_eps,
+            width as i32,
+            offset as i32,
+        )
+        .generics(vec![width.next_power_of_two().to_string()])
+        .execute(exec)?;
+        Ok(())
     }
 
     unsafe fn rope(
         &self,
-        x: Weight,
+        out: &mut Tensor<f32>,
+        x: &Tensor<f32>,
         bias: Weight,
         start: usize,
         exec: &ExecutionContext,
-    ) -> Result<Weight, ModelError> {
-        let rows = x.shape()[0] as usize;
-        let width = x.shape()[1] as usize;
-        Ok(Arc::new(
-            kernels::rope(
-                api::zeros::<f32>(&[rows, width]).partition([1, 64]),
-                x,
-                bias,
-                self.inv_freq.clone(),
-                start as i32,
-            )
-            .map(|(out, ..)| out)
-            .unpartition()
-            .execute(exec)?,
-        ))
+    ) -> Result<(), ModelError> {
+        kernels::rope(
+            out.partition([1, 64]),
+            x,
+            bias,
+            self.inv_freq.clone(),
+            start as i32,
+        )
+        .execute(exec)?;
+        Ok(())
     }
 }
 
@@ -523,14 +571,15 @@ struct GqaAttention {
     kv_heads: usize,
 }
 
-impl AttentionBackend<NaiveKVPool> for GqaAttention {
-    fn forward(
+impl GqaAttention {
+    unsafe fn forward_into(
         &self,
-        q: Weight,
+        out: &mut Tensor<f32>,
+        q: &Tensor<f32>,
         views: &[NaiveReadView<'_>],
         query_ranges: &[std::ops::Range<usize>],
         exec: &ExecutionContext,
-    ) -> Result<Weight, ModelError> {
+    ) -> Result<(), ModelError> {
         let [view] = views else {
             return Err(ModelError::InvalidInput(
                 "initial Qwen GQA backend expects one context".into(),
@@ -549,37 +598,77 @@ impl AttentionBackend<NaiveKVPool> for GqaAttention {
         }
         view.retain(exec)?;
         // SAFETY: view retains storage and allocation leases; writes precede reads on exec.
+        let (k, v, table) = view.tensors();
+        kernels::attention(
+            out.partition([1, 64]),
+            q,
+            k.clone(),
+            v.clone(),
+            table.clone(),
+            view.row() as i32,
+            (view.positions().end - rows) as i32,
+            self.q_heads as i32,
+            self.kv_heads as i32,
+        )
+        .execute(exec)?;
+        Ok(())
+    }
+}
+
+impl AttentionBackend<NaiveKVPool> for GqaAttention {
+    fn forward(
+        &self,
+        q: Weight,
+        views: &[NaiveReadView<'_>],
+        query_ranges: &[std::ops::Range<usize>],
+        exec: &ExecutionContext,
+    ) -> Result<Weight, ModelError> {
+        // SAFETY: the attention kernel writes every valid output before any read.
         unsafe {
-            let (k, v, table) = view.tensors();
-            Ok(Arc::new(
-                kernels::attention(
-                    api::zeros::<f32>(&[rows, self.q_heads * 64]).partition([1, 64]),
-                    q,
-                    k.clone(),
-                    v.clone(),
-                    table.clone(),
-                    view.row() as i32,
-                    (view.positions().end - rows) as i32,
-                    self.q_heads as i32,
-                    self.kv_heads as i32,
-                )
-                .map(|(out, ..)| out)
-                .unpartition()
-                .execute(exec)?,
-            ))
+            let mut out = Tensor::<f32>::uninitialized(q.size())
+                .execute(exec)?
+                .assume_init()
+                .reshape(&[q.shape()[0] as usize, self.q_heads * 64])?;
+            self.forward_into(&mut out, &q, views, query_ranges, exec)?;
+            Ok(Arc::new(out))
         }
     }
 }
 
 impl CausalModel<NaiveKVPool> for Qwen2Engine {
-    async fn next_token(
-        &self,
-        tokens: &[u32],
-        kv: &mut KVContext<NaiveKVPool>,
-        policy: Arc<dyn SchedulingPolicy>,
-    ) -> Result<u32, ModelError> {
-        Ok(self.step(tokens, kv, policy, false).await?.0)
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
     }
+
+    fn validate_input(&self, token_ids: &[u32]) -> Result<(), ModelError> {
+        if token_ids
+            .iter()
+            .any(|&id| id as usize >= self.config.vocab_size)
+        {
+            return Err(ModelError::InvalidInput(
+                "token ID outside model vocabulary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn next_tokens(
+        &self,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        policy: Arc<dyn SchedulingPolicy>,
+    ) -> Vec<Result<u32, ModelError>> {
+        // shortcut: serialize Qwen batch items until the attention kernel supports packed contexts.
+        let mut outputs = Vec::with_capacity(batch.len());
+        for input in batch {
+            outputs.push(
+                self.step(input.token_ids, input.kv, policy.clone(), false)
+                    .await
+                    .map(|(token, _)| token),
+            );
+        }
+        outputs
+    }
+
     fn is_eos(&self, token: u32) -> bool {
         self.eos.contains(&token)
     }
@@ -605,17 +694,14 @@ async fn weight(
     Ok(w)
 }
 
-unsafe fn add(x: Weight, y: Weight, exec: &ExecutionContext) -> Result<Weight, ModelError> {
-    Ok(Arc::new(
-        kernels::add(
-            api::zeros::<f32>(&[x.shape()[0] as usize, x.shape()[1] as usize]).partition([1, 256]),
-            x,
-            y,
-        )
-        .map(|(out, ..)| out)
-        .unpartition()
-        .execute(exec)?,
-    ))
+unsafe fn add(
+    out: &mut Tensor<f32>,
+    x: &Tensor<f32>,
+    y: &Tensor<f32>,
+    exec: &ExecutionContext,
+) -> Result<(), ModelError> {
+    kernels::add(out.partition([1, 256]), x, y).execute(exec)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -625,7 +711,7 @@ mod tests {
     use anyhow::Context;
     use cuda_async::scheduling_policies::SingleStream;
     use cutile::cuda_core::Device;
-    use futures::TryStreamExt;
+    use cutile::tensor::{IntoPartition, Unpartition};
 
     #[tokio::test]
     async fn linear_epilogue_bias_matches_cpu_with_partial_row_tile() -> Result<(), ModelError> {
@@ -648,7 +734,11 @@ mod tests {
                             .reshape(&[64, 32])?;
                         let bias = api::copy_host_vec_to_device(&biases).execute(exec)?;
                         let out = kernels::linear(
-                            api::zeros::<f32>(&[3, 64]).partition([4, 32]),
+                            Tensor::<f32>::uninitialized(3 * 64)
+                                .execute(exec)?
+                                .assume_init()
+                                .reshape(&[3, 64])?
+                                .partition([4, 32]),
                             x,
                             w,
                             bias,
@@ -693,7 +783,11 @@ mod tests {
                         .execute(exec)?
                         .reshape(&[4, 896])?;
                     let out = kernels::embedding(
-                        api::zeros::<f32>(&[3, 896]).partition([1, 256]),
+                        Tensor::<f32>::uninitialized(3 * 896)
+                            .execute(exec)?
+                            .assume_init()
+                            .reshape(&[3, 896])?
+                            .partition([1, 256]),
                         ids,
                         w,
                     )
@@ -751,17 +845,16 @@ mod tests {
         .await?;
         let initial = pool.metrics();
         let mut full = KVContext::new(pool.clone())?;
-        assert!(model
-            .next_token(&[], &mut full, policy.clone())
-            .await
-            .is_err());
-        {
-            let mut empty = Vec::new();
-            let mut stream =
-                std::pin::pin!(model.generate_greedy(&mut empty, &mut full, 2, policy.clone()));
-            assert!(stream.try_next().await.is_err());
-            assert_eq!(stream.try_next().await?, None);
-        }
+        let invalid = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: &[],
+                    kv: &mut full,
+                }],
+                policy.clone(),
+            )
+            .await;
+        assert!(invalid[0].is_err());
         assert!(!full.is_pending());
         let (first, actual) = model
             .step_with_logits(&tokens, &mut full, policy.clone())
@@ -780,9 +873,17 @@ mod tests {
         let mut chunked = KVContext::new(pool.clone())?;
         // Prefix logits are intentionally discarded: only its KV state is continued.
         let split = tokens.len() / 2 + 1;
-        model
-            .next_token(&tokens[..split], &mut chunked, policy.clone())
-            .await?;
+        let prefix_next = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: &tokens[..split],
+                    kv: &mut chunked,
+                }],
+                policy.clone(),
+            )
+            .await
+            .pop()
+            .unwrap()?;
         let (next, continued) = model
             .step_with_logits(&tokens, &mut chunked, policy.clone())
             .await?;
@@ -793,48 +894,143 @@ mod tests {
         let mut history = tokens.clone();
         history.push(next);
         let mut generated = vec![next];
-        // Constructing/dropping an unpolled stream must not advance history or KV.
-        drop(model.generate_greedy(&mut history, &mut chunked, 2, policy.clone()));
-        assert_eq!(history.len(), tokens.len() + 1);
-        assert_eq!(chunked.ready_len(), tokens.len());
-        if !model.is_eos(next) && expected_ids.len() > 1 {
-            // Drop between yielded items, then resume through another stream.
-            {
-                let mut stream = std::pin::pin!(model.generate_greedy(
-                    &mut history,
-                    &mut chunked,
-                    expected_ids.len() - 1,
+        while generated.len() < expected_ids.len() && !model.is_eos(*generated.last().unwrap()) {
+            let token = model
+                .next_tokens(
+                    &mut [ModelInput {
+                        token_ids: &history,
+                        kv: &mut chunked,
+                    }],
                     policy.clone(),
-                ));
-                generated.push(stream.try_next().await?.unwrap());
-            }
-            assert!(!chunked.is_pending());
-            assert_eq!(history.len(), tokens.len() + 2);
-            assert_eq!(chunked.ready_len(), tokens.len() + 1);
-        }
-        if !model.is_eos(*generated.last().unwrap()) {
-            generated.extend(
-                model
-                    .generate_greedy(
-                        &mut history,
-                        &mut chunked,
-                        expected_ids.len() - generated.len(),
-                        policy.clone(),
-                    )
-                    .try_collect::<Vec<_>>()
-                    .await?,
-            );
+                )
+                .await
+                .pop()
+                .unwrap()?;
+            history.push(token);
+            generated.push(token);
         }
         assert_eq!(generated, expected_ids);
         assert_eq!(chunked.ready_len() + 1, history.len());
-        let before = history.clone();
-        assert!(model
-            .generate_greedy(&mut history, &mut chunked, 0, policy)
-            .try_collect::<Vec<_>>()
-            .await?
-            .is_empty());
-        assert_eq!(history, before);
         chunked.release();
+        assert_eq!(pool.metrics(), initial);
+
+        // One model may serve different streams concurrently. Scratch checkouts
+        // must remain exclusive even when one forward is still in flight.
+        let mut concurrent_config = model.kv_pool_config(tokens.len())?;
+        concurrent_config.max_rows = 2;
+        concurrent_config.num_slots *= 2;
+        let concurrent_pool = NaiveKVPool::new(concurrent_config, &policy).await?;
+        let idle = concurrent_pool.metrics();
+        let other_policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
+        let mut left = KVContext::new(concurrent_pool.clone())?;
+        let mut right = KVContext::new(concurrent_pool.clone())?;
+        let mut left_input = [ModelInput {
+            token_ids: &tokens,
+            kv: &mut left,
+        }];
+        let mut right_input = [ModelInput {
+            token_ids: &tokens[..split],
+            kv: &mut right,
+        }];
+        let (a, b) = tokio::join!(
+            model.next_tokens(&mut left_input, policy.clone()),
+            model.next_tokens(&mut right_input, other_policy),
+        );
+        assert_eq!(*a[0].as_ref().unwrap(), first);
+        assert_eq!(*b[0].as_ref().unwrap(), prefix_next);
+        left.release();
+        right.release();
+        assert_eq!(concurrent_pool.metrics(), idle);
+
+        let turn_len = expected_ids.len().div_ceil(2);
+        let tokenizer = model.tokenizer().clone();
+        let mut decoder = tokenizer.decode_stream(true);
+        let mut streamed_text = String::new();
+        for &id in &expected_ids {
+            if let Some(delta) = decoder.step(id).unwrap() {
+                streamed_text.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed_text, reference["text"].as_str().unwrap());
+        let unicode = tokenizer.encode("Hello! 你好，世界🙂", false).unwrap();
+        for end in 0..=unicode.len() {
+            let ids = &unicode.get_ids()[..end];
+            let mut decoder = tokenizer.decode_stream(true);
+            let mut output = String::new();
+            for &id in ids {
+                if let Some(delta) = decoder.step(id).unwrap() {
+                    output.push_str(&delta);
+                }
+            }
+            let full = tokenizer.decode(ids, true).unwrap();
+            assert!(full.starts_with(&output));
+            assert!(!output.ends_with('�'));
+            if !full.ends_with('�') {
+                assert_eq!(output, full);
+            }
+        }
+        let mut continued = tokens.clone();
+        continued.extend_from_slice(&expected_ids[..turn_len]);
+        continued.extend_from_slice(tokenizer.encode("1", true).unwrap().get_ids());
+        let mut fresh = KVContext::new(pool.clone())?;
+        let expected_next = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: &continued,
+                    kv: &mut fresh,
+                }],
+                policy.clone(),
+            )
+            .await
+            .pop()
+            .unwrap()?;
+        fresh.release();
+        let expected_text = tokenizer.decode(&[expected_next], true).unwrap();
+        let expected_first = tokenizer.decode(&expected_ids[..turn_len], true).unwrap();
+        let prompt = reference["prompt"]
+            .as_str()
+            .context("reference prompt")?
+            .to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scheduler = crate::scheduler::Scheduler::new(cancel.child_token(), commands, reply_rx);
+        let owned_pool = pool.clone();
+        let runner = crate::runner::model_runner::RunnerBuilder::default()
+            .with_model_factory(move || async move { Ok(model) })
+            .with_pool_factory(move |_| async move { Ok(owned_pool) })
+            .with_policy_factory(move || Ok(policy))
+            .build(command_rx, replies)
+            .await?;
+        let task = tokio::spawn(runner.run(cancel.child_token()));
+        let result = async {
+            let mut full = crate::types::SessionRequest::new(None, prompt.clone());
+            full.sampling = Some(crate::types::SamplingConfig {
+                max_new_tokens: Some(expected_ids.len()),
+                ..Default::default()
+            });
+            assert_eq!(scheduler.execute(full).await?.output, streamed_text);
+            let id = scheduler.open_session().await?;
+            let mut first = crate::types::SessionRequest::new(Some(id), prompt);
+            first.sampling = Some(crate::types::SamplingConfig {
+                max_new_tokens: Some(turn_len),
+                ..Default::default()
+            });
+            assert_eq!(scheduler.execute(first).await?.output, expected_first);
+            let mut next = crate::types::SessionRequest::new(Some(id), "1".to_owned());
+            next.sampling = Some(crate::types::SamplingConfig {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            });
+            assert_eq!(scheduler.execute(next).await?.output, expected_text);
+            scheduler.close_session(id).await?;
+            Ok::<_, crate::error::EngineError>(())
+        }
+        .await;
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        task.await?;
+        result?;
         assert_eq!(pool.metrics(), initial);
         Ok(())
     }

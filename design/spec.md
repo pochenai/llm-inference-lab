@@ -5,7 +5,7 @@
 
 The request envelope and ownership below follow the Runner template and the
 minimal attention implementation. Rust snippets summarize interfaces; kernel
-bodies are omitted. Prefix caching, paged storage, and autoregressive sampling
+bodies are omitted. Prefix caching, paged storage, and non-greedy sampling
 remain future work.
 
 ## Visibility boundary
@@ -17,11 +17,11 @@ Trait methods inherit their trait's visibility and do not take a `pub` modifier.
 
 | Visibility | Contracts |
 | --- | --- |
-| `pub` | Scheduler construction, `execute`, `open_session`, `close_session`, `wait_stopped`; request construction/read-only ID; response fields |
+| `pub` | Scheduler construction, `execute`, `execute_stream`, `open_session`, `close_session`, `wait_stopped`; request construction/read-only ID; response fields |
 | `pub` | RunnerBuilder/factory configuration and `build`; ModelRunner `run`; RunnerCommand transport type |
-| `pub` | Model/KVPool/AttentionBackend extension traits and signature types; KVContext operations; configs, metrics, loader/export APIs |
+| `pub` | CausalModel/KVPool/AttentionBackend extension traits and signature types; KVContext operations; configs, metrics, loader/export APIs |
 | `pub` type, private fields | ModelRunner, KVContext, NaiveKVPool, NaiveContextState, NaiveReadView, NaiveWriteView; storage/progress ownership stays encapsulated |
-| `pub` type, `pub(crate)` fields | BatchReply channel payload |
+| `pub` | RunnerReply channel payload: text deltas and terminal statuses |
 | `pub(crate)` | SessionRequest internal ID assignment/access; unsafe read-buffer bridge for internal tensor kernels |
 | private | ModelRunner `new`, `open_session`, `close_session`, `execute_batch`, `execute_model_batch`, decoding; Scheduler dispatch/receive and PendingRequest; allocation state |
 | `pub(super)` in private kernel modules | Generated launch functions called only by their parent implementation |
@@ -30,7 +30,7 @@ Public batch payload types allow the external binary to connect Scheduler and
 Runner channels; their bookkeeping fields are not application inputs. Public
 factory defaults and extension signature types must stay reachable because they
 appear in public generic interfaces. The scalar `forward` and Runner `execute_session` convenience helpers are private
-and test-only; production execution uses Model::generate and Runner::execute_batch.
+and test-only; production execution uses CausalModel::next_tokens and Runner::execute_batch.
 
 ## Architecture
 
@@ -41,7 +41,7 @@ flowchart TB
     subgraph Worker["One local GPU resource group"]
         R["ModelRunner<br/>validate requests, select execution batches, session state"]
         H["Per-session async lock<br/>tokens, KVContext, sampling"]
-        M["Model.generate<br/>packed embedding, QKV, attention, MLP"]
+        M["CausalModel.next_tokens<br/>packed embedding, QKV, attention, MLP"]
         K["KVContext / KVPool<br/>progress, mapping, buffers, leases"]
         A["cuda-async<br/>policy selects stream, creates exec, signals completion"]
         G["GPU"]
@@ -55,7 +55,7 @@ flowchart TB
         G -.->|"complete"| A
         A -.->|"Future ready"| M
     end
-    R -->|"BatchReply by request_id; session acknowledgements"| S
+    R -->|"RunnerReply by request_id; session acknowledgements"| S
     S --> Caller
     D["Future KVManager directory"] -.->|"session owner, prefix locality, load"| S
 ```
@@ -75,7 +75,7 @@ sequenceDiagram
     participant D as Scheduler
     participant R as ModelRunner
     participant S as Session entry
-    participant M as Model
+    participant M as CausalModel
     participant K as KVContext / KVPool
     participant A as cuda-async / GPU
 
@@ -89,21 +89,24 @@ sequenceDiagram
         R-->>D: acknowledge creation
         D-->>C: SessionId
     end
-    C->>D: execute(SessionRequest)
+    C->>D: execute_stream(SessionRequest) or execute(SessionRequest)
     D->>R: Execute(candidate batch)
     Note over D,R: Scheduler batches contain unique Some(session_id); repeats stay queued for the next batch
     R->>R: encode prompt deltas
     R->>S: look up entries; acquire participating locks in input order
     Note over R,S: Release directory guards before await; unrelated sessions remain available
-    R->>M: validate_input(new token IDs, effective sampling), CPU only
+    R->>R: validate pure greedy sampling and generation budget
+    R->>M: validate_input(new token IDs), CPU only
     R->>R: record per-request errors; check full length against context capacity
     loop admitted execution batches
-        R->>K: can_append(total uncached tokens, new contexts)
+        R->>K: can_append(uncached input + generated KV budget, new contexts)
         R->>R: append CPU tokens only for admitted requests
     opt Stateless request
         R->>K: create temporary context
     end
-    R->>M: generate(batch of SessionRequest with ModelInput, policy)
+    Note over R,D: Zero-output requests finish before the first model step
+    loop unfinished requests, one greedy step
+    R->>M: next_tokens(mutable slice of ModelInput, policy)
     M->>M: trust admitted-input contract; pack suffixes and query ranges
     M->>A: submit one batch DeviceOp using Runner policy
     A->>M: execute operation with one exec
@@ -115,20 +118,27 @@ sequenceDiagram
     M->>A: one attention launch; per-query metadata selects history
     M->>A: packed residual and MLP; one result readback
     Note over M,A: Submitted, but ready_len has not advanced
-    A-->>M: submission result
+    A-->>M: completed submission result
     alt submission succeeded
         M->>K: commit every append
     else shared execution failed
-        M->>M: attach the error to each affected ModelOutput.result
+        M->>M: return an error for each affected next-token result
     end
-    M-->>R: one result per input, in input order
-    R->>S: restore successful histories; release session locks
-    opt Stateless request completes
-        R->>K: release temporary context
+    M-->>R: one next-token result per input, in input order
+    R->>R: append generated IDs; stop EOS, length-limited or failed items
+    R->>R: tokenizer.decode_stream.step(token), library owns buffering
+    R-->>D: RunnerReply::Delta(text), when available
+    D-->>C: Stream item (execute collects these items)
+    opt A request reaches EOS, its budget, or an error
+        R->>S: restore accepted state or roll back unchanged KV; unlock
+        opt Stateless request completes
+            R->>K: release temporary context
+        end
+        R-->>D: RunnerReply::Finished { request_id, result }
+        D-->>C: end that request's stream or emit error
     end
     end
-    R-->>D: BatchReply.results, per-request success or error
-    D-->>C: individual LLMResponse or error
+    end
     opt Session close
         C->>D: close_session(session_id)
         D->>R: flush earlier batch, then CloseSession(id)
@@ -162,8 +172,10 @@ impl<T> SessionRequest<T> {
     pub(crate) fn assigned_request_id(&self) -> RequestId;
 }
 pub type BatchIn<T = String> = Vec<SessionRequest<T>>;
-pub type BatchOut = Vec<(RequestId, Result<LLMResponse, EngineError>)>;
-pub struct BatchReply { pub(crate) results: BatchOut }
+pub enum RunnerReply {
+    Delta(LLMResponse),
+    Finished { request_id: RequestId, result: Result<(), EngineError> },
+}
 
 /// Public for channel wiring; applications call Scheduler instead of sending commands.
 pub enum RunnerCommand {
@@ -180,18 +192,18 @@ struct SessionState<P: KVPool> {
 
 pub struct ModelRunner<M, P: KVPool> {
     command_rx: UnboundedReceiver<RunnerCommand>,
-    batch_reply_tx: UnboundedSender<BatchReply>,
+    batch_reply_tx: UnboundedSender<RunnerReply>,
     model: M,
     pool: Arc<P>,
     policy: Arc<dyn SchedulingPolicy>,
     sessions: DashMap<SessionId, Arc<Mutex<Option<SessionState<P>>>>>,
 }
 
-impl<M: Model<P>, P: KVPool> ModelRunner<M, P> {
+impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
     /// 创建空 session；已存在则报错。
     fn open_session(&self, id: SessionId) -> Result<()>;
     /// 校验每个候选请求，按本地 KV 容量选择执行 batch，各自返回成功或错误。
-    async fn execute_batch(&self, batch: BatchIn) -> BatchReply;
+    async fn execute_batch(&self, batch: BatchIn, replies: &UnboundedSender<RunnerReply>);
     /// 等待当前 session 的活动调用，释放状态；旧 entry 的等待者不能复活它。
     async fn close_session(&self, id: SessionId) -> Result<()>;
     /// Process ordered commands; acknowledge session changes and return batch replies.
@@ -203,7 +215,10 @@ impl Scheduler {
     pub async fn open_session(&self) -> Result<SessionId, EngineError>;
     /// Flush preceding requests, then close on Runner and await acknowledgement.
     pub async fn close_session(&self, id: SessionId) -> Result<(), EngineError>;
-    /// 每次接收时分配新 request_id；Scheduler clones 共享原子计数器。
+    /// Admit a request and return text deltas; normal completion ends the stream.
+    pub fn execute_stream(&self, request: SessionRequest)
+        -> Result<impl Stream<Item = Result<LLMResponse, EngineError>> + Send + 'static, EngineError>;
+    /// Collect execute_stream into one response, using the same generation loop.
     pub async fn execute(&self, request: SessionRequest) -> Result<LLMResponse>;
 }
 ```
@@ -221,15 +236,14 @@ IDs without merging their meanings. `request_id` identifies one invocation/reply
 while `session_id` identifies history across invocations. The public constructor accepts no RequestId. Scheduler assigns a fresh ID to
 its owned envelope on every admission, using an atomic counter shared by its
 clones; re-admission always gets another ID. The private field is read-only to
-callers, while LLMResponse.request_id stays public. Runner/Model trust Scheduler-assigned IDs as an internal invariant; they do not
+callers, while LLMResponse.request_id stays public. Runner trusts Scheduler-assigned IDs as an internal invariant; it does not
 revalidate missing or duplicate request IDs. No separate request/session ID argument list
 is needed.
 
 `session_id=None` creates temporary state. `Some(id)` requires a previously opened
 session, appends the prompt delta, and inherits sampling settings unless overridden.
-This numerical demo rejects unsupported sampling options. Its scalar output is
-encoded for display and is not appended as input history; a future text generator
-must save actual generated IDs.
+Runner supports pure greedy sampling, output-token limits, and optional EOS overrides.
+Every generated token is appended to session history; its KV is computed by the next step.
 
 Scheduler guarantees at most one request per `Some(session_id)` in a batch.
 On a repeated session it flushes the current batch and carries that request into
@@ -242,7 +256,7 @@ group when the next request cannot fit, releases temporary contexts, and retries
 that request against current capacity. A request that still cannot fit receives
 its own capacity error. Persistent session KV continues to consume capacity.
 
-The first admission policy uses total uncached tokens and additional context rows.
+The first admission policy budgets uncached input plus generated KV tokens and additional context rows.
 Pool::can_append is a conservative CPU snapshot, not a reservation; actual pool
 allocation can still fail. Workspace-based sizing is a future policy refinement.
 
@@ -250,7 +264,7 @@ The directory lock lasts only for lookup/insertion/removal. A session's own lock
 covers its turn, including GPU completion. Runner awaits one batch at a time,
 so session locks follow input order without sorting. If execution later allows
 multiple concurrent batches on one Runner, establish a consistent lock order to
-prevent deadlocks. Scheduler channel batches preserve admission order; Model outputs
+prevent deadlocks. Scheduler channel batches preserve admission order; CausalModel outputs
 stay in input order without a reply-sort step.
 
 Runner holds the existing mutex guards, takes their states into local variables,
@@ -259,13 +273,13 @@ on success. On an ordinary error with unchanged KV, it truncates CPU tokens to
 the original length and restores the state. Changed/pending KV is released.
 Cancellation after taking ownership drops local states and leaves session entries
 invalid until closed; no custom turn guard or cancellation rollback is implemented.
-A successful turn is saved before display decoding or reply delivery. BatchReply
-has only per-request results. Validation, unknown-session, capacity, and decoding
+Successfully generated history stays saved if display decoding or reply delivery fails.
+Runner emits a per-request Finished only after state restoration/release and unlocking. Validation, unknown-session, capacity, and decoding
 errors affect their own request. Shared kernel/stream/submission failures are
 copied into each participating request's result; no batch-error field or outer
-Model::generate Result is added. Earlier completed execution groups stay saved.
+model-wide error result is added. Earlier completed execution groups stay saved.
 
-# Model batch state and APIs
+# CausalModel batch state and APIs
 
 ```rust
 pub struct ModelInput<'a, P: KVPool> {
@@ -273,10 +287,11 @@ pub struct ModelInput<'a, P: KVPool> {
     pub kv: &'a mut KVContext<P>,
 }
 
-pub trait Model<P: KVPool>: Send + Sync {
+pub trait CausalModel<P: KVPool>: Send + Sync {
+    /// Borrow the matching tokenizer; Runner controls encoding and decoding.
     fn tokenizer(&self) -> &Tokenizer;
-    /// CPU 校验新增 token 和生效的采样配置，Runner 在组执行 batch 前调用。
-    fn validate_input(&self, new_token_ids: &[u32], sampling: &SamplingConfig) -> Result<(), ModelError>;
+    /// Validate new IDs before admission; Runner validates sampling separately.
+    fn validate_input(&self, new_token_ids: &[u32]) -> Result<(), ModelError>;
     /// 默认拼接未缓存后缀，按模型提供的正数倍数补齐；ranges 不含 padding。
     fn pack_token_ids(batch: &[ModelInput<'_, P>], pad_multiple: usize)
         -> (Vec<i32>, Vec<Range<usize>>);
@@ -287,15 +302,11 @@ pub trait Model<P: KVPool>: Send + Sync {
         policy: &Arc<dyn SchedulingPolicy>,
         submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> Result<T, ModelError> + Send)
         -> impl Future<Output = Result<T, ModelError>> + Send;
-    /// 接收 Runner 已校验的输入；共享 GPU 错误也写入每条 ModelOutput.result。
-    fn generate(&self, batch: BatchIn<ModelInput<'_, P>>,
+    /// One ordered next-token result per validated input; no request/session IDs.
+    fn next_tokens(&self, batch: &mut [ModelInput<'_, P>],
         policy: Arc<dyn SchedulingPolicy>)
-        -> impl Future<Output = Vec<ModelOutput>> + Send;
-}
-
-pub struct ModelOutput {
-    pub request_id: RequestId,
-    pub result: Result<Vec<u32>, ModelError>,
+        -> impl Future<Output = Vec<Result<u32, ModelError>>> + Send;
+    fn is_eos(&self, token: u32) -> bool;
 }
 
 pub trait AttentionBackend<P: KVPool> {
@@ -307,14 +318,14 @@ pub trait AttentionBackend<P: KVPool> {
 }
 ```
 
-Model and AttentionBackend return ModelError; KVContext returns KVContextError;
+CausalModel and AttentionBackend return ModelError; KVContext returns KVContextError;
 KVPool returns KVPoolError. Context/model errors retain their typed lower-layer
 errors. Runner wraps them in EngineError::Model, EngineError::KVContext, or
 EngineError::KVPool for per-request responses, preserving typed error chains.
 
-The envelope's SessionId is routing metadata; Model does not look up session state.
+The envelope's SessionId is routing metadata; CausalModel does not look up session state.
 Runner lends the already selected contexts. Runner's policy is passed explicitly
-through Model to `.schedule(&policy)`; model weight export policy does not select
+through CausalModel to `.schedule(&policy)`; model weight export policy does not select
 inference streams.
 
 ```text
@@ -354,56 +365,60 @@ fn submit_batch(batch, exec: &ExecutionContext) -> Result<HostResults> {
 }
 
 let (packed_token_ids, query_ranges) = Self::pack_token_ids(batch, model_tile_multiple);
-// Model checks layout-specific tensor limits; upload stays in its GPU callback.
+// CausalModel checks layout-specific tensor limits; upload stays in its GPU callback.
 let values = Self::execute_append_batch(batch, &policy, |batch, exec| submit_batch(batch, exec)).await?;
 ```
 
-The current model evaluates one layer/head plus the MLP and returns a scalar per
-request. Runner guarantees a nonempty uncached suffix and idle context: it appends
+SimpleMLP retains its one-layer scalar core and maps its output to a numeric token.
+Qwen supplies real vocabulary logits and greedy argmax. Runner guarantees a nonempty uncached suffix and idle context: it appends
 a nonempty prompt delta to accepted history and never reuses a pending/failed context.
-Model does not rescan existing history for input validation. Numeric ID constraints
+CausalModel does not rescan existing history for input validation. Numeric ID constraints
 (including the toy tokenizer's UNK=256) are checked through validate_input on new
 tokens. Runner checks full-history length against max_seq_len per request.
 Cached logits or final-token replay are future work. A real multi-layer model repeats the shared
 projection/cache-write/attention/FFN stage per attention layer inside the same execution boundary.
 
-## Causal model stepping capability
+## Unified model and greedy lifecycle
 
-The scalar demo's Model API stays unchanged. CausalModel adds the token-ID stepping
-capability needed for a real decoder without forcing a vocabulary head into the toy
-MLP or placing a model-specific generation loop in every implementation.
+RunnerBuilder's model factory returns only the model. CausalModel owns and exposes
+its matching tokenizer through a borrowed accessor; Runner controls encoding and decoding. Runner owns
+request IDs, session history, sampling, and output-token budgets. It repeatedly calls
+CausalModel::next_tokens on unfinished inputs, appends each selected token, and removes
+EOS/length-limited/error items from later steps. Default max_new_tokens is 1.
+Runner uses tokenizer.decode_stream(true) directly. After each step it forwards
+Some(text) as Delta and continues on None. The tokenizer library owns buffering,
+UTF-8 assembly, and context-sensitive spacing. Runner does not maintain decoder
+internals, call decode again at completion, or synthesize replacement characters.
+If generation stops while a fragment is still buffered, only the already-emitted
+chunks form the response; this can differ from batch decoding of incomplete UTF-8.
+CPU token history is retained independently of displayed text.
+RunnerReply::Finished carries one request ID and Result<(), EngineError> after
+that request's state cleanup. Stopped requests, including zero-output requests,
+finish before any peer's next step; temporary KV and session locks are released
+at that boundary. Validation/admission errors finish immediately. execute_batch
+and execute_model_batch return unit: all text and terminal results travel through
+the supplied reply channel, with no full-response intermediate. Scheduler routes
+text unchanged and ends each stream or emits one terminal error; it does not track
+text lengths or decode tails. Partial text already delivered cannot be retracted on failure.
+Scheduler::execute collects this same stream into one final response. Streams are
+buffered, not GPU backpressure: dropping a consumer stops delivery but does not
+cancel generation. Scheduler/Runner shutdown still cancels outstanding work.
 
-```rust
-pub trait CausalModel<P: KVPool>: Send + Sync {
-    /// Framework-controlled reserve -> submit -> await -> commit for one context.
-    fn execute_step<T: Send>(input: ModelInput<'_, P>,
-        policy: &Arc<dyn SchedulingPolicy>,
-        submit: impl FnOnce(&mut ModelInput<'_, P>, &ExecutionContext)
-            -> Result<T, ModelError> + Send)
-        -> impl Future<Output = Result<T, ModelError>> + Send;
-    /// Compute the nonempty uncached suffix and return GPU greedy argmax.
-    /// The common submission helper waits for GPU success before committing KV.
-    fn next_token(&self, tokens: &[u32], kv: &mut KVContext<P>,
-        policy: Arc<dyn SchedulingPolicy>)
-        -> impl Future<Output = Result<u32, ModelError>> + Send;
-    fn is_eos(&self, token: u32) -> bool;
-    /// Lazy framework stream: step -> append CPU token -> yield, including EOS once.
-    fn generate_greedy(&self, tokens: &mut Vec<u32>, kv: &mut KVContext<P>,
-        max_new_tokens: usize, policy: Arc<dyn SchedulingPolicy>)
-        -> impl Stream<Item = Result<u32, ModelError>> + Send;
-}
-```
+Admission checks full input length plus max_new_tokens - 1 against sequence and pool
+capacity. Capacity boundaries and end-of-input share one execute_model_batch call
+site; the next prepared request is retried against capacity after the preceding
+group releases temporary KV. Pure greedy options are validated before history mutation. Cancellation
+can interrupt a running turn and releases its retained contexts.
 
-After one greedy step, KV covers the input history. The newly selected token is
+After a nonzero greedy generation, KV covers the last step's input history. The newly selected token is
 appended only to CPU history, so `tokens.len() == kv.ready_len() + 1` after generation.
 A continuation computes that suffix along with any subsequently appended input.
 The caller owns history/context and releases it; the model owns read-only weights.
-The stream advances only when polled and ends after EOS, the output limit, or one
-error. Consumers can incrementally decode items or collect them for a single response.
-Dropping between items allows continuation; dropping an in-flight step may leave
-KV pending, requiring release. No output-token Vec is allocated by the stream itself.
+Generation loops live only in Runner; models expose a single batch-step method.
+Single-input callers pass `&mut [ModelInput { token_ids, kv }]` without an input Vec.
+Dropping an in-flight step can leave KV pending, requiring release; GPU leases remain retained.
 
-Qwen2Engine uses this contract directly in the single-request example. It loads
+The Qwen example uses Scheduler -> Runner -> CausalModel; diagnostic logits remain a direct model call. It loads
 BF16 checkpoint values into FP32 storage, implements its GQA backend through the
 existing AttentionBackend trait, and uses NaiveKVPool with a flat per-token KV
 vector of `kv_heads * head_dim` elements (128 for two 64-dimensional heads).
@@ -412,9 +427,13 @@ Submission only enqueues the copies; the outer Future awaits successful completi
 commits KV, and then exposes host values. Cancellation retains in-flight resources;
 neither stack destinations nor explicit stream synchronization are used for readback.
 No common KV API changes are required. Its eager cuTile kernels provide the real
-model correctness baseline. Scheduler/Runner step dispatch, Qwen graph capture,
-and further operator abstractions are subsequent integration work rather than
-implicit capabilities of this first example.
+model correctness baseline. Qwen batch items currently execute serially through
+its one-context kernel; packed Qwen attention, continuous batching, and Qwen graph
+capture remain subsequent work. Its eager workspace is exclusive per forward and
+reuses disjoint scratch regions across all decoder layers on the same stream.
+Outputs fully overwrite their regions without zero-fill kernels. Scratch allocation
+checks its exact byte budget against available device/pool memory; completion and
+escaped-handle leases prevent early recycling, including on failure/cancellation.
 
 # KV Cache state and APIs
 
@@ -650,7 +669,7 @@ For the naive single-head layout, with `active_rows=rows-free_rows`,
 ## Future storage and lifecycle extensions
 
 A paged pool can replace ContextState and read/write views while keeping Runner history
-ownership and Model's semantic append lifecycle. Its compatible attention backend
+ownership and CausalModel's semantic append lifecycle. Its compatible attention backend
 uses block tables rather than per-token slots; shared partial tails may need COW.
 FlashAttention and paging are separate choices and require a compatible kernel /
 view pair. This does not imply arbitrary kernels can consume arbitrary layouts.

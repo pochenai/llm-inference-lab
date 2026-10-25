@@ -6,8 +6,8 @@ use cuda_async::{
 };
 use cutile::{api, tensor::Tensor};
 
-use super::super::ModelError;
 use super::engine::INPUT_DIM;
+use crate::ModelError;
 
 // Bound retained memory across shape changes; in-flight checkouts are independent.
 const MAX_IDLE_WORKSPACES: usize = 4;

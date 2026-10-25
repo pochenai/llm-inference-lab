@@ -23,11 +23,12 @@ use cutile::cuda_core::Device;
 use engine::{
     runner::{
         kv_pool::{KVPool, NaiveKVPool, NaiveKVPoolConfig},
-        model::{Model, ModelError, ModelInput, ModelOutput, SimpleMLPEngine},
+        model::SimpleMLPEngine,
         model_runner::RunnerBuilder,
     },
     scheduler::Scheduler,
-    types::{BatchIn, SamplingConfig, SessionRequest},
+    types::SessionRequest,
+    CausalModel, ModelError, ModelInput,
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -64,23 +65,23 @@ struct TimedModel {
     samples: Arc<Mutex<Vec<(usize, f64)>>>,
 }
 
-impl Model<NaiveKVPool> for TimedModel {
+impl CausalModel<NaiveKVPool> for TimedModel {
     fn tokenizer(&self) -> &tokenizers::Tokenizer {
         self.inner.tokenizer()
     }
 
-    fn validate_input(&self, ids: &[u32], sampling: &SamplingConfig) -> Result<(), ModelError> {
-        self.inner.validate_input(ids, sampling)
+    fn validate_input(&self, ids: &[u32]) -> Result<(), ModelError> {
+        self.inner.validate_input(ids)
     }
 
-    async fn generate(
+    async fn next_tokens(
         &self,
-        batch: BatchIn<ModelInput<'_, NaiveKVPool>>,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> Vec<ModelOutput> {
+    ) -> Vec<Result<u32, ModelError>> {
         let size = batch.len();
         let start = Instant::now();
-        let output = self.inner.generate(batch, policy).await;
+        let output = self.inner.next_tokens(batch, policy).await;
         self.samples
             .lock()
             .unwrap()
@@ -153,15 +154,14 @@ async fn main() -> Result<()> {
     let scheduler = Scheduler::new(cancel.child_token(), command_tx, reply_rx);
     let runner = RunnerBuilder::default()
         .with_model_factory(move || async move {
+            let model = SimpleMLPEngine::random(0).await?;
+            let model = if cuda_graph {
+                model.with_cuda_graphs()
+            } else {
+                model
+            };
             Ok(TimedModel {
-                inner: {
-                    let model = SimpleMLPEngine::random(0).await?;
-                    if cuda_graph {
-                        model.with_cuda_graphs()
-                    } else {
-                        model
-                    }
-                },
+                inner: model,
                 samples: timings,
             })
         })

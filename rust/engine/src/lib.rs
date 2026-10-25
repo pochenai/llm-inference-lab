@@ -3,3 +3,5 @@ mod profiling;
 pub mod runner;
 pub mod scheduler;
 pub mod types;
+
+pub use runner::model::{AttentionBackend, CausalModel, ModelError, ModelInput};

@@ -6,6 +6,7 @@ pub type RequestId = u64;
 #[derive(Debug)]
 pub struct LLMResponse {
     pub request_id: RequestId,
+    /// A text delta from execute_stream, or the complete text from execute.
     pub output: String,
 }
 
@@ -50,7 +51,6 @@ impl<T> SessionRequest<T> {
 }
 
 pub type BatchIn<T = String> = Vec<SessionRequest<T>>;
-pub type BatchOut = Vec<(RequestId, Result<LLMResponse, EngineError>)>;
 
 /// Ordered transport between Scheduler and Runner; applications use Scheduler APIs.
 #[derive(Debug)]
@@ -66,6 +66,11 @@ pub enum RunnerCommand {
     },
 }
 
-pub struct BatchReply {
-    pub(crate) results: BatchOut,
+/// Incremental text and terminal results use the same ordered Runner transport.
+pub enum RunnerReply {
+    Delta(LLMResponse),
+    Finished {
+        request_id: RequestId,
+        result: Result<(), EngineError>,
+    },
 }

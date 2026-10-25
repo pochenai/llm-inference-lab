@@ -25,18 +25,15 @@ use cutile::{
     tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
 };
 
-use super::super::{AttentionBackend, Model, ModelError, ModelInput, ModelOutput};
 use super::{
     graph::{self, GraphInstance, GraphKey, GraphPool},
     kernels,
     workspace::{Buffers, WorkspacePool},
 };
 use crate::runner::kv_pool::{KVContext, NaiveKVPool, NaiveMappingPlan, NaiveReadView};
+use crate::runner::loader::{GenerationConfig, WeightLoader};
 use crate::runner::upload::UploadPool;
-use crate::{
-    runner::loader::{GenerationConfig, WeightLoader},
-    types::{BatchIn, SamplingConfig},
-};
+use crate::{AttentionBackend, CausalModel, ModelError, ModelInput};
 
 pub const INPUT_DIM: usize = 16;
 const TILE: usize = 4;
@@ -230,16 +227,13 @@ impl SimpleMLPEngine {
     pub async fn random(device_id: usize) -> Result<Self, ModelError> {
         // A tiny demo vocabulary: numeric words map to their integer IDs.
         // A real LLM would load its matching tokenizer.json here.
-        let mut vocab: HashMap<String, u32> = (0..256).map(|id| (id.to_string(), id)).collect();
-        // [UNK] means "unknown": WordLevel uses this entry for words outside
-        // the vocabulary. Its spelling and ID are configured here, not built in.
-        vocab.insert("[UNK]".into(), 256);
-        // Demo output tokens spell the numeric result; Fuse joins them into text.
-        for (offset, symbol) in ["-", ".", "e", "+"].into_iter().enumerate() {
-            vocab.insert(symbol.into(), 257 + offset as u32);
-        }
         let word_level = WordLevel::builder()
-            .vocab(vocab)
+            .vocab(
+                (0..256)
+                    .map(|id| (id.to_string(), id))
+                    .chain(std::iter::once(("[UNK]".into(), 256)))
+                    .collect(),
+            )
             .unk_token("[UNK]".into()) // Select the fallback entry defined above.
             .build()
             .map_err(|error| ModelError::Execution(error.to_string()))?;
@@ -351,7 +345,7 @@ impl SimpleMLPEngine {
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Result<f32, ModelError> {
         Ok(self
-            .forward_batch(vec![ModelInput { token_ids, kv }], policy)
+            .forward_batch(&mut [ModelInput { token_ids, kv }], policy)
             .await?[0])
     }
 
@@ -378,7 +372,7 @@ impl SimpleMLPEngine {
     /// change. Request leases survive GPU completion but are never cached in graphs.
     async fn forward_batch(
         &self,
-        mut batch: Vec<ModelInput<'_, NaiveKVPool>>,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Result<Vec<f32>, ModelError> {
         if batch.is_empty() {
@@ -390,14 +384,14 @@ impl SimpleMLPEngine {
         // With TILE=4: packed_token_ids=[12,13,21,0(PAD)], query_ranges=[0..2, 2..3].
         // Per-request rows in packed token/Q tensors and projected K/V, excluding padding;
         // these are not history positions or physical KV slot indices.
-        let (packed_token_ids, query_ranges) = Self::pack_token_ids(&batch, TILE);
+        let (packed_token_ids, query_ranges) = Self::pack_token_ids(batch, TILE);
         let rows = packed_token_ids.len();
         if rows > i32::MAX as usize / INPUT_DIM {
             return Err(ModelError::InvalidInput("packed batch is too large".into()));
         }
         let values = if let Some(graphs) = &self.graphs {
             self.forward_graph_batch(
-                &mut batch,
+                batch,
                 &policy,
                 Arc::new(packed_token_ids),
                 &query_ranges,
@@ -406,7 +400,7 @@ impl SimpleMLPEngine {
             )
             .await?
         } else {
-            Self::execute_packed_append_batch(&mut batch, &policy, |batch, mapping, exec| {
+            Self::execute_packed_append_batch(batch, &policy, |batch, mapping, exec| {
                 // SAFETY: the awaited submission retains all buffers and state leases.
                 unsafe {
                     self.submit_batch(
@@ -428,7 +422,7 @@ impl SimpleMLPEngine {
     }
 
     /// Naive-specific path: reserve first, then let submit pack the deferred mapping
-    /// with model inputs. Generic Model::execute_append_batch still prepares mappings
+    /// with model inputs. Generic CausalModel::execute_append_batch still prepares mappings
     /// immediately and has no mapping-plan type in its interface.
     async fn execute_packed_append_batch<T: Send>(
         batch: &mut [ModelInput<'_, NaiveKVPool>],
@@ -731,77 +725,84 @@ impl SimpleMLPEngine {
     }
 }
 
-impl Model<NaiveKVPool> for SimpleMLPEngine {
+impl CausalModel<NaiveKVPool> for SimpleMLPEngine {
     fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
 
-    fn validate_input(
-        &self,
-        token_ids: &[u32],
-        sampling: &SamplingConfig,
-    ) -> Result<(), ModelError> {
+    fn validate_input(&self, token_ids: &[u32]) -> Result<(), ModelError> {
         if token_ids.iter().any(|&id| id >= 256) {
             return Err(ModelError::InvalidInput(
                 "expected numeric input tokens in 0..256".into(),
             ));
         }
-        if sampling.do_sample == Some(true)
-            || sampling.temperature.is_some()
-            || sampling.top_k.is_some()
-            || sampling.top_p.is_some()
-            || sampling.max_new_tokens.is_some()
-            || sampling.eos_token_id.is_some()
-        {
-            return Err(ModelError::InvalidInput(
-                "the scalar demo does not implement sampling or generation limits".into(),
-            ));
-        }
         Ok(())
     }
 
-    async fn generate(
+    async fn next_tokens(
         &self,
-        batch: BatchIn<ModelInput<'_, NaiveKVPool>>,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> Vec<ModelOutput> {
-        let mut request_ids = Vec::with_capacity(batch.len());
-        let mut inputs = Vec::with_capacity(batch.len());
-        for item in batch {
-            request_ids.push(item.assigned_request_id());
-            inputs.push(item.input);
-        }
-        let scalars = match self.forward_batch(inputs, policy).await {
-            Ok(scalars) => scalars,
-            Err(error) => {
-                return request_ids
-                    .into_iter()
-                    .map(|request_id| ModelOutput {
-                        request_id,
-                        result: Err(error.clone()),
-                    })
-                    .collect()
-            }
-        };
-        request_ids
-            .into_iter()
-            .zip(scalars)
-            .map(|(request_id, scalar)| {
-                let result = scalar
-                    .to_string()
-                    .chars()
-                    .map(|character| {
-                        self.tokenizer
-                            .token_to_id(&character.to_string())
-                            .ok_or_else(|| {
-                                ModelError::Execution(format!("no output token for {character:?}"))
-                            })
-                    })
-                    .collect();
-                ModelOutput { request_id, result }
+    ) -> Vec<Result<u32, ModelError>> {
+        let mut outputs: Vec<_> = batch
+            .iter()
+            .map(|input| {
+                let kv = &input.kv;
+                if kv.is_pending()
+                    || input.token_ids.len() <= kv.ready_len()
+                    || input.token_ids.len() > kv.max_seq_len()
+                {
+                    return Err(ModelError::InvalidInput(
+                        "expected an idle context with a nonempty suffix within capacity".into(),
+                    ));
+                }
+                self.validate_input(&input.token_ids[kv.ready_len()..])
+                    .map(|()| 0)
             })
-            .collect()
+            .collect();
+        let values = if outputs.iter().any(Result::is_err) {
+            // Validation results already identify the original output slots in order.
+            let mut filtered: Vec<_> = batch
+                .iter_mut()
+                .zip(&outputs)
+                .filter_map(|(input, result)| {
+                    result.is_ok().then(|| ModelInput {
+                        token_ids: input.token_ids,
+                        kv: &mut *input.kv,
+                    })
+                })
+                .collect();
+            self.forward_batch(&mut filtered, policy).await
+        } else {
+            self.forward_batch(batch, policy).await
+        };
+        match values {
+            Ok(values) => {
+                for (output, value) in outputs
+                    .iter_mut()
+                    .filter(|result| result.is_ok())
+                    .zip(values)
+                {
+                    *output = scalar_token(value);
+                }
+            }
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|result| result.is_ok()) {
+                    *output = Err(error.clone());
+                }
+            }
+        }
+        outputs
     }
+}
+
+fn scalar_token(scalar: f32) -> Result<u32, ModelError> {
+    if !scalar.is_finite() {
+        return Err(ModelError::Execution("non-finite demo output".into()));
+    }
+    // shortcut: quantize the scalar demo to a numeric token; add a vocabulary
+    // head only if toy generation quality becomes part of the experiment.
+    Ok(scalar.round().clamp(0.0, 255.0) as u32)
 }
 
 struct NaiveAttention;
@@ -921,6 +922,91 @@ mod tests {
     use crate::runner::kv_pool::{KVPool, NaiveKVPoolConfig};
 
     #[tokio::test]
+    async fn next_tokens_validates_each_input_without_failing_valid_peers() -> Result<(), ModelError>
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountedPolicy {
+            inner: Arc<dyn SchedulingPolicy>,
+            submissions: AtomicUsize,
+        }
+        impl SchedulingPolicy for CountedPolicy {
+            fn next_stream(
+                &self,
+            ) -> Result<Arc<cutile::cuda_core::Stream>, cuda_async::error::DeviceError>
+            {
+                self.submissions.fetch_add(1, Ordering::Relaxed);
+                self.inner.next_stream()
+            }
+        }
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let model = SimpleMLPEngine::random(0).await?;
+        let policy = model.weight_policy.clone();
+        let pool = pool(&policy).await?;
+        let initial = pool.metrics();
+        let policy = Arc::new(CountedPolicy {
+            inner: policy,
+            submissions: AtomicUsize::new(0),
+        });
+        let mut empty = KVContext::new(pool.clone())?;
+        let mut invalid = KVContext::new(pool.clone())?;
+        let mut first = KVContext::new(pool.clone())?;
+        let mut second = KVContext::new(pool.clone())?;
+        let rejected = model
+            .next_tokens(
+                &mut [
+                    ModelInput {
+                        token_ids: &[],
+                        kv: &mut empty,
+                    },
+                    ModelInput {
+                        token_ids: &[256],
+                        kv: &mut invalid,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        assert!(rejected.iter().all(Result::is_err));
+        assert_eq!(policy.submissions.load(Ordering::Relaxed), 0);
+        let results = model
+            .next_tokens(
+                &mut [
+                    ModelInput {
+                        token_ids: &[],
+                        kv: &mut empty,
+                    },
+                    ModelInput {
+                        token_ids: &[1, 2],
+                        kv: &mut first,
+                    },
+                    ModelInput {
+                        token_ids: &[256],
+                        kv: &mut invalid,
+                    },
+                    ModelInput {
+                        token_ids: &[3, 4, 5],
+                        kv: &mut second,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        assert!(matches!(results[0], Err(ModelError::InvalidInput(_))));
+        assert!(matches!(results[2], Err(ModelError::InvalidInput(_))));
+        assert!(results[1].as_ref().is_ok_and(|&id| id < 256));
+        assert!(results[3].as_ref().is_ok_and(|&id| id < 256));
+        assert_eq!(policy.submissions.load(Ordering::Relaxed), 1);
+        assert!(!empty.is_pending() && !invalid.is_pending());
+        assert_eq!(empty.ready_len(), 0);
+        assert_eq!(invalid.ready_len(), 0);
+        assert_eq!(first.ready_len(), 2);
+        assert_eq!(second.ready_len(), 3);
+        drop((empty, invalid, first, second));
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_replays_new_inputs_without_retaining_stateless_kv() -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let model = SimpleMLPEngine::random(0).await?.with_cuda_graphs();
@@ -986,14 +1072,14 @@ mod tests {
             }
             let output = model
                 .forward_batch(
-                    contexts
+                    &mut contexts
                         .iter_mut()
                         .zip(&histories)
                         .map(|(kv, tokens)| ModelInput {
                             kv,
                             token_ids: tokens,
                         })
-                        .collect(),
+                        .collect::<Vec<_>>(),
                     policy.clone(),
                 )
                 .await?;
@@ -1045,14 +1131,14 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let output = model
                 .forward_batch(
-                    contexts
+                    &mut contexts
                         .iter_mut()
                         .zip(&histories)
                         .map(|(kv, tokens)| ModelInput {
                             kv,
                             token_ids: tokens,
                         })
-                        .collect(),
+                        .collect::<Vec<_>>(),
                     policy.clone(),
                 )
                 .await?;
@@ -1090,7 +1176,7 @@ mod tests {
             [vec![1, 2, 3], vec![7, 8, 9]],
             [vec![1, 2, 3, 4], vec![7, 8, 9, 10]],
         ] {
-            let inputs = contexts
+            let mut inputs: Vec<_> = contexts
                 .iter_mut()
                 .zip(&histories)
                 .map(|(kv, tokens)| ModelInput {
@@ -1098,7 +1184,7 @@ mod tests {
                     token_ids: tokens,
                 })
                 .collect();
-            let outputs = model.forward_batch(inputs, policy.clone()).await?;
+            let outputs = model.forward_batch(&mut inputs, policy.clone()).await?;
             for (index, tokens) in histories.iter().enumerate() {
                 close(
                     outputs[index],
@@ -1351,12 +1437,12 @@ mod tests {
             .await?;
         let histories: [&[u32]; 3] = [&[1, 2, 3, 4, 5], &[7, 8], &[9, 10]];
         // Suffixes have lengths 2, 1, 2: five real packed rows and three padding rows.
-        let inputs = contexts
+        let mut inputs: Vec<_> = contexts
             .iter_mut()
             .zip(histories)
             .map(|(kv, token_ids)| ModelInput { token_ids, kv })
             .collect();
-        let outputs = model.forward_batch(inputs, policy.clone()).await?;
+        let outputs = model.forward_batch(&mut inputs, policy.clone()).await?;
         let mut used_slots = std::collections::HashSet::new();
         let mut cache = None;
         for (index, (kv, tokens)) in contexts.iter().zip(histories).enumerate() {
@@ -1460,7 +1546,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_submission_failure_is_reported_on_every_output() -> Result<(), ModelError> {
-        use crate::types::SessionRequest;
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let mut model = SimpleMLPEngine::random(0).await?;
         let policy = model.weight_policy.clone();
@@ -1470,51 +1555,45 @@ mod tests {
         // Fail a launch shape check after all contexts reserved KV and mapping work
         // was submitted, without poisoning the device with an illegal access.
         model.layers[3] = original.reshape(&[8, 32])?;
-        let mut a = KVContext::new(pool.clone())?;
-        let mut b = KVContext::new(pool.clone())?;
-        let outputs = model
-            .generate(
-                vec![
-                    SessionRequest::new(
-                        None,
-                        ModelInput {
-                            token_ids: &[1, 2],
-                            kv: &mut a,
-                        },
-                    )
-                    .with_request_id(90),
-                    SessionRequest::new(
-                        None,
-                        ModelInput {
-                            token_ids: &[8],
-                            kv: &mut b,
-                        },
-                    )
-                    .with_request_id(91),
-                ],
-                policy.clone(),
-            )
-            .await;
-        assert_eq!(
-            outputs
-                .iter()
-                .map(|output| output.request_id)
-                .collect::<Vec<_>>(),
-            vec![90, 91]
-        );
-        assert!(outputs
-            .iter()
-            .all(|output| matches!(output.result, Err(ModelError::Execution(_)))));
-        assert_eq!(
-            outputs[0].result.as_ref().unwrap_err().to_string(),
-            outputs[1].result.as_ref().unwrap_err().to_string()
-        );
-        assert!(a.is_pending() && b.is_pending());
-        assert_eq!(a.ready_len(), 0);
-        assert_eq!(b.ready_len(), 0);
-        a.release();
-        b.release();
-        assert_eq!(pool.metrics(), initial);
+        for include_invalid in [false, true] {
+            let mut a = KVContext::new(pool.clone())?;
+            let mut b = KVContext::new(pool.clone())?;
+            let mut invalid = KVContext::new(pool.clone())?;
+            let mut batch = vec![ModelInput {
+                token_ids: &[1, 2],
+                kv: &mut a,
+            }];
+            if include_invalid {
+                batch.push(ModelInput {
+                    token_ids: &[256],
+                    kv: &mut invalid,
+                });
+            }
+            batch.push(ModelInput {
+                token_ids: &[8],
+                kv: &mut b,
+            });
+            let outputs = model.next_tokens(&mut batch, policy.clone()).await;
+            drop(batch);
+            assert_eq!(outputs.len(), if include_invalid { 3 } else { 2 });
+            for (index, output) in outputs.iter().enumerate() {
+                if include_invalid && index == 1 {
+                    assert!(matches!(output, Err(ModelError::InvalidInput(_))));
+                } else {
+                    assert!(matches!(output, Err(ModelError::Execution(_))));
+                }
+            }
+            assert_eq!(
+                outputs[0].as_ref().unwrap_err().to_string(),
+                outputs.last().unwrap().as_ref().unwrap_err().to_string()
+            );
+            assert!(a.is_pending() && b.is_pending());
+            assert!(!invalid.is_pending());
+            assert_eq!(a.ready_len(), 0);
+            assert_eq!(b.ready_len(), 0);
+            drop((a, b, invalid));
+            assert_eq!(pool.metrics(), initial);
+        }
         model.layers[3] = original;
         let mut context = KVContext::new(pool.clone())?;
         assert!(model
@@ -1528,7 +1607,6 @@ mod tests {
 
     #[tokio::test]
     async fn packed_ragged_batch_matches_independent_cpu_histories() -> Result<(), ModelError> {
-        use crate::types::SessionRequest;
         let _guard = crate::runner::GPU_TEST_LOCK.lock().await;
         let model = SimpleMLPEngine::random(0).await?;
         let policy = model.weight_policy.clone();
@@ -1550,28 +1628,17 @@ mod tests {
             .forward(&[8], &mut contexts[1], policy.clone())
             .await?;
         let histories: [&[u32]; 3] = [&[1, 2, 4, 5, 9], &[8, 7], &[6, 3, 2, 10]];
-        let batch = contexts
+        let mut batch: Vec<_> = contexts
             .iter_mut()
             .zip(histories)
-            .enumerate()
-            .map(|(i, (kv, token_ids))| {
-                SessionRequest::new(Some(100 + i as u64), ModelInput { token_ids, kv })
-                    .with_request_id(20 + i as u64)
-            })
+            .map(|(kv, token_ids)| ModelInput { token_ids, kv })
             .collect();
-        let outputs = model.generate(batch, policy).await;
-        for (i, output) in outputs.iter().enumerate() {
-            assert_eq!(output.request_id, 20 + i as u64);
-            let actual = model
-                .tokenizer()
-                .decode(output.result.as_ref().unwrap(), true)
-                .unwrap()
-                .parse::<f32>()
-                .unwrap();
-            close(
-                actual,
-                cpu_reference(histories[i], &weights, model.config.input_divisor),
-            );
+        let outputs = model.next_tokens(&mut batch, policy).await;
+        for (i, output) in outputs.into_iter().enumerate() {
+            let expected = cpu_reference(histories[i], &weights, model.config.input_divisor)
+                .round()
+                .clamp(0.0, 255.0) as u32;
+            assert_eq!(output?, expected);
             assert_eq!(contexts[i].ready_len(), histories[i].len());
         }
         drop(contexts);
@@ -1609,7 +1676,7 @@ mod tests {
                 .await?,
         );
         reference.release();
-        assert!(model.generate(vec![], policy).await.is_empty());
+        assert!(model.next_tokens(&mut [], policy).await.is_empty());
         a.release();
         b.release();
         assert_eq!(pool.metrics(), initial);

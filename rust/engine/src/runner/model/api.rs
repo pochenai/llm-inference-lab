@@ -2,13 +2,9 @@ use std::{future::Future, ops::Range, sync::Arc};
 
 use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::tensor::Tensor;
-use futures::{stream, Stream};
 use tokenizers::Tokenizer;
 
-use crate::{
-    runner::kv_pool::{KVContext, KVPool},
-    types::{BatchIn, RequestId, SamplingConfig},
-};
+use crate::runner::kv_pool::{KVContext, KVPool};
 
 use super::ModelError;
 
@@ -18,21 +14,12 @@ pub struct ModelInput<'a, P: KVPool> {
     pub kv: &'a mut KVContext<P>,
 }
 
-#[derive(Debug)]
-pub struct ModelOutput {
-    pub request_id: RequestId,
-    pub result: Result<Vec<u32>, ModelError>,
-}
-
-pub trait Model<P: KVPool>: Send + Sync {
+pub trait CausalModel<P: KVPool>: Send + Sync {
+    /// Borrow the matching tokenizer; Runner controls encoding and decoding.
     fn tokenizer(&self) -> &Tokenizer;
 
-    /// CPU validation of newly encoded tokens and effective sampling, before admission.
-    fn validate_input(
-        &self,
-        _token_ids: &[u32],
-        _sampling: &SamplingConfig,
-    ) -> Result<(), ModelError> {
+    /// CPU validation of newly encoded tokens, before Runner admission.
+    fn validate_input(&self, _token_ids: &[u32]) -> Result<(), ModelError> {
         Ok(())
     }
 
@@ -63,99 +50,40 @@ pub trait Model<P: KVPool>: Send + Sync {
         policy: &Arc<dyn SchedulingPolicy>,
         submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> Result<T, ModelError> + Send,
     ) -> impl Future<Output = Result<T, ModelError>> + Send {
-        execute_append(batch, policy, submit)
-    }
-
-    /// Runner guarantees nonempty uncached suffixes and idle contexts within capacity.
-    /// Return exactly one ordered result per input, including shared GPU failures.
-    fn generate(
-        &self,
-        batch: BatchIn<ModelInput<'_, P>>,
-        policy: Arc<dyn SchedulingPolicy>,
-    ) -> impl Future<Output = Vec<ModelOutput>> + Send;
-}
-
-/// Shared append submission boundary for batch and causal model implementations.
-pub(super) async fn execute_append<P: KVPool, T: Send>(
-    batch: &mut [ModelInput<'_, P>],
-    policy: &Arc<dyn SchedulingPolicy>,
-    submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> Result<T, ModelError> + Send,
-) -> Result<T, ModelError> {
-    let output = with_context(|exec| {
-        value((|| {
-            let mut appends: Vec<_> = batch
-                .iter_mut()
-                .map(|input| {
-                    let count = input.token_ids.len() - input.kv.ready_len();
-                    (&mut *input.kv, count)
-                })
-                .collect();
-            KVContext::prepare_append_batch(&mut appends, exec)?;
-            submit(batch, exec)
-        })())
-    })
-    .schedule(policy)?
-    .await??;
-    for input in batch {
-        input.kv.commit_append()?;
-    }
-    Ok(output)
-}
-
-/// Token-ID stepping capability. The framework owns the greedy loop and stopping rules;
-/// scalar demonstration models do not need to implement this contract.
-pub trait CausalModel<P: KVPool>: Send + Sync {
-    /// Safe submission entry for causal backends, including implementations outside
-    /// engine. Reserve the suffix, run all required KV writes, await, then commit.
-    fn execute_step<T: Send>(
-        input: ModelInput<'_, P>,
-        policy: &Arc<dyn SchedulingPolicy>,
-        submit: impl FnOnce(&mut ModelInput<'_, P>, &ExecutionContext) -> Result<T, ModelError> + Send,
-    ) -> impl Future<Output = Result<T, ModelError>> + Send {
         async move {
-            let mut batch = [input];
-            execute_append(&mut batch, policy, |inputs, exec| {
-                submit(&mut inputs[0], exec)
+            let output = with_context(|exec| {
+                value((|| {
+                    let mut appends: Vec<_> = batch
+                        .iter_mut()
+                        .map(|input| {
+                            let count = input.token_ids.len() - input.kv.ready_len();
+                            (&mut *input.kv, count)
+                        })
+                        .collect();
+                    KVContext::prepare_append_batch(&mut appends, exec)?;
+                    submit(batch, exec)
+                })())
             })
-            .await
+            .schedule(policy)?
+            .await??;
+            for input in batch {
+                input.kv.commit_append()?;
+            }
+            Ok(output)
         }
     }
 
-    /// Compute the uncached suffix, commit KV after GPU completion, and return greedy argmax.
-    /// History must match this context, with a nonempty appended suffix.
-    fn next_token(
+    /// Compute one next token per input in order, including per-input validation/GPU errors.
+    /// Reject pending contexts, empty suffixes, invalid IDs, and exceeded capacity.
+    /// Success commits KV for the full input history before returning its next token.
+    fn next_tokens(
         &self,
-        token_ids: &[u32],
-        kv: &mut KVContext<P>,
+        batch: &mut [ModelInput<'_, P>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> impl Future<Output = Result<u32, ModelError>> + Send;
+    ) -> impl Future<Output = Vec<Result<u32, ModelError>>> + Send;
 
-    fn is_eos(&self, token: u32) -> bool;
-
-    /// Lazily generate one owned token ID per poll-driven step, appending it to history
-    /// before yielding. EOS is yielded once; EOS, the length limit, or an error ends
-    /// the stream. No output Vec is allocated. The last yielded token has no KV yet.
-    /// Dropping between items preserves resumable history/KV; dropping an in-flight
-    /// step may leave a pending append, which must be released rather than reused.
-    fn generate_greedy(
-        &self,
-        token_ids: &mut Vec<u32>,
-        kv: &mut KVContext<P>,
-        max_new_tokens: usize,
-        policy: Arc<dyn SchedulingPolicy>,
-    ) -> impl Stream<Item = Result<u32, ModelError>> + Send {
-        stream::try_unfold(
-            (token_ids, kv, max_new_tokens, policy),
-            move |(token_ids, kv, remaining, policy)| async move {
-                if remaining == 0 {
-                    return Ok(None);
-                }
-                let next = self.next_token(token_ids, kv, policy.clone()).await?;
-                token_ids.push(next);
-                let remaining = if self.is_eos(next) { 0 } else { remaining - 1 };
-                Ok(Some((next, (token_ids, kv, remaining, policy))))
-            },
-        )
+    fn is_eos(&self, _token: u32) -> bool {
+        false
     }
 }
 
