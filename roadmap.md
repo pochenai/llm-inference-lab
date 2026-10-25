@@ -1,13 +1,35 @@
 # LLM Inference 学习路线图
 
-更新日期：2026-10-19。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
+更新日期：2026-10-25。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
 
-# next weekroad map
-补最小 step 接口和 greedy 生成循环。
-提前跑通 Qwen2.5-0.5B-Instruct 的单请求浮点生成，用参考实现验证 logits 和 tokens。
-测短/长 prefill、单请求 decode、普通 batch decode，找到真实瓶颈。
-再选择量化/算子优化，或者最小 continuous batching。
-Chunked prefill、radix、复杂调度策略由对应负载触发。
+## Current checkpoint and next work
+
+Qwen2.5-0.5B-Instruct now runs through Scheduler -> Runner -> CausalModel,
+with greedy token steps, streaming text, session continuation and independent
+request completion. FP32 reference logits/tokens and full/chunked KV checks are
+in place. Qwen reuses scratch across decoder layers; Scheduler observers and
+model/pool `metrics` instruments cover request timing, execution and memory.
+The standalone Qwen benchmark separates model execution from request latency.
+No exporter is installed.
+
+1. Profile warmed short/long prefill and decode with the existing benchmark and
+   Nsight. Attribute time to host submission, linear kernels, attention and
+   readback; keep JIT/warmup and fresh KV explicit. Existing 32-token/4K samples
+   are diagnostic baselines, not a statistically robust throughput study.
+2. Optimize the dominant measured path. Attention currently scans cached tokens
+   one at a time; investigate tiled attention if it dominates long prefill.
+   Evaluate linear-kernel/dtype changes against the FP32 reference. Port CUDA
+   Graph to Qwen if host launch overhead is material; replay currently supports
+   SimpleMLP only.
+3. Add packed Qwen batches: `next_tokens` accepts a batch but currently awaits
+   each request separately. Start with uniform decode, then ragged prefill;
+   compare outputs, memory and batch throughput.
+4. Build minimal continuous batching on that executor. Add chunked-prefill
+   scheduling when mixed long/short arrivals demonstrate decode interference.
+   Radix prefix caching and quantization remain subsequent experiments.
+
+Units are numbered by the current implementation sequence: W5 covers the completed
+Qwen baseline, followed by performance work, scheduling, prefix reuse and quantization.
 
 ## 1. 目标、投入与学习边界
 
@@ -54,8 +76,9 @@ flowchart TD
     N -.-> J
 ```
 
-The first eight units follow the implementation sequence below. Unit labels do
-not force one calendar week per topic or retroactively rename historical commits.
+The first eight units follow the current implementation sequence. Unit labels
+represent learning units rather than calendar weeks; historical commits retain
+their original labels.
 Profiling and correctness checks apply throughout rather than occupying a separate
 prerequisite week.
 
@@ -64,25 +87,24 @@ prerequisite week.
 | W1 | Model loader: formats, Safetensors, config/tokenizer, host/device storage | Load and round-trip deterministic model weights |
 | W2 | Scheduler/Runner framework + minimal MLP; GEMM/ReLU kernels | Concurrent requests, request IDs, channel lifecycle, CPU/GPU agreement |
 | W3 | KVPool/KVContext + KV-cache indirection; attention and KV-write kernels | Session continuation, cache addressing, typed views, fused writes, release |
-| W4 | CUDA Graph and reusable execution buffers (implemented) | Pooled exact-shape replay, dynamic inputs, mapped output, correctness and profiling |
-| W5 | Step-level single-node execution; continuous batching and chunked prefill (next) | Synthetic token generation, token budgets, arrivals/completions, cancellation |
-| W6 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
-| W7 | One quantization path on the toy engine | Floating-point reference, quantization error, memory/traffic and latency |
-| W8 | Qwen2.5-0.5B-Instruct architecture and additional operators | Real checkpoint, logits/token agreement, greedy generation, earlier mechanisms |
+| W4 | CUDA Graph and reusable execution buffers (SimpleMLP implemented) | Pooled exact-shape replay, dynamic inputs, mapped output; Qwen replay pending |
+| W5 | Qwen2.5-0.5B-Instruct baseline — Done | Reference logits/tokens, sessions/streaming, scratch reuse, metrics and benchmark |
+| W6 | Continuous batching and chunked-prefill scheduling | Add packed Qwen execution on the existing Runner token-step lifecycle; arrivals/completions, budgets and cancellation |
+| W7 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
+| W8 | One quantization path on Qwen | FP32 reference, quality/error, memory/traffic and latency |
 | W9 | Speculative decoding | Original plan retained |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
-| W13 | Distributed routing, SLO, and serving semantics | Original plan retained; extends W6's cache-locality routing |
+| W13 | Distributed routing, SLO, and serving semantics | Original plan retained; extends W7's cache-locality routing |
 | W14 | End-to-end synthesis | Original plan retained |
 
-Current checkpoint: the loader, Scheduler/Runner, KV/attention baseline, and CUDA
-Graph replay are implemented. The graph path has pooled fixed buffers, one packed
-input upload, mapped page-locked host output, and per-replay KV leases. It uses
-exact-shape caching; fixed shape buckets remain a later scheduling optimization.
-W5 step-level execution is next. The toy model still returns a scalar and has no
-autoregressive generation loop; W5 adds the minimal token-step workload required
-to validate scheduling before W8 introduces a real language model.
+Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
+Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
+Qwen uses eager execution and serial batch items. Chunked appends are numerically
+validated; interleaved chunked-prefill scheduling, continuous batching and radix
+prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
+commands and metric contracts.
 
 多模态编码器、LoRA 服务、structured output、弹性伸缩在扩展表中了解位置；本轮主线覆盖文本自回归 LLM inference，不要求深入所有相邻工作负载。
 
@@ -90,8 +112,8 @@ to validate scheduling before W8 introduces a real language model.
 
 ### 3.1 One implementation spine
 
-- Main implementation: `rust/engine`, using Rust, cuTile, and cuda-async. Extend the same tiny model through loading, execution, KV management, CUDA Graph, scheduling, prefix reuse, and quantization.
-- Main model progression: deterministic MLP -> MLP with causal attention/KV -> a small synthetic token generator for scheduling -> [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct). Keep the toy model as a fast regression fixture after adding Qwen.
+- Main implementation: `rust/engine`, using Rust, cuTile, and cuda-async. Keep shared Scheduler/Runner/KV contracts; use Qwen for subsequent performance, scheduling, prefix reuse and quantization experiments.
+- Main model progression: deterministic MLP -> MLP with causal attention/KV -> [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct). Qwen is now the performance baseline; keep the toy model as a fast regression fixture without a separate synthetic-generation project.
 - References: use the local SGLang and vLLM source trees for focused interface/control-flow comparisons. Their production architecture is a reference, not a requirement to reproduce every subsystem.
 - Python/PyTorch or Transformers provide independent numerical references and evaluation. Triton/CUDA kernels are optional comparison baselines. Mojo/MAX and torch.compile remain optional follow-up references rather than parallel required implementations.
 - Preserve public request/session semantics while changing model/backends. Scheduler handles ingress/routing; Runner owns local session state and execution resources. Add an abstraction when the next concrete implementation requires it.
@@ -123,11 +145,13 @@ to validate scheduling before W8 introduces a real language model.
 model loader
   -> Scheduler / Runner + minimal MLP (GEMM, ReLU)
   -> KVPool / KVContext + token-slot indirection + attention / cache writes
-  -> CUDA Graph
-  -> step-level generation + continuous batching / chunked prefill
+  -> CUDA Graph on SimpleMLP
+  -> Qwen2.5-0.5B-Instruct + shared causal steps / Runner streaming
+  -> scratch reuse + metrics / benchmarks (current)
+  -> profile and optimize Qwen + packed batch execution
+  -> continuous batching / chunked-prefill scheduling
   -> radix prefix reuse + cache-aware routing
-  -> quantization
-  -> Qwen2.5-0.5B-Instruct
+  -> quantization on Qwen
   -> W9 onward: revisit when these foundations are validated
 ```
 
@@ -193,13 +217,13 @@ model loader
 - [ ] Full prefill, chunked appends, and one-token appends match an independent CPU reference; actual K/V entries match projected values.
 - [ ] Different sessions remain isolated; nonzero append positions, fragmented slots, and padding do not overwrite another context.
 - [ ] Read/write view misuse fails to compile; dynamic bounds and missing pending state fail at runtime. Release waits for in-flight GPU resource ownership.
-- [ ] Report pool allocation/mapping bytes and free/assigned capacity. Prefix sharing and radix indexing remain W6 work.
+- [ ] Report pool allocation/mapping bytes and free/assigned capacity. Prefix sharing and radix indexing remain W7 work.
 
-### Phase B: extend the same engine before changing model architecture (W4–W8)
+### Phase B: real-model baseline and execution improvements (W4–W8)
 
 #### W4: CUDA Graph and reusable execution buffers
 
-Status: implemented. See [engine execution notes](rust/engine/README.md),
+Status: implemented for SimpleMLP; Qwen uses eager execution. See [engine execution notes](rust/engine/README.md),
 [graph implementation](rust/engine/src/runner/model/simple_mlp/graph.rs), and the
 local [profiling results](rust/profiling/simple_mlp_attn/RESULTS.md). Recent source
 milestones include `24a6ce6` (pooled scoped capture) and `60dd84a` (mapped output).
@@ -210,7 +234,7 @@ milestones include `24a6ce6` (pooled scoped capture) and `60dd84a` (mapped outpu
 - Preallocate tokens, metadata, activations, and output workspace. Keep addresses stable; update per-request contents without recapture.
 - Initialize GEMM/GEMV accumulators independently of previous workspace contents. Keep synchronous host readback outside capture.
 - Manage pool/weight/workspace lifetime separately from each replay's session leases. Order metadata updates and replay on the same execution stream.
-- Current replay is cached by exact packed geometry, KV backing storage, and weight identity. Warmup/capture are separate from steady state; fixed buckets and padding policy can be added with W5 scheduling.
+- Current replay is cached by exact packed geometry, KV backing storage, and weight identity. Warmup/capture are separate from steady state; fixed buckets and padding policy can be added with W6 scheduling.
 
 **References**
 
@@ -228,16 +252,56 @@ Performance conclusions distinguish graph replay from workspace, upload, mapped
 output, and completion-policy changes. Eager and the final graph path have different
 host transfer/completion behavior, so their whole-path latency difference must not
 be reported as an isolated graph-launch speedup. Bucket-based dispatch and changing
-active-request membership are W5 follow-up work.
+active-request membership are W6 follow-up work.
 
-#### W5: step-level generation, continuous batching, and chunked prefill
+#### W5: Qwen2.5-0.5B-Instruct baseline
 
-Status: next. Keep the completed eager/graph execution paths as the local executor
-baseline; first introduce one-step token generation before changing scheduling.
+Status: Done. The FP32 numerical/lifecycle baseline is implemented. The real
+checkpoint uses the shared CausalModel/Runner path. Reusable scratch removes
+per-layer temporary accumulation and redundant zero fills. Scheduler observers
+report request/first-text timing and actual generated tokens; model counters and
+histograms and pool gauges handle concurrent observations without attributing
+shared totals to one batch. Qwen graph replay, packed GPU batches, prefix sharing
+and quantized execution remain open.
 
 **Focus**
 
-- Add a minimal synthetic token-generation workload: a small output vocabulary/logits head, deterministic greedy selection, EOS/length stopping, and a step-level execution boundary. The current scalar demo is not yet autoregressive generation.
+- Treat real-model support as architecture integration: config-driven dimensions, repeated decoder layers, GQA, normalization, positions, vocabulary logits, and tokenizer/chat-template/stopping semantics.
+- Add the operators missing from the toy model: RMSNorm, RoPE, Q/K/V projection biases, attention output projection, gated SiLU/SwiGLU MLP, final normalization, and tied embedding/LM-head handling as defined by the checkpoint.
+- Use the actual config/checkpoint as the authority. The published model has 24 layers and 14 query heads / 2 KV heads; do not generalize the toy model's single head or 16-wide vectors.
+- Bring up a supported floating-point compute path first, then enable earlier graph/cache/scheduling and quantization features one at a time. Loading BF16 weights alone does not prove BF16 kernel support.
+- Keep the toy model as the fast architecture/lifecycle fixture. Fix interface assumptions exposed by a real model instead of duplicating the whole serving stack.
+
+**References**
+
+1. Official [model card](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [config](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json), tokenizer, and generation settings; pin a revision.
+2. The pinned Transformers Qwen2 implementation for independent logits/token references, and local SGLang/vLLM Qwen2 model implementations for execution organization.
+
+**Acceptance**
+
+- [x] Load the real checkpoint and compare final logits/greedy token IDs with an independent Transformers FP32 reference.
+- [x] Full/chunked prefill logits, cached decode, reference token IDs, session continuation and KV release are validated.
+- [x] Qwen-only benchmark covers fresh-KV warmup/samples, prefill/decode timings, scratch ownership and CUDA-pool peaks; no serving throughput claim is implied.
+**Follow-up work (outside W5 acceptance)**
+
+- Profile warmed prefill/decode, optimize the dominant measured path, then add
+  packed GPU batches starting with uniform decode. Validate each change against
+  the existing reference and report latency, throughput and workspace usage.
+- Port CUDA Graph if host submission overhead warrants it; schedule changing
+  request membership in W6 after the packed executor works.
+
+- Add selected intermediate-tensor checks when changing numerical kernels.
+- Validate graph replay, packed batching and prefix reuse as each feature is added; evaluate quantized quality/performance in W8.
+
+#### W6: step-level generation, continuous batching, and chunked prefill
+
+Status: planned on top of the existing Runner generation/lifecycle baseline.
+Implement packed Qwen execution before changing active batch membership. Correct chunked KV appends do not yet establish an
+interleaved chunked-prefill scheduler.
+
+**Focus**
+
+- Add packed Qwen execution using `CausalModel::next_tokens` and Runner greedy/EOS/length handling; keep per-request error isolation and stream completion.
 - Move from batching whole requests to scheduling model steps: waiting/running requests, token budgets, arrivals, completions, cancellation, and local KV admission.
 - Interleave chunked prefill with decode. Maintain the invariant between accepted tokens, computed KV, and any last generated token whose KV is not computed yet.
 - Keep Runner lifecycle independent from the ingress Scheduler. Place execution-batch decisions where local KV/workspace capacity is known.
@@ -250,12 +314,13 @@ baseline; first introduce one-step token generation before changing scheduling.
 
 **Acceptance**
 
-- [ ] Serial and continuously batched execution produce the same deterministic token sequences for the toy workload.
+- [x] Runner token stepping, EOS/length stopping, session continuation, streaming and independent request completion are covered by regressions.
+- [ ] Packed and serial Qwen execution produce the same deterministic token sequences; continuously batched execution then agrees with that baseline.
 - [ ] A new request can join while existing requests decode; finished/cancelled requests release resources without disturbing peers.
-- [ ] Compare at least two prefill budgets on the same mixed long/short workload; report queueing, first-result latency, per-step latency, and throughput with toy-workload limits stated.
+- [ ] Compare at least two prefill budgets on the same mixed long/short workload; report request/first-text latency, per-step latency and throughput. Add an explicit Runner-start event before claiming exact queue time.
 - [ ] CUDA Graph bucket selection and dynamic metadata remain correct when batch membership changes.
 
-#### W6: radix prefix caching, shared ownership, and cache-aware routing
+#### W7: radix prefix caching, shared ownership, and cache-aware routing
 
 **Focus**
 
@@ -276,14 +341,14 @@ baseline; first introduce one-step token generation before changing scheduling.
 - [ ] A small controlled multi-owner routing experiment chooses the appropriate cached owner and handles misses/stale hints; label any mock routing as simulation.
 - [ ] Distinguish hit rate, prefill work saved, latency, and throughput rather than treating them as interchangeable.
 
-#### W7: one quantization path on the existing toy engine
+#### W8: one quantization path on Qwen
 
 **Focus**
 
 - Select one small weight-only or KV quantization path. Understand scale granularity, packing, dequantization, and the kernel/layout contract before adding algorithms.
 - Keep quantization algorithm, checkpoint representation, and execution kernel separate; smaller storage does not establish faster inference.
-- Measure tensor/output error against the toy floating-point baseline. Language-quality evaluation belongs to the real-model stage.
-- Keep the floating-point path available for Qwen bring-up and regression tests; quantization is a selectable backend rather than a required correctness baseline.
+- Measure tensor/logit error and held-out generation quality against the working Qwen FP32 baseline.
+- Keep the floating-point path available for Qwen numerical comparisons and regression tests; quantization is a selectable backend rather than a required correctness baseline.
 
 **References**
 
@@ -293,30 +358,8 @@ baseline; first introduce one-step token generation before changing scheduling.
 **Acceptance**
 
 - [ ] Quantize/dequantize a small linear layer or KV tensor; compare at least two scale granularities with independently computed reference values.
-- [ ] Integrate one path into the toy model and compare outputs, storage/traffic, workspace, and steady-state latency for at least two shapes.
+- [ ] Integrate one path into Qwen and compare quality, storage/traffic, workspace and steady-state latency for at least two shapes.
 - [ ] State which operations remain floating point and where extra conversion occurs; reuse cache/graph tests for the selected path.
-
-#### W8: support Qwen2.5-0.5B-Instruct and its additional operators
-
-**Focus**
-
-- Treat real-model support as architecture integration: config-driven dimensions, repeated decoder layers, GQA, normalization, positions, vocabulary logits, and tokenizer/chat-template/stopping semantics.
-- Add the operators missing from the toy model: RMSNorm, RoPE, Q/K/V projection biases, attention output projection, gated SiLU/SwiGLU MLP, final normalization, and tied embedding/LM-head handling as defined by the checkpoint.
-- Use the actual config/checkpoint as the authority. The published model has 24 layers and 14 query heads / 2 KV heads; do not generalize the toy model's single head or 16-wide vectors.
-- Bring up a supported floating-point compute path first, then enable earlier graph/cache/scheduling and quantization features one at a time. Loading BF16 weights alone does not prove BF16 kernel support.
-- Keep the toy model as the fast architecture/lifecycle fixture. Fix interface assumptions exposed by a real model instead of duplicating the whole serving stack.
-
-**References**
-
-1. Official [model card](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [config](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json), tokenizer, and generation settings; pin a revision.
-2. The pinned Transformers Qwen2 implementation for independent logits/token references, and local SGLang/vLLM Qwen2 model implementations for execution organization.
-
-**Acceptance**
-
-- [ ] Load the real checkpoint and match selected intermediate tensors and final logits against a trusted implementation, with dtype/tolerance recorded.
-- [ ] Cached prefill + decode agrees with uncached/full-history execution; greedy generation reproduces a fixed reference token sequence with the same template and stopping rules.
-- [ ] Validate multi-layer/GQA cache indexing, sessions, graph replay, batching, and prefix reuse with real inputs; introduce each feature against a working floating-point baseline.
-- [ ] Evaluate any quantized variant on held-out text/logit metrics and generation behavior; report quality and performance separately.
 
 ### Phase C: later algorithms and model families (W9–W10; existing plan retained)
 
@@ -426,7 +469,7 @@ baseline; first introduce one-step token generation before changing scheduling.
 
 1. 主实现二选一：[SGLang Model Gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway)；或 [Dynamo Routing Concepts](https://docs.nvidia.com/dynamo/dev/knowledge-base/modular-components/router/routing-concepts)。读策略入口、worker 状态和请求结束记账，不通读整个网关。
 2. 对照阅读：[llm-d Token-Aware Routing](https://llm-d.ai/blog/sticky-until-saturated-token-aware-routing)。理解缓存亲和在什么条件下让位于负载。
-3. Reuse W5's inference-perf / arrival-trace tooling; no new benchmark framework is required.
+3. Reuse W6's inference-perf / arrival-trace tooling; no new benchmark framework is required.
 
 **产出与验收**
 
@@ -467,20 +510,20 @@ baseline; first introduce one-step token generation before changing scheduling.
 | 原始 / 扩展主题 | 本轮处理 | 后续深入触发条件 / 入口 |
 |---|---|---|
 | GPT 架构、LLM workload、KV | 利用已有基础快速核对，贯穿实测 | 模型实现或成本推导出现具体疑问 |
-| GEMM/ReLU, attention/softmax, RMSNorm/GEMV | W2 MLP, W3 attention, W8 real-model operators | 某算子在 profile 中占据显著时间 |
+| GEMM/ReLU, attention/softmax, RMSNorm/GEMV | W2 MLP, W3 attention, W5 real-model operators | 某算子在 profile 中占据显著时间 |
 | FlashAttention、Flash-Decoding | W3 numerical/parallelism references; mature-kernel integration optional | 对 Attention kernel 感兴趣时，再读 [FlashAttention 实现](https://github.com/Dao-AILab/flash-attention)及硬件专项优化 |
 | ChunkAttention | 暂不要求；不等于 chunked prefill | 需要研究共享前缀的 attention 计算复用时再读原论文 |
-| KV-cache indirection, allocation granularity, prefix cache | W3 mapping/allocation; W6 radix sharing/reuse and routing | PagedAttention is a paged example; [vAttention](https://arxiv.org/abs/2405.04437) compares a virtual-memory approach |
+| KV-cache indirection, allocation granularity, prefix cache | W3 mapping/allocation; W7 radix sharing/reuse and routing | PagedAttention is a paged example; [vAttention](https://arxiv.org/abs/2405.04437) compares a virtual-memory approach |
 | 分布式 / 异构 KV | W12 核心，跑一条路径 | 在 CPU / NVMe / RDMA 的实际瓶颈出现后再扩展 |
 | TP、PP、EP、DP、all-reduce | W11 核心，TP 与 DP 实测 | 实际受通信限制后再考虑 custom collective、拓扑调优 |
 | 序列并行、序列流水并行 | W11 了解划分对象与通信 | 长上下文成为主兴趣后深入具体 context parallel / pipeline 实现 |
 | 分离式架构 | W12 学一次交接与成本 | 需要研究资源配比、多机容错时再深入 |
-| 异步调度、NanoFlow | W2 submission/completion, W4 replay, W5 step scheduling; NanoFlow optional | 对算子级流水与资源重叠感兴趣时读 [NanoFlow](https://arxiv.org/abs/2408.12757) |
-| Weight-only、W8A8、FP8 | W7 one toy-model path; W8 real-model validation | 质量 / 性能出现具体差异后再深挖 AWQ、GPTQ、SmoothQuant 等 |
+| 异步调度、NanoFlow | W2 submission/completion, W4 replay, W6 step scheduling; NanoFlow optional | 对算子级流水与资源重叠感兴趣时读 [NanoFlow](https://arxiv.org/abs/2408.12757) |
+| Weight-only、W8A8、FP8 | W8 one Qwen path against the W5 FP32 reference | 质量 / 性能出现具体差异后再深挖 AWQ、GPTQ、SmoothQuant 等 |
 | torch.compile、CUDA Graph | W4 CUDA Graph; torch.compile is an optional reference comparison | 产生编译瓶颈后再学 Inductor / Triton / MLIR 细节 |
 | Lookahead、tree attention | W9 理解其在 draft / verify 中的位置 | 投机解码成为兴趣方向后再专门实现 |
 | MoE、MLA、混合状态模型 | W10 补齐现代模型差异 | 不要求每种模型都部署完整规模 |
-| Sampling、structured output | W5 deterministic toy decoding; W8 real-model generation; W9 rejection sampling | 需要语法约束输出时读 [vLLM Structured Outputs](https://docs.vllm.ai/en/latest/features/structured_outputs/) |
+| Sampling、structured output | W5 Qwen/Runner greedy generation; W6 step scheduling; W9 rejection sampling | 需要语法约束输出时读 [vLLM Structured Outputs](https://docs.vllm.ai/en/latest/features/structured_outputs/) |
 | LoRA、多模态、RL rollout serving | 了解额外状态 / 编码 / 权重版本会影响调度 | 遇到相关使用场景时选择一条支线，不同时展开 |
 | Mojo / MAX | Optional language/runtime comparison; Rust/cuTile remains the implementation spine | Revisit one validated operator if the language/runtime itself becomes a research question |
 | 本地模型托管 | 不列为本轮必做周任务 | 未来本地部署的参考：[Strata](https://github.com/Niko1221/Strata) |

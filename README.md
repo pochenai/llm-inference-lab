@@ -6,8 +6,10 @@ An experiment-driven, learning-first roadmap for understanding LLM inference mec
 
 See the detailed [learning roadmap](roadmap.md) for goals, references, experiments, and acceptance criteria.
 
-Extend one small Rust/cuTile engine through execution, KV management, CUDA Graph,
-scheduling, prefix reuse, and quantization before adding Qwen2.5-0.5B-Instruct.
+The Rust/cuTile engine now runs Qwen2.5-0.5B-Instruct through Scheduler/Runner,
+with streaming greedy generation, sessions, reusable scratch and metrics.
+Next: profile Qwen, optimize the measured bottleneck, then support packed GPU
+batches before continuous batching, prefix reuse and quantization.
 Profiling and numerical/lifecycle checks accompany every phase. Week labels are
 learning units; speculative decoding and the later plan remain unchanged.
 
@@ -16,11 +18,11 @@ learning units; speculative decoding and the later plan remain unchanged.
 | 1 | [Model loader, formats, and storage](d1_model_formats/README.md) | ✅ Implemented |
 | 2 | [Scheduler/Runner framework + minimal GEMM/ReLU MLP](rust/engine/README.md), 预备知识 [Nvidia cutile-rs tutorials](https://nvlabs.github.io/cutile-rs/main/index.html) | ✅ Baseline implemented |
 | 3 | KVPool/KVContext, token-slot indirection, attention, and fused KV writes | ✅ Baseline implemented |
-| 4 | CUDA Graph, pooled workspace/replay, and mapped host output | ✅ Baseline implemented |
-| 5 | Step-level generation, continuous batching, and chunked prefill | ⏭ Next |
-| 6 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
-| 7 | Quantization on the toy engine | ⬜ Planned |
-| 8 | Qwen2.5-0.5B-Instruct: real architecture and additional operators | ⬜ Planned |
+| 4 | CUDA Graph, pooled workspace/replay, and mapped host output | ✅ SimpleMLP implemented; Qwen pending |
+| 5 | Qwen2.5-0.5B-Instruct: operators, reference checks, scratch reuse, metrics and benchmark | ✅ Done |
+| 6 | Continuous batching and chunked-prefill scheduling on the existing token-step API | ⬜ Planned |
+| 7 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
+| 8 | Quantization on Qwen | ⬜ Planned |
 | 9 | Speculative decoding | ⬜ Planned |
 | 10 | Modern model architectures | ⬜ Planned |
 | 11 | Multi-GPU execution | ⬜ Planned |
@@ -29,7 +31,26 @@ learning units; speculative decoding and the later plan remain unchanged.
 | 14 | End-to-end synthesis | ⬜ Planned |
 
 
+## Current baseline and next experiment
+
+- Unified `CausalModel::next_tokens`; Runner owns greedy generation, EOS/budgets,
+  sessions and streamed text. Qwen currently executes batch items sequentially.
+- Independent reference logits/tokens and full/chunked KV checks; exclusive
+  per-forward scratch is reused across decoder layers without zero fills.
+- Scheduler observer plugins and `metrics` counters/gauges/histograms; optional
+  structured tracing. No exporter or external monitoring service is installed.
+- [Qwen benchmark](rust/engine/benches/qwen2.rs) uses fresh KV per sample and
+  reports prefill/decode latency, tokens/s, scratch ownership and CUDA-pool peaks.
+  See the [engine guide](rust/engine/README.md) for runnable commands.
+
+Next, profile warmed short/long prefill and decode to choose between attention,
+linear/dtype improvements and Qwen CUDA Graph. Follow with packed Qwen execution,
+starting with uniform decode. Continuous batching and chunked-prefill scheduling
+then build on a working batch executor; radix caching and quantization follow.
+Existing chunked-KV correctness checks do not imply chunked-prefill scheduling.
+
 ## Future plans
+
 - RDMA
 - CoW for forked Conversation
 - Local LLM like [Strata](https://github.com/Niko1221/Strata)
