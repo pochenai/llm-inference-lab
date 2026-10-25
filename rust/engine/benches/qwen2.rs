@@ -36,7 +36,7 @@ struct Args {
     /// Number of one-token steps after prefill (does not stop at EOS).
     #[arg(long, default_value = "8")]
     decode_steps: NonZeroUsize,
-    /// Qwen currently executes batch items serially.
+    /// Number of requests sharing one packed GPU forward.
     #[arg(long, default_value = "1")]
     batch_size: NonZeroUsize,
     #[arg(long, default_value = "1")]

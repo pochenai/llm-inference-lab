@@ -21,32 +21,31 @@ pub(super) struct UploadPool<T: DType = i32> {
 }
 
 impl<T: DType> UploadPool<T> {
-    /// Copy a borrowed slice into reusable owned staging memory. Only cache-exclusive
-    /// buffers can be refilled; exec retains each upload source through completion.
-    /// Cache hits reuse the staging Vec and its Arc owner; capacity grows only as needed.
-    pub unsafe fn upload_slice(
+    /// Pack values directly into reusable owned staging, without a temporary Vec.
+    /// Only cache-exclusive buffers can be refilled; exec retains the source through
+    /// completion. Cache hits reuse the Vec and its Arc, growing capacity as needed.
+    pub unsafe fn upload_iter(
         self: &Arc<Self>,
-        data: &[T],
+        data: impl IntoIterator<Item = T>,
         exec: &ExecutionContext,
     ) -> Result<Arc<Tensor<T>>, DeviceError> {
         let source = {
             let mut idle = self.host_idle.lock().unwrap();
-            if let Some(source) = idle.iter_mut().find_map(|entry| {
-                let buffer = Arc::get_mut(entry)?;
+            if let Some(source) = idle.iter_mut().find(|entry| Arc::strong_count(entry) == 1) {
+                let buffer = Arc::get_mut(source).unwrap();
                 buffer.clear();
-                buffer.extend_from_slice(data);
-                Some(entry.clone())
-            }) {
-                source
+                buffer.extend(data);
+                source.clone()
             } else {
-                let source = Arc::new(data.to_vec());
+                let source = Arc::new(data.into_iter().collect::<Vec<_>>());
                 if idle.len() < MAX_IDLE_BUFFERS {
                     idle.push(source.clone());
                 }
                 source
             }
         };
-        self.upload(source, &[data.len()], exec)
+        let len = source.len();
+        self.upload(source, &[len], exec)
     }
 
     /// Caller owns exec and must establish GPU completion. All consumers must run
@@ -162,7 +161,7 @@ mod tests {
             let (actual, pointer) = with_context(|exec| {
                 value((|| -> Result<_, DeviceError> {
                     // SAFETY: upload leases both buffers until outer completion.
-                    let tensor = unsafe { pool.upload_slice(&input, exec)? };
+                    let tensor = unsafe { pool.upload_iter(input.iter().copied(), exec)? };
                     assert!(pool
                         .host_idle
                         .lock()

@@ -60,7 +60,7 @@ use cutile::{
     tile_kernel::TileKernel,
 };
 use serde::Deserialize;
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
 type Weight = Arc<Tensor<f32>>;
@@ -284,6 +284,7 @@ impl Qwen2Engine {
         let attention = GqaAttention {
             q_heads: config.num_attention_heads,
             kv_heads: config.num_key_value_heads,
+            metadata_uploads: Arc::default(),
         };
         let workspaces: Arc<WorkspacePool> = Arc::default();
         let instruments = Instruments::new(workspaces.metrics().model_instance);
@@ -349,11 +350,64 @@ impl Qwen2Engine {
         policy: Arc<dyn SchedulingPolicy>,
         read_logits: bool,
     ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
-        let rows = tokens.len().saturating_sub(kv.ready_len());
-        let prefill = kv.ready_len() == 0 || rows > 1;
+        let mut batch = [ModelInput {
+            token_ids: tokens,
+            kv,
+        }];
+        self.validate_step_input(&batch[0])?;
+        let output = self.forward_batch(&mut batch, policy, read_logits).await?;
+        Ok(StepOutput {
+            token: self.checked_token(output.token.as_slice()[0])?,
+            logits: output.logits.map(|values| values.as_slice().to_vec()),
+            host_submit_seconds: output.host_submit_seconds,
+        })
+    }
+
+    fn validate_step_input(&self, input: &ModelInput<'_, NaiveKVPool>) -> Result<(), ModelError> {
+        let tokens = input.token_ids;
+        let kv = &input.kv;
+        if kv.is_pending()
+            || tokens.len() <= kv.ready_len()
+            || tokens.len() > kv.max_seq_len()
+            || tokens.len() > self.config.max_position_embeddings
+        {
+            return Err(ModelError::InvalidInput(
+                "expected valid tokens with an uncached suffix and idle context".into(),
+            ));
+        }
+        self.validate_input(&tokens[kv.ready_len()..])
+    }
+
+    fn checked_token(&self, token: i32) -> Result<u32, ModelError> {
+        if token < 0 || token as usize >= self.config.vocab_size {
+            return Err(ModelError::Execution(
+                "non-finite logits or invalid argmax".into(),
+            ));
+        }
+        Ok(token as u32)
+    }
+
+    /// One submission for the packed batch; outer completion precedes all KV commits
+    /// and host reads. Mixed steps are labelled prefill if any input is not decode.
+    async fn forward_batch(
+        &self,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        policy: Arc<dyn SchedulingPolicy>,
+        read_logits: bool,
+    ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
+        let rows = batch
+            .iter()
+            .map(|input| input.token_ids.len() - input.kv.ready_len())
+            .sum();
+        let prefill = batch.iter().any(|input| {
+            input.kv.ready_len() == 0 || input.token_ids.len() - input.kv.ready_len() > 1
+        });
         let start = Instant::now();
-        let result = self.step_inner(tokens, kv, policy, read_logits).await;
-        // Whole step wall time, including GPU/D2H completion, KV commit and CPU output access.
+        let result = Self::execute_append_batch(batch, &policy, |batch, exec| {
+            // SAFETY: every GPU access, including D2H, belongs to this submission.
+            unsafe { self.submit(batch, read_logits, exec) }
+        })
+        .await;
         let step_wall_seconds = start.elapsed().as_secs_f64();
         let host_submit_seconds = result
             .as_ref()
@@ -363,68 +417,46 @@ impl Qwen2Engine {
             .step(prefill, rows, step_wall_seconds, host_submit_seconds);
         tracing::debug!(target: "engine::qwen2", event = "step_completed",
             phase = if prefill { "prefill" } else { "decode" },
-            input_tokens = rows, context_tokens = tokens.len(), step_wall_seconds, host_submit_seconds,
+            input_tokens = rows, batch_size = batch.len(), step_wall_seconds, host_submit_seconds,
             diagnostic_logits = read_logits, success = result.is_ok());
         result
     }
 
-    async fn step_inner(
-        &self,
-        tokens: &[u32],
-        kv: &mut KVContext<NaiveKVPool>,
-        policy: Arc<dyn SchedulingPolicy>,
-        read_logits: bool,
-    ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
-        if kv.is_pending()
-            || tokens.len() <= kv.ready_len()
-            || tokens.len() > kv.max_seq_len()
-            || tokens.len() > self.config.max_position_embeddings
-            || tokens[kv.ready_len()..]
-                .iter()
-                .any(|&id| id as usize >= self.config.vocab_size)
-        {
-            return Err(ModelError::InvalidInput(
-                "expected valid tokens with an uncached suffix and idle context".into(),
-            ));
-        }
-        let input = ModelInput {
-            token_ids: tokens,
-            kv,
-        };
-        let output = Self::execute_append_batch(&mut [input], &policy, |batch, exec| {
-            let input = &mut batch[0];
-            // SAFETY: every GPU access, including D2H, belongs to this submission.
-            unsafe { self.submit(input.token_ids, input.kv, read_logits, exec) }
-        })
-        .await?;
-        // Outer completion includes D2H; only now expose host references.
-        let token = output.token.as_slice()[0] as u32;
-        if token as usize >= self.config.vocab_size {
-            return Err(ModelError::Execution(
-                "non-finite logits or invalid argmax".into(),
-            ));
-        }
-        let logits = output.logits.map(|values| values.as_slice().to_vec());
-        Ok(StepOutput {
-            token,
-            logits,
-            host_submit_seconds: output.host_submit_seconds,
-        })
-    }
-
     unsafe fn submit(
         &self,
-        tokens: &[u32],
-        kv: &mut KVContext<NaiveKVPool>,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
         read_logits: bool,
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
         let submit_started = Instant::now();
-        let start = kv.ready_len();
-        let rows = tokens.len() - start;
-        // reuse the same buffer
-        let mut scratch = self.workspaces.acquire(rows, &self.config, exec)?;
-        let ids = self.input_uploads.upload_slice(&tokens[start..], exec)?;
+        let mut rows = 0usize;
+        let query_ranges: Vec<_> = batch
+            .iter()
+            .map(|input| {
+                let start = rows;
+                rows += input.token_ids.len() - input.kv.ready_len();
+                start..rows
+            })
+            .collect();
+        // Check the entire packed geometry before allocating/uploading model inputs.
+        let mut scratch = self
+            .workspaces
+            .acquire(rows, batch.len(), &self.config, exec)?;
+        let metadata = {
+            let views = batch
+                .iter()
+                .map(|input| input.kv.read_view(0))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.attention
+                .prepare_metadata(rows, &views, &query_ranges, exec)?
+        };
+        // Pack directly into cached staging; retain u32 IDs without an intermediate Vec.
+        let ids = self.input_uploads.upload_iter(
+            batch
+                .iter()
+                .flat_map(|input| input.token_ids[input.kv.ready_len()..].iter().copied()),
+            exec,
+        )?;
         kernels::embedding(
             (&mut scratch.x).partition([1, 256]),
             ids,
@@ -438,7 +470,8 @@ impl Qwen2Engine {
                 &mut scratch.norm,
                 &scratch.x,
                 layer.input_norm.clone(),
-                0,
+                &metadata,
+                false,
                 exec,
             )?;
             self.linear(&mut scratch.q, &scratch.norm, layer.q.clone(), None, exec)?;
@@ -454,28 +487,31 @@ impl Qwen2Engine {
                 &mut scratch.rotated_q,
                 &scratch.q,
                 layer.q_bias.clone(),
-                start,
+                &metadata,
                 exec,
             )?;
             self.rope(
                 &mut scratch.rotated_k,
                 &scratch.k,
                 layer.k_bias.clone(),
-                start,
+                &metadata,
                 exec,
             )?;
-            kv.store(
-                index,
-                scratch.rotated_k.slice(&[0..rows])?,
-                scratch.v.slice(&[0..rows])?,
-                exec,
-            )?;
-            let view = kv.read_view(index)?;
-            self.attention.forward_into(
+            for (input, range) in batch.iter_mut().zip(&query_ranges) {
+                input.kv.store(
+                    index,
+                    scratch.rotated_k.slice(&[range.clone()])?,
+                    scratch.v.slice(&[range.clone()])?,
+                    exec,
+                )?;
+            }
+            // Preparation retains every context; all requests share this layer's backing storage.
+            let view = batch[0].kv.read_view(index)?;
+            self.attention.submit_prepared(
                 &mut scratch.attention,
                 &scratch.rotated_q,
-                &[view],
-                &[0..rows],
+                &view,
+                &metadata,
                 exec,
             )?;
             // Q projection has no remaining consumers: reuse its buffer for O/down.
@@ -491,7 +527,8 @@ impl Qwen2Engine {
                 &mut scratch.norm,
                 &scratch.residual,
                 layer.post_norm.clone(),
-                0,
+                &metadata,
+                false,
                 exec,
             )?;
             self.linear(
@@ -521,7 +558,8 @@ impl Qwen2Engine {
             &mut scratch.final_norm,
             &scratch.x,
             self.norm.clone(),
-            rows - 1,
+            &metadata,
+            true,
             exec,
         )?;
         self.linear(
@@ -531,12 +569,11 @@ impl Qwen2Engine {
             None,
             exec,
         )?;
-        let flat = scratch.logits.reshape(&[self.config.vocab_size])?;
         let blocks = self.config.vocab_size.div_ceil(256);
         kernels::argmax_blocks(
-            (&mut scratch.maxima).partition([1]),
-            (&mut scratch.indices).partition([1]),
-            &flat,
+            (&mut scratch.maxima).partition([1, 1]),
+            (&mut scratch.indices).partition([1, 1]),
+            &scratch.logits,
             self.config.vocab_size as i32,
         )
         .execute(exec)?;
@@ -549,7 +586,11 @@ impl Qwen2Engine {
         .execute(exec)?;
         let token = enqueue_readback(scratch.winner, &self.token_readbacks, exec)?;
         let values = if read_logits {
-            Some(enqueue_readback(flat, &self.logit_readbacks, exec)?)
+            Some(enqueue_readback(
+                scratch.logits,
+                &self.logit_readbacks,
+                exec,
+            )?)
         } else {
             None
         };
@@ -584,19 +625,25 @@ impl Qwen2Engine {
         out: &mut Tensor<f32>,
         x: &Tensor<f32>,
         w: Weight,
-        offset: usize,
+        metadata: &Tensor<i32>,
+        gather: bool,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
         let width = self.config.hidden_size;
+        let last_rows_offset = x.shape()[0] * kernels::TOKEN_METADATA_WIDTH;
         kernels::rms_norm(
             out.partition([1, width.next_power_of_two()]),
             x,
             w,
+            metadata,
             self.config.rms_norm_eps,
             width as i32,
-            offset as i32,
+            last_rows_offset,
         )
-        .generics(vec![width.next_power_of_two().to_string()])
+        .generics(vec![
+            width.next_power_of_two().to_string(),
+            gather.to_string(),
+        ])
         .execute(exec)?;
         Ok(())
     }
@@ -606,7 +653,7 @@ impl Qwen2Engine {
         out: &mut Tensor<f32>,
         x: &Tensor<f32>,
         bias: Weight,
-        start: usize,
+        metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
         kernels::rope(
@@ -614,7 +661,7 @@ impl Qwen2Engine {
             x,
             bias,
             self.inv_freq.clone(),
-            start as i32,
+            metadata,
         )
         .execute(exec)?;
         Ok(())
@@ -625,35 +672,82 @@ impl Qwen2Engine {
 struct GqaAttention {
     q_heads: usize,
     kv_heads: usize,
+    metadata_uploads: Arc<UploadPool<i32>>,
 }
 
 impl GqaAttention {
-    unsafe fn forward_into(
+    /// Per packed token: context row, absolute position, visible history start.
+    /// The tail stores range.end - 1 for each request's final RMSNorm/LM-head row.
+    /// Built/uploaded once per forward and reused by RoPE and every attention layer.
+    unsafe fn prepare_metadata(
+        &self,
+        rows: usize,
+        views: &[NaiveReadView<'_>],
+        query_ranges: &[Range<usize>],
+        exec: &ExecutionContext,
+    ) -> Result<Arc<Tensor<i32>>, ModelError> {
+        let first = views
+            .first()
+            .ok_or_else(|| ModelError::InvalidInput("empty GQA batch".into()))?;
+        if views.len() != query_ranges.len()
+            || rows
+                .checked_mul(kernels::TOKEN_METADATA_WIDTH as usize)
+                .and_then(|n| n.checked_add(views.len()))
+                .is_none_or(|n| n > i32::MAX as usize)
+        {
+            return Err(ModelError::InvalidInput(
+                "incompatible GQA batch geometry".into(),
+            ));
+        }
+        let mut end = 0;
+        for (view, range) in views.iter().zip(query_ranges) {
+            if view.k_ptr() != first.k_ptr()
+                || view.v_ptr() != first.v_ptr()
+                || view.slot_table_ptr() != first.slot_table_ptr()
+                || view.head_dim() != self.kv_heads * 64
+                || range.start != end
+                || range.is_empty()
+                || range.end > rows
+                || range.len() > view.positions().len()
+            {
+                return Err(ModelError::InvalidInput(
+                    "GQA needs packed queries and compatible views from one pool".into(),
+                ));
+            }
+            view.retain(exec)?;
+            end = range.end;
+        }
+        if end != rows {
+            return Err(ModelError::InvalidInput(
+                "GQA ranges must cover every packed row".into(),
+            ));
+        }
+        let tokens = views.iter().zip(query_ranges).flat_map(|(view, range)| {
+            let start = view.positions().end - range.len();
+            (0..range.len()).flat_map(move |local| {
+                [
+                    view.row() as i32,
+                    (start + local) as i32,
+                    view.positions().start as i32,
+                ]
+            })
+        });
+        Ok(self.metadata_uploads.upload_iter(
+            tokens.chain(query_ranges.iter().map(|range| (range.end - 1) as i32)),
+            exec,
+        )?)
+    }
+
+    /// Preparation retains all contexts on exec; view supplies shared layer storage.
+    unsafe fn submit_prepared(
         &self,
         out: &mut Tensor<f32>,
         q: &Tensor<f32>,
-        views: &[NaiveReadView<'_>],
-        query_ranges: &[std::ops::Range<usize>],
+        view: &NaiveReadView<'_>,
+        metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
-        let [view] = views else {
-            return Err(ModelError::InvalidInput(
-                "initial Qwen GQA backend expects one context".into(),
-            ));
-        };
-        let rows = q.shape()[0] as usize;
-        if q.shape().len() != 2
-            || q.shape()[1] as usize != self.q_heads * 64
-            || view.head_dim() != self.kv_heads * 64
-            || query_ranges != [0..rows]
-            || rows > view.positions().len()
-        {
-            return Err(ModelError::InvalidInput(
-                "incompatible GQA query or KV layout".into(),
-            ));
-        }
         view.retain(exec)?;
-        // SAFETY: view retains storage and allocation leases; writes precede reads on exec.
         let (k, v, table) = view.tensors();
         kernels::attention(
             out.partition([1, 64]),
@@ -661,8 +755,7 @@ impl GqaAttention {
             k.clone(),
             v.clone(),
             table.clone(),
-            view.row() as i32,
-            (view.positions().end - rows) as i32,
+            metadata,
             self.q_heads as i32,
             self.kv_heads as i32,
         )
@@ -679,13 +772,20 @@ impl AttentionBackend<NaiveKVPool> for GqaAttention {
         query_ranges: &[std::ops::Range<usize>],
         exec: &ExecutionContext,
     ) -> Result<Weight, ModelError> {
+        if q.shape().len() != 2 || q.shape()[1] as usize != self.q_heads * 64 {
+            return Err(ModelError::InvalidInput(
+                "incompatible GQA query width".into(),
+            ));
+        }
         // SAFETY: the attention kernel writes every valid output before any read.
         unsafe {
             let mut out = Tensor::<f32>::uninitialized(q.size())
                 .execute(exec)?
                 .assume_init()
                 .reshape(&[q.shape()[0] as usize, self.q_heads * 64])?;
-            self.forward_into(&mut out, &q, views, query_ranges, exec)?;
+            let metadata =
+                self.prepare_metadata(q.shape()[0] as usize, views, query_ranges, exec)?;
+            self.submit_prepared(&mut out, &q, &views[0], &metadata, exec)?;
             Ok(Arc::new(out))
         }
     }
@@ -715,14 +815,47 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
     ) -> Vec<Result<u32, ModelError>> {
         let start = Instant::now();
         let batch_size = batch.len();
-        // shortcut: serialize Qwen batch items until the attention kernel supports packed contexts.
-        let mut outputs = Vec::with_capacity(batch.len());
-        for input in batch {
-            outputs.push(
-                self.step(input.token_ids, input.kv, policy.clone(), false)
-                    .await
-                    .map(|output| output.token),
-            );
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        let mut outputs: Vec<_> = batch
+            .iter()
+            .map(|input| self.validate_step_input(input).map(|()| 0))
+            .collect();
+        let result = if outputs.iter().any(Result::is_err) {
+            // Keep valid peers packed together, preserving their original output slots.
+            let mut valid: Vec<_> = batch
+                .iter_mut()
+                .zip(&outputs)
+                .filter_map(|(input, result)| {
+                    result.is_ok().then(|| ModelInput {
+                        token_ids: input.token_ids,
+                        kv: &mut *input.kv,
+                    })
+                })
+                .collect();
+            if valid.is_empty() {
+                return outputs;
+            }
+            self.forward_batch(&mut valid, policy, false).await
+        } else {
+            self.forward_batch(batch, policy, false).await
+        };
+        match result {
+            Ok(result) => {
+                for (output, &token) in outputs
+                    .iter_mut()
+                    .filter(|output| output.is_ok())
+                    .zip(result.token.as_slice())
+                {
+                    *output = self.checked_token(token);
+                }
+            }
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|output| output.is_ok()) {
+                    *output = Err(error.clone());
+                }
+            }
         }
         self.instruments
             .batch(batch_size, start.elapsed().as_secs_f64());
@@ -775,6 +908,214 @@ mod tests {
     use cutile::cuda_core::Device;
     use cutile::tensor::{IntoPartition, Unpartition};
     use std::sync::Mutex;
+
+    /// Small deterministic weights exercise the full multi-layer/GQA batch path without HF files.
+    async fn tiny_model(policy: &Arc<dyn SchedulingPolicy>) -> Result<Qwen2Engine, ModelError> {
+        with_context(|exec| {
+            value((|| -> Result<_, ModelError> {
+                let config: Qwen2Config = serde_json::from_value(serde_json::json!({
+                    "model_type":"qwen2", "vocab_size":257, "hidden_size":128,
+                    "intermediate_size":64, "num_hidden_layers":2,
+                    "num_attention_heads":2, "num_key_value_heads":1,
+                    "rms_norm_eps":1e-6, "rope_theta":1000000.0,
+                    "max_position_embeddings":64, "tie_word_embeddings":true,
+                    "eos_token_id":256, "hidden_act":"silu"
+                }))
+                .unwrap();
+                let weight = |shape: &[usize], seed: usize| -> Result<Weight, ModelError> {
+                    let values = (0..shape.iter().product())
+                        .map(|index: usize| {
+                            if seed == 0 {
+                                1.0
+                            } else {
+                                ((index * 13 + seed * 7) % 59) as f32 * 0.003 - 0.087
+                            }
+                        })
+                        .collect();
+                    // SAFETY: all uploads share exec; construction awaits completion.
+                    Ok(Arc::new(unsafe {
+                        api::copy_host_vec_to_device(&Arc::new(values))
+                            .execute(exec)?
+                            .reshape(shape)?
+                    }))
+                };
+                let embedding = weight(&[257, 128], 1)?;
+                let mut layers = Vec::new();
+                for seed in [2, 13] {
+                    layers.push(Layer {
+                        input_norm: weight(&[128], 0)?,
+                        post_norm: weight(&[128], 0)?,
+                        q: weight(&[128, 128], seed)?,
+                        k: weight(&[64, 128], seed + 1)?,
+                        v: weight(&[64, 128], seed + 2)?,
+                        o: weight(&[128, 128], seed + 3)?,
+                        q_bias: weight(&[128], seed + 4)?,
+                        k_bias: weight(&[64], seed + 5)?,
+                        v_bias: weight(&[64], seed + 6)?,
+                        gate: weight(&[64, 128], seed + 7)?,
+                        up: weight(&[64, 128], seed + 8)?,
+                        down: weight(&[128, 64], seed + 9)?,
+                    });
+                }
+                let frequencies: Vec<_> = (0..32)
+                    .map(|i| config.rope_theta.powf(-(i as f32) / 32.0))
+                    .collect();
+                let workspaces: Arc<WorkspacePool> = Arc::default();
+                Ok(Qwen2Engine {
+                    instruments: Instruments::new(workspaces.metrics().model_instance),
+                    workspaces,
+                    attention: GqaAttention {
+                        q_heads: 2,
+                        kv_heads: 1,
+                        metadata_uploads: Arc::default(),
+                    },
+                    tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+                    embedding: embedding.clone(),
+                    lm_head: embedding,
+                    norm: weight(&[128], 0)?,
+                    inv_freq: Arc::new(unsafe {
+                        api::copy_host_vec_to_device(&Arc::new(frequencies)).execute(exec)?
+                    }),
+                    layers,
+                    config,
+                    eos: vec![256],
+                    input_uploads: Arc::default(),
+                    token_readbacks: Default::default(),
+                    logit_readbacks: Default::default(),
+                })
+            })())
+        })
+        .schedule(policy)?
+        .await?
+    }
+
+    #[tokio::test]
+    async fn packed_qwen_matches_serial_ragged_history_decode_and_invalid_peers(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let mut model = tiny_model(&policy).await?;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        model.instruments = metrics::with_local_recorder(&recorder, || {
+            Instruments::new(model.workspace_metrics().model_instance)
+        });
+        let step_count = || {
+            recorder
+                .snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(key, _, _, value)| {
+                    if key.key().name() != "qwen2_steps_total" {
+                        return None;
+                    }
+                    match value {
+                        metrics_util::debugging::DebugValue::Counter(count) => Some(count),
+                        _ => None,
+                    }
+                })
+                .sum::<u64>()
+        };
+        let mut config = model.kv_pool_config(16)?;
+        config.max_rows = 5;
+        config.num_slots *= 5;
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let mut contexts = (0..3)
+            .map(|_| KVContext::new(pool.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut histories = [vec![1, 2, 3, 4, 5], vec![9, 8, 7], vec![23, 24, 25, 26]];
+        // Different cached prefixes, including a fresh request and a one-token suffix.
+        for ((history, context), prefix) in histories.iter().zip(&mut contexts).zip([2, 0, 3]) {
+            if prefix > 0 {
+                model
+                    .step(&history[..prefix], context, policy.clone(), false)
+                    .await?;
+            }
+        }
+        for round in 0..3 {
+            let mut inputs: Vec<_> = histories
+                .iter()
+                .zip(&mut contexts)
+                .map(|(token_ids, kv)| ModelInput { token_ids, kv })
+                .collect();
+            // DebuggingRecorder snapshots drain counters; discard earlier forwards.
+            let _ = step_count();
+            let actual = model
+                .forward_batch(&mut inputs, policy.clone(), true)
+                .await?;
+            assert_eq!(step_count(), 1, "one packed forward, not one per request");
+            let logits = actual.logits.as_ref().unwrap().as_slice();
+            for (index, (history, context)) in histories.iter().zip(&contexts).enumerate() {
+                let mut serial = KVContext::new(pool.clone())?;
+                // Full-history reference also checks cached-prefix and nonzero RoPE positions.
+                let expected = model
+                    .step(history, &mut serial, policy.clone(), true)
+                    .await?;
+                assert_eq!(
+                    actual.token.as_slice()[index] as u32,
+                    expected.token,
+                    "round {round}, request {index}"
+                );
+                for (&a, b) in logits[index * 257..(index + 1) * 257]
+                    .iter()
+                    .zip(expected.logits.unwrap())
+                {
+                    assert!(a.is_finite() && (a - b).abs() < 1e-4, "{a} vs {b}");
+                }
+                assert_eq!(context.ready_len(), history.len());
+                assert!(!context.is_pending());
+                serial.release();
+            }
+            for (history, &token) in histories.iter_mut().zip(actual.token.as_slice()) {
+                history.push(token as u32);
+            }
+        }
+        // Reject the middle request, but still execute both valid peers in one packed batch.
+        let mut invalid = KVContext::new(pool.clone())?;
+        let (left, right) = contexts.split_at_mut(1);
+        let _ = step_count();
+        let outputs = model
+            .next_tokens(
+                &mut [
+                    ModelInput {
+                        token_ids: &histories[0],
+                        kv: &mut left[0],
+                    },
+                    ModelInput {
+                        token_ids: &[257],
+                        kv: &mut invalid,
+                    },
+                    ModelInput {
+                        token_ids: &histories[2],
+                        kv: &mut right[1],
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        assert_eq!(step_count(), 1, "valid peers must stay in one batch");
+        assert!(outputs[1].is_err());
+        assert_eq!(invalid.ready_len(), 0);
+        assert!(!invalid.is_pending());
+        invalid.release();
+        for (output, index) in [(&outputs[0], 0), (&outputs[2], 2)] {
+            let mut serial = KVContext::new(pool.clone())?;
+            let expected = model
+                .step(&histories[index], &mut serial, policy.clone(), false)
+                .await?;
+            assert_eq!(*output.as_ref().unwrap(), expected.token);
+            assert_eq!(contexts[index].ready_len(), histories[index].len());
+            serial.release();
+        }
+        assert!(model.next_tokens(&mut [], policy).await.is_empty());
+        for context in contexts {
+            context.release();
+        }
+        assert_eq!(pool.metrics(), initial);
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn linear_epilogue_bias_matches_cpu_with_partial_row_tile() -> Result<(), ModelError> {
@@ -841,7 +1182,7 @@ mod tests {
             value((|| -> Result<_, ModelError> {
                 // SAFETY: all resources are owned/retained through completion.
                 unsafe {
-                    let ids = uploads.upload_slice(&[3, 0, 2], exec)?;
+                    let ids = uploads.upload_iter([3, 0, 2], exec)?;
                     let w = api::copy_host_vec_to_device(&weights)
                         .execute(exec)?
                         .reshape(&[4, 896])?;
@@ -1008,6 +1349,58 @@ mod tests {
         left.release();
         right.release();
         assert_eq!(concurrent_pool.metrics(), idle);
+
+        // Real-checkpoint packed prefill (ragged suffixes) followed by uniform decode.
+        let mut packed_config = model.kv_pool_config(tokens.len() + 2)?;
+        packed_config.max_rows = 3;
+        packed_config.num_slots *= 3;
+        let packed_pool = NaiveKVPool::new(packed_config, &policy).await?;
+        let packed_idle = packed_pool.metrics();
+        let mut contexts = [
+            KVContext::new(packed_pool.clone())?,
+            KVContext::new(packed_pool.clone())?,
+        ];
+        let mut histories = [tokens.clone(), tokens[..split].to_vec()];
+        model
+            .step(&tokens[..1], &mut contexts[0], policy.clone(), false)
+            .await?;
+        for _ in 0..2 {
+            let mut inputs: Vec<_> = histories
+                .iter()
+                .zip(&mut contexts)
+                .map(|(token_ids, kv)| ModelInput { token_ids, kv })
+                .collect();
+            let output = model
+                .forward_batch(&mut inputs, policy.clone(), true)
+                .await?;
+            let logits = output.logits.as_ref().unwrap().as_slice();
+            for (index, history) in histories.iter().enumerate() {
+                let mut serial = KVContext::new(packed_pool.clone())?;
+                let expected = model
+                    .step(history, &mut serial, policy.clone(), true)
+                    .await?;
+                assert_eq!(output.token.as_slice()[index] as u32, expected.token);
+                for (&a, b) in logits
+                    [index * model.config.vocab_size..(index + 1) * model.config.vocab_size]
+                    .iter()
+                    .zip(expected.logits.unwrap())
+                {
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 1e-3,
+                        "packed logit differs: {a} vs {b}"
+                    );
+                }
+                assert_eq!(contexts[index].ready_len(), history.len());
+                serial.release();
+            }
+            for (history, &token) in histories.iter_mut().zip(output.token.as_slice()) {
+                history.push(token as u32);
+            }
+        }
+        for context in contexts {
+            context.release();
+        }
+        assert_eq!(packed_pool.metrics(), packed_idle);
 
         let turn_len = expected_ids.len().div_ceil(2);
         let tokenizer = model.tokenizer().clone();

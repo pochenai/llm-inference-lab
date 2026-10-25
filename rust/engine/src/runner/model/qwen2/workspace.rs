@@ -40,6 +40,7 @@ pub(super) struct Buffers {
 
 struct Workspace {
     rows: usize,
+    batch_size: usize,
     floats: Arc<Tensor<f32>>,
     integers: Arc<Tensor<i32>>,
 }
@@ -119,6 +120,7 @@ impl WorkspacePool {
     pub(super) unsafe fn acquire(
         self: &Arc<Self>,
         rows: usize,
+        batch_size: usize,
         config: &Qwen2Config,
         exec: &ExecutionContext,
     ) -> Result<Buffers, ModelError> {
@@ -127,14 +129,15 @@ impl WorkspacePool {
         let i = config.intermediate_size;
         let vocab = config.vocab_size;
         let blocks = vocab.div_ceil(256);
-        let (floats, integers) = element_counts(rows, config)?;
+        let (floats, integers) = element_counts(rows, batch_size, config)?;
         let required = (floats + integers) * 4;
         let cached = {
             let mut state = self.state.lock().unwrap();
-            let index = state
-                .idle
-                .iter()
-                .position(|w| w.rows == rows && w.floats.device_id() == exec.get_device_id());
+            let index = state.idle.iter().position(|w| {
+                w.rows == rows
+                    && w.batch_size == batch_size
+                    && w.floats.device_id() == exec.get_device_id()
+            });
             let cached = match index {
                 Some(index) => {
                     let workspace = state.idle.swap_remove(index);
@@ -171,6 +174,7 @@ impl WorkspacePool {
                     // SAFETY: producers overwrite every valid f32/i32 element before use.
                     Ok(Workspace {
                         rows,
+                        batch_size,
                         floats: Arc::new(
                             Tensor::<f32>::uninitialized(floats)
                                 .execute(exec)?
@@ -199,7 +203,7 @@ impl WorkspacePool {
                 }
             }
         };
-        tracing::debug!(target: "engine::qwen2", event = "workspace_checkout", rows,
+        tracing::debug!(target: "engine::qwen2", event = "workspace_checkout", rows, batch_size,
             scratch_bytes = required, cache_hit);
         let lease = Arc::new(WorkspaceLease {
             workspace: Some(workspace),
@@ -223,11 +227,26 @@ impl WorkspacePool {
             gate: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
             up: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
             activated: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
-            final_norm: handle(&lease, &workspace.floats, &mut offset, &[1, h]),
-            logits: handle(&lease, &workspace.floats, &mut offset, &[1, vocab]),
-            maxima: handle(&lease, &workspace.floats, &mut offset, &[blocks]),
-            indices: handle(&lease, &workspace.integers, &mut integer_offset, &[blocks]),
-            winner: handle(&lease, &workspace.integers, &mut integer_offset, &[1]),
+            final_norm: handle(&lease, &workspace.floats, &mut offset, &[batch_size, h]),
+            logits: handle(&lease, &workspace.floats, &mut offset, &[batch_size, vocab]),
+            maxima: handle(
+                &lease,
+                &workspace.floats,
+                &mut offset,
+                &[batch_size, blocks],
+            ),
+            indices: handle(
+                &lease,
+                &workspace.integers,
+                &mut integer_offset,
+                &[batch_size, blocks],
+            ),
+            winner: handle(
+                &lease,
+                &workspace.integers,
+                &mut integer_offset,
+                &[batch_size],
+            ),
         };
         debug_assert_eq!(offset, floats);
         debug_assert_eq!(integer_offset, integers);
@@ -235,20 +254,30 @@ impl WorkspacePool {
     }
 }
 
-/// Linear in suffix length, independent of decoder depth. Count the two backing
-/// allocations exactly, including last-row logits and both argmax stages.
-fn element_counts(rows: usize, config: &Qwen2Config) -> Result<(usize, usize), ModelError> {
+/// Linear in packed suffix length; logits/argmax storage also scales with batch size.
+/// Decoder depth does not affect scratch capacity.
+fn element_counts(
+    rows: usize,
+    batch_size: usize,
+    config: &Qwen2Config,
+) -> Result<(usize, usize), ModelError> {
     let per_row =
         6 * config.hidden_size + 3 * config.num_key_value_heads * 64 + 3 * config.intermediate_size;
     let blocks = config.vocab_size.div_ceil(256);
-    let floats = rows
-        .checked_mul(per_row)
-        .and_then(|n| n.checked_add(config.hidden_size + config.vocab_size + blocks))
+    let invalid = || ModelError::InvalidInput("Qwen workspace shape exceeds tensor limits".into());
+    if batch_size == 0 || rows < batch_size {
+        return Err(invalid());
+    }
+    let floats = batch_size
+        .checked_mul(config.hidden_size + config.vocab_size + blocks)
+        .and_then(|tail| rows.checked_mul(per_row)?.checked_add(tail))
         .filter(|&n| n <= i32::MAX as usize)
-        .ok_or_else(|| {
-            ModelError::InvalidInput("Qwen workspace shape exceeds tensor limits".into())
-        })?;
-    Ok((floats, blocks + 1))
+        .ok_or_else(invalid)?;
+    let integers = batch_size
+        .checked_mul(blocks + 1)
+        .filter(|&n| n <= i32::MAX as usize)
+        .ok_or_else(invalid)?;
+    Ok((floats, integers))
 }
 
 /// Best-effort scratch admission after weights/KV allocation; concurrent external
@@ -443,7 +472,7 @@ mod tests {
             // SAFETY: exclusive checkouts survive outer completion through their handles.
             value(
                 (0..3)
-                    .map(|_| unsafe { pool.acquire(3, &config, exec) })
+                    .map(|_| unsafe { pool.acquire(3, 1, &config, exec) })
                     .collect::<Result<Vec<_>, _>>(),
             )
         })
@@ -477,11 +506,52 @@ mod tests {
     #[test]
     fn scratch_budget_depends_on_suffix_length_not_layer_count() {
         let mut config = config();
-        let (floats, integers) = element_counts(4096, &config).unwrap();
+        let (floats, integers) = element_counts(4096, 1, &config).unwrap();
         assert_eq!((floats + integers) * 4, 334063252);
         config.num_hidden_layers = 48;
-        assert_eq!(element_counts(4096, &config).unwrap(), (floats, integers));
-        assert!(element_counts(usize::MAX, &config).is_err());
+        assert_eq!(
+            element_counts(4096, 1, &config).unwrap(),
+            (floats, integers)
+        );
+        assert!(element_counts(usize::MAX, 1, &config).is_err());
+        let (packed_floats, packed_ints) = element_counts(4096, 3, &config).unwrap();
+        let tail_bytes =
+            4 * (config.hidden_size + config.vocab_size + 2 * config.vocab_size.div_ceil(256) + 1);
+        assert_eq!(
+            (packed_floats + packed_ints - floats - integers) * 4,
+            2 * tail_bytes
+        );
+        assert!(element_counts(1, 2, &config).is_err());
+        assert!(element_counts(1, 0, &config).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_cache_distinguishes_batch_size_with_equal_token_count(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let config = config();
+        let pool = Arc::new(WorkspacePool::default());
+        let mut pointers = Vec::new();
+        for batch_size in [1, 3, 1, 3] {
+            let buffers = with_context(|exec| {
+                // SAFETY: exclusive handles keep the workspace alive through outer completion.
+                value(unsafe { pool.acquire(3, batch_size, &config, exec) })
+            })
+            .schedule(&policy)?
+            .await??;
+            assert_eq!(
+                buffers.logits.shape(),
+                [batch_size as i32, config.vocab_size as i32]
+            );
+            pointers.push(buffers.x.device_pointer().cu_deviceptr());
+            drop(buffers);
+        }
+        assert_ne!(pointers[0], pointers[1]);
+        assert_eq!(pointers[0], pointers[2]);
+        assert_eq!(pointers[1], pointers[3]);
+        assert_eq!(pool.metrics().in_use_bytes, 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -497,8 +567,8 @@ mod tests {
                 // Oversized scratch is rejected without attempting an allocation.
                 assert!(unsafe { check_available(usize::MAX, exec) }.is_err());
                 // SAFETY: all handles/allocations remain leased through outer completion.
-                let a = unsafe { pool.acquire(3, &config, exec)? };
-                let b = unsafe { pool.acquire(3, &config, exec)? };
+                let a = unsafe { pool.acquire(3, 1, &config, exec)? };
+                let b = unsafe { pool.acquire(3, 1, &config, exec)? };
                 assert_ne!(
                     a.x.device_pointer().cu_deviceptr(),
                     b.x.device_pointer().cu_deviceptr()
@@ -520,8 +590,8 @@ mod tests {
             value(unsafe {
                 (|| -> Result<_, ModelError> {
                     Ok((
-                        pool.acquire(3, &config, exec)?,
-                        pool.acquire(3, &config, exec)?,
+                        pool.acquire(3, 1, &config, exec)?,
+                        pool.acquire(3, 1, &config, exec)?,
                     ))
                 })()
             })
@@ -537,7 +607,7 @@ mod tests {
         // A failure after checkout must return the lease only after cleanup completes.
         let failed = with_context(|exec| {
             value((|| -> Result<(), ModelError> {
-                let buffers = unsafe { pool.acquire(3, &config, exec)? };
+                let buffers = unsafe { pool.acquire(3, 1, &config, exec)? };
                 drop(buffers);
                 assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
                 Err(ModelError::Execution("injected failure".into()))

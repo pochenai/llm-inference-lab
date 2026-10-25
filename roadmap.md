@@ -21,12 +21,13 @@ No exporter is installed.
    Evaluate linear-kernel/dtype changes against the FP32 reference. Port CUDA
    Graph to Qwen if host launch overhead is material; replay currently supports
    SimpleMLP only.
-3. Add packed Qwen batches: `next_tokens` accepts a batch but currently awaits
-   each request separately. Start with uniform decode, then ragged prefill;
-   compare outputs, memory and batch throughput.
-4. Build minimal continuous batching on that executor. Add chunked-prefill
+3. Build minimal continuous batching on that executor. Add chunked-prefill
    scheduling when mixed long/short arrivals demonstrate decode interference.
    Radix prefix caching and quantization remain subsequent experiments.
+
+Packed Qwen GPU execution is implemented: ragged suffixes, different cached
+prefix lengths, batched decode and per-request validation share one forward.
+The next experiment profiles this path at batch size 1 and larger batches.
 
 Units are numbered by the current implementation sequence: W5 covers the completed
 Qwen baseline, followed by performance work, scheduling, prefix reuse and quantization.
@@ -89,7 +90,7 @@ prerequisite week.
 | W3 | KVPool/KVContext + KV-cache indirection; attention and KV-write kernels | Session continuation, cache addressing, typed views, fused writes, release |
 | W4 | CUDA Graph and reusable execution buffers (SimpleMLP implemented) | Pooled exact-shape replay, dynamic inputs, mapped output; Qwen replay pending |
 | W5 | Qwen2.5-0.5B-Instruct baseline — Done | Reference logits/tokens, sessions/streaming, scratch reuse, metrics and benchmark |
-| W6 | Continuous batching and chunked-prefill scheduling | Add packed Qwen execution on the existing Runner token-step lifecycle; arrivals/completions, budgets and cancellation |
+| W6 | Continuous batching and chunked-prefill scheduling | Use packed Qwen execution and the existing Runner token-step lifecycle; arrivals/completions, budgets and cancellation |
 | W7 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
 | W8 | One quantization path on Qwen | FP32 reference, quality/error, memory/traffic and latency |
 | W9 | Speculative decoding | Original plan retained |
@@ -101,7 +102,7 @@ prerequisite week.
 
 Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
 Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
-Qwen uses eager execution and serial batch items. Chunked appends are numerically
+Qwen uses eager execution with packed ragged GPU batches. Chunked appends are numerically
 validated; interleaved chunked-prefill scheduling, continuous batching and radix
 prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
 commands and metric contracts.
@@ -261,8 +262,8 @@ checkpoint uses the shared CausalModel/Runner path. Reusable scratch removes
 per-layer temporary accumulation and redundant zero fills. Scheduler observers
 report request/first-text timing and actual generated tokens; model counters and
 histograms and pool gauges handle concurrent observations without attributing
-shared totals to one batch. Qwen graph replay, packed GPU batches, prefix sharing
-and quantized execution remain open.
+shared totals to one batch. Packed GPU batches support ragged prefill and decode;
+Qwen graph replay, prefix sharing and quantized execution remain open.
 
 **Focus**
 
@@ -282,26 +283,27 @@ and quantized execution remain open.
 - [x] Load the real checkpoint and compare final logits/greedy token IDs with an independent Transformers FP32 reference.
 - [x] Full/chunked prefill logits, cached decode, reference token IDs, session continuation and KV release are validated.
 - [x] Qwen-only benchmark covers fresh-KV warmup/samples, prefill/decode timings, scratch ownership and CUDA-pool peaks; no serving throughput claim is implied.
+
 **Follow-up work (outside W5 acceptance)**
 
-- Profile warmed prefill/decode, optimize the dominant measured path, then add
-  packed GPU batches starting with uniform decode. Validate each change against
-  the existing reference and report latency, throughput and workspace usage.
+- Profile the packed GPU path for warmed short/long prefill and decode, at batch
+  size 1 and larger batches. Optimize the dominant measured path and validate
+  against the reference; report latency, throughput and workspace usage.
 - Port CUDA Graph if host submission overhead warrants it; schedule changing
-  request membership in W6 after the packed executor works.
-
+  request membership in W6 using the packed executor.
 - Add selected intermediate-tensor checks when changing numerical kernels.
-- Validate graph replay, packed batching and prefix reuse as each feature is added; evaluate quantized quality/performance in W8.
+- Validate graph replay and prefix reuse as each feature is added; evaluate quantized quality/performance in W8.
 
 #### W6: step-level generation, continuous batching, and chunked prefill
 
 Status: planned on top of the existing Runner generation/lifecycle baseline.
-Implement packed Qwen execution before changing active batch membership. Correct chunked KV appends do not yet establish an
-interleaved chunked-prefill scheduler.
+Packed Qwen execution is implemented; changing active batch membership remains
+open. Correct chunked KV appends do not yet establish an interleaved chunked-prefill
+scheduler.
 
 **Focus**
 
-- Add packed Qwen execution using `CausalModel::next_tokens` and Runner greedy/EOS/length handling; keep per-request error isolation and stream completion.
+- Reuse packed Qwen execution through `CausalModel::next_tokens` and Runner greedy/EOS/length handling; keep per-request error isolation and stream completion.
 - Move from batching whole requests to scheduling model steps: waiting/running requests, token budgets, arrivals, completions, cancellation, and local KV admission.
 - Interleave chunked prefill with decode. Maintain the invariant between accepted tokens, computed KV, and any last generated token whose KV is not computed yet.
 - Keep Runner lifecycle independent from the ingress Scheduler. Place execution-batch decisions where local KV/workspace capacity is known.
@@ -315,7 +317,8 @@ interleaved chunked-prefill scheduler.
 **Acceptance**
 
 - [x] Runner token stepping, EOS/length stopping, session continuation, streaming and independent request completion are covered by regressions.
-- [ ] Packed and serial Qwen execution produce the same deterministic token sequences; continuously batched execution then agrees with that baseline.
+- [x] Packed and serial Qwen execution agree for ragged prefill, different cached-prefix lengths and decode.
+- [ ] Continuously batched execution agrees with the packed baseline.
 - [ ] A new request can join while existing requests decode; finished/cancelled requests release resources without disturbing peers.
 - [ ] Compare at least two prefill budgets on the same mixed long/short workload; report request/first-text latency, per-step latency and throughput. Add an explicit Runner-start event before claiming exact queue time.
 - [ ] CUDA Graph bucket selection and dynamic metadata remain correct when batch membership changes.

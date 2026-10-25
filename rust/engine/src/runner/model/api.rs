@@ -74,6 +74,7 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
     }
 
     /// Compute one next token per input in order, including per-input validation/GPU errors.
+    /// Valid inputs in a packed forward must use one compatible KV pool.
     /// Reject pending contexts, empty suffixes, invalid IDs, and exceeded capacity.
     /// Success commits KV for the full input history before returning its next token.
     fn next_tokens(

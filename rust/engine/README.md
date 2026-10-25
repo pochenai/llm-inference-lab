@@ -293,13 +293,20 @@ The Qwen example submits through Scheduler -> Runner; optional reference mode st
 reads diagnostic logits directly. Exact generated IDs and multi-turn Runner continuation
 are checked by the real-checkpoint regression. The CLI response contains text and request_id.
 
-Qwen currently serializes batch items through its existing one-context attention kernel;
-SimpleMLP retains packed GPU batches and CUDA Graph replay. Shared KV interfaces are unchanged.
+Qwen packs uncached token suffixes into one GPU forward, supporting ragged prefill,
+different cached-prefix lengths and batched decode. Linear/FFN and GQA process all
+packed rows; RoPE/attention share per-token context/position metadata uploaded once
+per forward. KV writes retain each context's pending-only store contract. Final
+RMSNorm gathers each request's last packed row, then LM-head/argmax produce one
+token per request in a single D2H readback. Invalid inputs are filtered before
+submission; valid peers stay in one batch and results retain the original order.
+Append batches require one KV pool. SimpleMLP retains CUDA Graph replay; Qwen is
+eager. Shared model/KV interfaces are unchanged.
 Token/logit readbacks enqueue asynchronous D2H into reusable pinned buffers and become
 readable only after outer completion. Dropping an in-flight model step may require
 context release; retained GPU leases prevent premature storage reuse.
-Qwen uses eager execution with an exclusive, exact-suffix-shape workspace per
-forward. Two backing allocations hold disjoint float/integer regions; all decoder
+Qwen uses an exclusive workspace keyed by packed token count, batch size and
+device for each eager forward. Two backing allocations hold disjoint float/integer regions; all decoder
 layers reuse them in stream order. Every output is fully overwritten, so scratch
 needs no zero-fill kernel. The lease survives submission failure, cancellation,
 and escaped tensor handles; concurrent forwards receive different workspaces.
@@ -309,7 +316,7 @@ size against device free memory plus unused execution-pool reservations after
 weights/KV allocation. This snapshot cannot reserve memory against other callers;
 allocation errors still propagate as per-request failures.
 For Qwen2.5-0.5B, scratch bytes are
-`4 * (suffix_tokens * 20352 + 154021)`: about 3.07 MiB for 32 tokens and
+`4 * (packed_suffix_tokens * 20352 + batch_size * 154021)`: for batch size 1, about 3.07 MiB for 32 tokens and
 318.59 MiB for 4096 tokens, independent of the decoder layer count. These figures
 exclude weights, KV, input uploads, pinned readbacks, and other idle/in-flight
 workspaces. Qwen CUDA Graph capture remains subsequent work.
@@ -344,17 +351,20 @@ recorder to check actual counters, gauge transitions and histogram observations.
 Qwen execution totals are maintained only by Counter/Histogram handles. There is
 no `Qwen2Metrics` accumulator or per-engine last-step timing: simultaneous batches
 share those instruments, and their overlapping durations must not be interpreted
-as elapsed wall time for an individual batch. Prefill means empty KV or a multi-token
-suffix; decode means one token with existing KV. Durations cover CPU preparation,
-submission, GPU/D2H completion and host result handling, excluding Scheduler work.
-`step_wall_seconds` spans the entire model step through GPU/D2H completion,
-KV commit and CPU output access. `host_submit_seconds` is returned in the private
+as elapsed wall time for an individual batch. Each completed packed forward adds
+one step and one duration observation, with input-token counts summed across its
+requests. Decode means every input adds one token to existing KV; a mixed batch
+is labelled prefill if any input has empty KV or a multi-token suffix.
+`step_wall_seconds` spans CPU preparation/submission, GPU/D2H completion and KV
+commit, excluding Scheduler work and the caller's later CPU output access.
+`host_submit_seconds` is returned in the private
 `StepOutput` for that invocation: host wall time inside submit, including scratch,
 input uploads, JIT and CUDA calls, without awaiting GPU completion. It excludes
 KV mapping preparation and later host output access. GPU execution can overlap
 host submission, so subtracting them does not yield pure GPU kernel time. Failed
-steps increment the failure counter and have no successful submission-duration
-sample; tracing leaves that duration unavailable. Cold JIT,
+submitted forwards increment the failure counter and have no successful duration
+sample; rejected inputs do not produce a GPU-step observation. Failed-step
+tracing leaves that duration unavailable. Cold JIT,
 warmup and diagnostic observations are included; cancelled futures do not emit
 completed-step observations.
 

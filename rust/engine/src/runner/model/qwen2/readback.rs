@@ -9,6 +9,8 @@ use cutile::{
     tensor::Tensor,
 };
 
+const MAX_CACHED_READBACKS: usize = 4;
+
 pub(super) type Readback<T> = Arc<PinnedHostBuffer<T>>;
 pub(super) type ReadbackCache<T> = Mutex<Vec<Readback<T>>>;
 
@@ -24,6 +26,7 @@ pub(super) unsafe fn enqueue_readback<T: DeviceCopy + DType>(
     let source = tensor.borrow().device_pointer().cu_deviceptr();
     let output = {
         let mut idle = cache.lock().unwrap();
+        // Reuse only a matching length/device with exclusive cache ownership; GPU/CPU users prevent reuse.
         if let Some(buffer) = idle.iter_mut().find_map(|entry| {
             let buffer = Arc::get_mut(entry)?;
             (buffer.len() == count && buffer.context().ordinal() == exec.get_device_id())
@@ -35,10 +38,16 @@ pub(super) unsafe fn enqueue_readback<T: DeviceCopy + DType>(
                 &CudaContext::new(exec.get_device_id())?,
                 count,
             )?);
-            // Keep only a small cache; overflow buffers live through their GPU owners.
-            if idle.len() < 4 {
+            // This limit counts cached entries, including idle buffers, not active users.
+            if idle.len() < MAX_CACHED_READBACKS {
+                // cache it
                 idle.push(buffer.clone());
+            } else if let Some(entry) = idle.iter_mut().find(|entry| Arc::strong_count(entry) == 1)
+            {
+                // only cache hold it, which means it's not in use.
+                *entry = buffer.clone();
             }
+            // If every entry still has a GPU/CPU user, use this buffer without caching it.
             buffer
         }
     };
@@ -61,6 +70,75 @@ mod tests {
         device_operation::{value, with_context, DeviceOp},
     };
     use cutile::api;
+
+    #[tokio::test]
+    async fn full_cache_replaces_idle_shapes_and_keeps_live_readers() -> Result<(), DeviceError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let cache = ReadbackCache::default();
+        let new_count = MAX_CACHED_READBACKS * 2;
+        let mut previous = None;
+        for count in (1..=MAX_CACHED_READBACKS).chain([new_count, new_count]) {
+            let output = with_context(|exec| {
+                value((|| -> Result<_, DeviceError> {
+                    // SAFETY: upload and D2H share exec; host reads follow completion.
+                    unsafe {
+                        let tensor =
+                            api::copy_host_vec_to_device(&Arc::new(vec![count as i32; count]))
+                                .execute(exec)?;
+                        enqueue_readback(tensor, &cache, exec)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            assert_eq!(output.as_slice(), vec![count as i32; count]);
+            if count == new_count {
+                let entries = cache.lock().unwrap();
+                assert_eq!(entries.len(), MAX_CACHED_READBACKS);
+                assert!(
+                    entries.iter().any(|entry| Arc::ptr_eq(entry, &output)),
+                    "a new length must enter the full cache"
+                );
+                let pointer = output.as_ptr();
+                if let Some(previous) = previous {
+                    assert_eq!(pointer, previous);
+                }
+                previous = Some(pointer);
+            }
+        }
+        // Keep every cached buffer borrowed by a CPU reader while another copy runs.
+        let readers = cache.lock().unwrap().clone();
+        let overflow = with_context(|exec| {
+            value((|| -> Result<_, DeviceError> {
+                // SAFETY: exec owns the copy; existing readers must remain untouched.
+                unsafe {
+                    let tensor =
+                        api::copy_host_vec_to_device(&Arc::new(vec![99i32; new_count + 1]))
+                            .execute(exec)?;
+                    let output = enqueue_readback(tensor, &cache, exec)?;
+                    let entries = cache.lock().unwrap();
+                    assert_eq!(entries.len(), MAX_CACHED_READBACKS);
+                    assert!(readers
+                        .iter()
+                        .zip(entries.iter())
+                        .all(|(a, b)| Arc::ptr_eq(a, b)));
+                    assert!(!entries.iter().any(|entry| Arc::ptr_eq(entry, &output)));
+                    Ok(output)
+                }
+            })())
+        })
+        .schedule(&policy)?
+        .await??;
+        assert_eq!(overflow.as_slice(), vec![99; new_count + 1]);
+        for reader in &readers {
+            assert!(reader
+                .as_slice()
+                .iter()
+                .all(|&value| value == reader.len() as i32));
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn pinned_readback_waits_for_completion_and_consumer_before_reuse(

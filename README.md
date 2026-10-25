@@ -8,8 +8,8 @@ See the detailed [learning roadmap](roadmap.md) for goals, references, experimen
 
 The Rust/cuTile engine now runs Qwen2.5-0.5B-Instruct through Scheduler/Runner,
 with streaming greedy generation, sessions, reusable scratch and metrics.
-Next: profile Qwen, optimize the measured bottleneck, then support packed GPU
-batches before continuous batching, prefix reuse and quantization.
+Packed GPU batches now support ragged prefill and decode. Next: profile Qwen and
+optimize the measured bottleneck before continuous batching, prefix reuse and quantization.
 Profiling and numerical/lifecycle checks accompany every phase. Week labels are
 learning units; speculative decoding and the later plan remain unchanged.
 
@@ -34,7 +34,7 @@ learning units; speculative decoding and the later plan remain unchanged.
 ## Current baseline and next experiment
 
 - Unified `CausalModel::next_tokens`; Runner owns greedy generation, EOS/budgets,
-  sessions and streamed text. Qwen currently executes batch items sequentially.
+  sessions and streamed text. Qwen executes ragged suffixes in one packed GPU forward.
 - Independent reference logits/tokens and full/chunked KV checks; exclusive
   per-forward scratch is reused across decoder layers without zero fills.
 - Scheduler observer plugins and `metrics` counters/gauges/histograms; optional
@@ -44,8 +44,7 @@ learning units; speculative decoding and the later plan remain unchanged.
   See the [engine guide](rust/engine/README.md) for runnable commands.
 
 Next, profile warmed short/long prefill and decode to choose between attention,
-linear/dtype improvements and Qwen CUDA Graph. Follow with packed Qwen execution,
-starting with uniform decode. Continuous batching and chunked-prefill scheduling
+linear/dtype improvements and Qwen CUDA Graph. Continuous batching and chunked-prefill scheduling
 then build on a working batch executor; radix caching and quantization follow.
 Existing chunked-KV correctness checks do not imply chunked-prefill scheduling.
 

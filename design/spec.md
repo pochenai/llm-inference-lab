@@ -440,10 +440,14 @@ Submission only enqueues the copies; the outer Future awaits successful completi
 commits KV, and then exposes host values. Cancellation retains in-flight resources;
 neither stack destinations nor explicit stream synchronization are used for readback.
 No common KV API changes are required. Its eager cuTile kernels provide the real
-model correctness baseline. Qwen batch items currently execute serially through
-its one-context kernel; packed Qwen attention, continuous batching, and Qwen graph
-capture remain subsequent work. Its eager workspace is exclusive per forward and
-reuses disjoint scratch regions across all decoder layers on the same stream.
+model correctness baseline. Qwen executes ragged suffixes in a single packed
+forward. Per-token context/position metadata is uploaded once and reused across
+layers; final hidden rows and argmax preserve request order. Invalid inputs are
+filtered while valid peers remain batched. Contexts in one append batch must share
+a KV pool. Continuous batching and Qwen graph capture remain subsequent work.
+The eager workspace is keyed by packed token count, batch size and device. Each
+forward owns an exclusive lease and reuses disjoint scratch regions across all
+decoder layers on the same stream.
 Outputs fully overwrite their regions without zero-fill kernels. Scratch allocation
 checks its exact byte budget against available device/pool memory; completion and
 escaped-handle leases prevent early recycling, including on failure/cancellation.
