@@ -405,6 +405,24 @@ exclude other processes and non-pool CUDA allocations; they are not device-wide
 peak VRAM. The default three measured iterations are a diagnostic sample, not a
 statistically robust throughput study.
 
+For Nsight Systems, add `--profile` to start capture after warmup and stop it before
+optional validation. Qwen's synchronous NVTX submit ranges label prefill/decode;
+they do not span the GPU-completion await. Use the optimized executable path
+printed by the benchmark build:
+
+```bash
+nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --event-sample=none --backtrace=none --capture-range=cudaProfilerApi --capture-range-end=stop --output=rust/profiling/qwen2/packed-nsys/trace-b1-t32 BENCH_PATH --model-dir "$QWEN2_MODEL_DIR" --tokens 32 --batch-size 1 --decode-steps 8 --warmup 3 --iterations 3 --profile
+```
+
+The local [packed Qwen profiling report](../profiling/qwen2/packed-nsys/RESULTS.md)
+keeps unprofiled wall times separate from correlated kernel/API measurements.
+The first attention optimization gathers 32 logical KV slots per iteration and
+uses occupancy target 2, preserving the existing KV layout and lifecycle. This is
+a compute tile, not a cache allocation page. The local
+[attention optimization report](../profiling/qwen2/attention-tiling/RESULTS.md)
+compares release runs and hardware counters. Prefill linear tiling and split-KV
+decode remain candidates; Qwen CUDA Graph is a later submission-cost experiment.
+
 The example supplies the explicit two-message Qwen2 chat template and uses pure
 greedy decoding (no repetition penalty or stochastic sampling).
 

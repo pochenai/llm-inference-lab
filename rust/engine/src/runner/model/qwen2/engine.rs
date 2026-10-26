@@ -63,6 +63,8 @@ use serde::Deserialize;
 use std::{ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
+const KV_TOKENS_PER_TILE: i32 = 32;
+
 type Weight = Arc<Tensor<f32>>;
 
 /// One invocation's outputs: GPU readbacks before outer completion, CPU values after it.
@@ -429,6 +431,16 @@ impl Qwen2Engine {
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
         let submit_started = Instant::now();
+        // Thread-local NVTX range covers synchronous submission only, never the await.
+        let _range = crate::profiling::ScopedRange::new(
+            if batch.iter().any(|input| {
+                input.kv.ready_len() == 0 || input.token_ids.len() - input.kv.ready_len() > 1
+            }) {
+                c"qwen2.prefill.submit"
+            } else {
+                c"qwen2.decode.submit"
+            },
+        );
         let mut rows = 0usize;
         let query_ranges: Vec<_> = batch
             .iter()
@@ -759,6 +771,7 @@ impl GqaAttention {
             self.q_heads as i32,
             self.kv_heads as i32,
         )
+        .generics(vec![KV_TOKENS_PER_TILE.to_string()])
         .execute(exec)?;
         Ok(())
     }
@@ -987,6 +1000,175 @@ mod tests {
         })
         .schedule(policy)?
         .await?
+    }
+
+    #[tokio::test]
+    async fn gqa_matches_cpu_across_kv_block_boundaries_and_fragmented_slots(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let pool = NaiveKVPool::new(
+            NaiveKVPoolConfig {
+                num_layers: 1,
+                num_slots: 320,
+                max_rows: 2,
+                max_seq_len: 160,
+                head_dim: 128,
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let attention = GqaAttention {
+            q_heads: 4,
+            kv_heads: 2,
+            metadata_uploads: Arc::default(),
+        };
+        let readbacks = ReadbackCache::default();
+        let queries = Arc::new(
+            (0..5 * 256)
+                .map(|i| ((i * 13 % 89) as f32 - 44.0) * 0.01)
+                .collect::<Vec<_>>(),
+        );
+        let query_ranges = [0..3, 3..5];
+        let history_starts = [5, 3];
+        for length in [31, 32, 33, 63, 64, 65, 127, 129] {
+            let lengths = [length, length + 5];
+            let keys: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .map(|(r, &len)| {
+                    Arc::new(
+                        (0..len * 128)
+                            .map(|i| ((i * 7 + r * 11) % 97) as f32 * 0.003 - 0.144)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let values: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .map(|(r, &len)| {
+                    Arc::new(
+                        (0..len * 128)
+                            .map(|i| ((i * 17 + r * 29) % 103) as f32 * 0.01 - 0.51)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let mut contexts = [KVContext::new(pool.clone())?, KVContext::new(pool.clone())?];
+            // Reserve A's first seven slots before B, so its later append is fragmented.
+            with_context(|exec| {
+                value((|| -> Result<(), ModelError> {
+                    unsafe {
+                        let k = api::copy_host_vec_to_device(&keys[0])
+                            .execute(exec)?
+                            .reshape(&[length, 128])?;
+                        let v = api::copy_host_vec_to_device(&values[0])
+                            .execute(exec)?
+                            .reshape(&[length, 128])?;
+                        contexts[0].prepare_append(7, exec)?;
+                        contexts[0].store(0, k.slice(&[0..7])?, v.slice(&[0..7])?, exec)?;
+                    }
+                    Ok(())
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            contexts[0].commit_append()?;
+            let output = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    // Reserve B first; A's continuation cannot be contiguous with its prefix.
+                    contexts[1].prepare_append(lengths[1], exec)?;
+                    contexts[0].prepare_append(lengths[0] - 7, exec)?;
+                    for (r, context) in contexts.iter_mut().enumerate() {
+                        unsafe {
+                            let k = api::copy_host_vec_to_device(&keys[r])
+                                .execute(exec)?
+                                .reshape(&[lengths[r], 128])?;
+                            let v = api::copy_host_vec_to_device(&values[r])
+                                .execute(exec)?
+                                .reshape(&[lengths[r], 128])?;
+                            let positions = context.pending_range().unwrap();
+                            context.store(
+                                0,
+                                k.slice(&[positions.clone()])?,
+                                v.slice(&[positions])?,
+                                exec,
+                            )?;
+                        }
+                    }
+                    let views = contexts
+                        .iter()
+                        .enumerate()
+                        .map(|(r, context)| {
+                            pool.read_view(context.state(), 0, history_starts[r]..lengths[r])
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // SAFETY: all producers/readers and D2H share exec, with leases retained.
+                    unsafe {
+                        let q = Arc::new(
+                            api::copy_host_vec_to_device(&queries)
+                                .execute(exec)?
+                                .reshape(&[5, 256])?,
+                        );
+                        let out = attention.forward(q, &views, &query_ranges, exec)?;
+                        Ok(enqueue_readback(out, &readbacks, exec)?)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            for context in &mut contexts {
+                context.commit_append()?;
+            }
+            for (r, range) in query_ranges.iter().enumerate() {
+                for (local, packed_row) in range.clone().enumerate() {
+                    let position = lengths[r] - range.len() + local;
+                    for head in 0..4 {
+                        let kv_head = head / 2;
+                        let mut scores: Vec<f64> = (history_starts[r]..=position)
+                            .map(|pos| {
+                                (0..64)
+                                    .map(|d| {
+                                        f64::from(queries[packed_row * 256 + head * 64 + d])
+                                            * f64::from(keys[r][pos * 128 + kv_head * 64 + d])
+                                    })
+                                    .sum::<f64>()
+                                    * 0.125
+                            })
+                            .collect();
+                        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        for score in &mut scores {
+                            *score = (*score - maximum).exp();
+                        }
+                        let denominator: f64 = scores.iter().sum();
+                        for d in 0..64 {
+                            let expected: f64 = scores
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &weight)| {
+                                    weight
+                                        * f64::from(
+                                            values[r]
+                                                [(history_starts[r] + i) * 128 + kv_head * 64 + d],
+                                        )
+                                })
+                                .sum::<f64>()
+                                / denominator;
+                            let actual = output.as_slice()[packed_row * 256 + head * 64 + d];
+                            assert!((f64::from(actual) - expected).abs() < 2e-5,
+                                "length={length}, request={r}, row={packed_row}, head={head}, dim={d}: {actual} vs {expected}");
+                        }
+                    }
+                }
+            }
+            for context in contexts {
+                context.release();
+            }
+            assert_eq!(pool.metrics(), initial);
+        }
+        Ok(())
     }
 
     #[tokio::test]

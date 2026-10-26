@@ -9,7 +9,7 @@ use cutile::{
     tensor::Tensor,
 };
 
-const MAX_CACHED_READBACKS: usize = 4;
+const MAX_CACHED_READBACKS: usize = 16;
 
 pub(super) type Readback<T> = Arc<PinnedHostBuffer<T>>;
 pub(super) type ReadbackCache<T> = Mutex<Vec<Readback<T>>>;

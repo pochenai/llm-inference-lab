@@ -6,6 +6,11 @@
 //! mkdir -p rust/profiling/qwen2
 //! cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2 -- --model-dir MODEL_DIR --tokens 4096 --decode-steps 8 --warmup 1 --iterations 3 --validate-chunked > rust/profiling/qwen2/4096.jsonl
 //! ```
+//! Add --profile under nsys --capture-range=cudaProfilerApi to capture measured
+//! iterations only. Use the executable path printed by the --no-run command:
+//! ```bash
+//! nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --event-sample=none --backtrace=none --capture-range=cudaProfilerApi --capture-range-end=stop --output=rust/profiling/qwen2/packed-b1-t32 BENCH_PATH --model-dir MODEL_DIR --tokens 32 --batch-size 1 --decode-steps 8 --warmup 3 --iterations 5 --profile
+//! ```
 //! Timings are host wall time through GPU/D2H completion, not CUDA event/kernel time.
 //! --trace-steps adds structured tracing JSON to stderr; omit it for latency sampling.
 
@@ -50,6 +55,9 @@ struct Args {
     chunk_size: NonZeroUsize,
     #[arg(long)]
     trace_steps: bool,
+    /// Start CUDA profiler capture after warmup and stop before diagnostic validation.
+    #[arg(long)]
+    profile: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -66,6 +74,12 @@ async fn main() -> Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let device = Device::new(0)?;
+    // SAFETY: reuse the installed driver's profiler API, as in simple_mlp_attn.
+    let driver = unsafe { libloading::Library::new("libcuda.so.1")? };
+    let profiler_start =
+        unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStart\0")? };
+    let profiler_stop =
+        unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStop\0")? };
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
     let model = Qwen2Engine::load(&args.model_dir, &policy).await?;
@@ -100,6 +114,11 @@ async fn main() -> Result<()> {
     let mut decodes = Vec::with_capacity(args.iterations.get() * args.decode_steps.get());
     for iteration in 0..args.warmup.get() + args.iterations.get() {
         let warmup = iteration < args.warmup.get();
+        if args.profile && iteration == args.warmup.get() {
+            device.bind_to_thread()?;
+            // SAFETY: all warmup GPU work and readbacks have completed.
+            ensure!(unsafe { profiler_start() } == 0, "cuProfilerStart failed");
+        }
         cuda_pool.reset_used_high()?;
         cuda_pool.reset_reserved_high()?;
         let mut contexts = (0..args.batch_size.get())
@@ -165,6 +184,11 @@ async fn main() -> Result<()> {
             prefills.push(step_seconds[0]);
             decodes.extend_from_slice(&step_seconds[1..]);
         }
+    }
+    if args.profile {
+        device.bind_to_thread()?;
+        // SAFETY: every measured forward and readback has completed.
+        ensure!(unsafe { profiler_stop() } == 0, "cuProfilerStop failed");
     }
     let prefill_mean = prefills.iter().sum::<f64>() / prefills.len() as f64;
     let decode_total: f64 = decodes.iter().sum();

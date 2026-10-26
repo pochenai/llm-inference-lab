@@ -12,22 +12,28 @@ model/pool `metrics` instruments cover request timing, execution and memory.
 The standalone Qwen benchmark separates model execution from request latency.
 No exporter is installed.
 
-1. Profile warmed short/long prefill and decode with the existing benchmark and
-   Nsight. Attribute time to host submission, linear kernels, attention and
-   readback; keep JIT/warmup and fresh KV explicit. Existing 32-token/4K samples
-   are diagnostic baselines, not a statistically robust throughput study.
-2. Optimize the dominant measured path. Attention currently scans cached tokens
-   one at a time; investigate tiled attention if it dominates long prefill.
-   Evaluate linear-kernel/dtype changes against the FP32 reference. Port CUDA
-   Graph to Qwen if host launch overhead is material; replay currently supports
-   SimpleMLP only.
+Initial KV-block attention optimization is complete: 32 tokens per compute tile
+and occupancy target 2 preserve the cache/API contracts. The release diagnostic
+comparison reduces B1/4K prefill from 32.86 s to 5.78 s and decode from 45.19 ms to
+17.28 ms/step; the local [attention report](rust/profiling/qwen2/attention-tiling/RESULTS.md)
+includes hardware counters, alternatives, correctness checks and limits.
+
+1. Profile/tile prefill linear execution: it now accounts for about 66% of B1/4K
+   kernel time. Evaluate larger M/N tiles and data reuse against the FP32 reference.
+2. Improve long single-request decode parallelism if that workload is the target:
+   attention still accounts for about 56% of B1/4K kernel time and launches only
+   14 query/head blocks. Investigate split-KV partial softmax reduction separately.
+   Revisit CUDA Graph when host submission becomes material; current replay
+   supports SimpleMLP only.
 3. Build minimal continuous batching on that executor. Add chunked-prefill
    scheduling when mixed long/short arrivals demonstrate decode interference.
    Radix prefix caching and quantization remain subsequent experiments.
 
 Packed Qwen GPU execution is implemented: ragged suffixes, different cached
 prefix lengths, batched decode and per-request validation share one forward.
-The next experiment profiles this path at batch size 1 and larger batches.
+Release profiling at batch sizes 1 and 4 is complete; see the local
+[packed Qwen report](rust/profiling/qwen2/packed-nsys/RESULTS.md) for workloads,
+raw artifacts and reproducible commands.
 
 Units are numbered by the current implementation sequence: W5 covers the completed
 Qwen baseline, followed by performance work, scheduling, prefix reuse and quantization.
@@ -286,9 +292,9 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 
 **Follow-up work (outside W5 acceptance)**
 
-- Profile the packed GPU path for warmed short/long prefill and decode, at batch
-  size 1 and larger batches. Optimize the dominant measured path and validate
-  against the reference; report latency, throughput and workspace usage.
+- [x] Profile the release packed GPU path for short/long prefill and decode at batch sizes 1 and 4; separate wall time, kernel time, host submission and readback.
+- [x] Add KV-block attention, compare block sizes/occupancy targets, and validate ragged/causal/cache behavior against CPU and real-model references.
+- [ ] Improve prefill linear tiling and long-context decode parallelism against the recorded release baseline.
 - Port CUDA Graph if host submission overhead warrants it; schedule changing
   request membership in W6 using the packed executor.
 - Add selected intermediate-tensor checks when changing numerical kernels.

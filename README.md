@@ -8,8 +8,9 @@ See the detailed [learning roadmap](roadmap.md) for goals, references, experimen
 
 The Rust/cuTile engine now runs Qwen2.5-0.5B-Instruct through Scheduler/Runner,
 with streaming greedy generation, sessions, reusable scratch and metrics.
-Packed GPU batches now support ragged prefill and decode. Next: profile Qwen and
-optimize the measured bottleneck before continuous batching, prefix reuse and quantization.
+Packed GPU batches support ragged prefill and decode. Release profiling led to
+KV-block attention with a measured occupancy target. Next: prefill linear tiling
+and long-context decode parallelism, before continuous batching, prefix reuse and quantization.
 Profiling and numerical/lifecycle checks accompany every phase. Week labels are
 learning units; speculative decoding and the later plan remain unchanged.
 
@@ -43,9 +44,13 @@ learning units; speculative decoding and the later plan remain unchanged.
   reports prefill/decode latency, tokens/s, scratch ownership and CUDA-pool peaks.
   See the [engine guide](rust/engine/README.md) for runnable commands.
 
-Next, profile warmed short/long prefill and decode to choose between attention,
-linear/dtype improvements and Qwen CUDA Graph. Continuous batching and chunked-prefill scheduling
-then build on a working batch executor; radix caching and quantization follow.
+The local [packed Qwen baseline](rust/profiling/qwen2/packed-nsys/RESULTS.md) and
+[attention optimization report](rust/profiling/qwen2/attention-tiling/RESULTS.md)
+record short/long prefill and decode at batch sizes 1 and 4. KV-block attention is
+implemented; next investigate prefill linear tiles and split-KV decode before
+revisiting Qwen CUDA Graph submission costs.
+Continuous batching and chunked-prefill scheduling build on the packed executor;
+radix caching and quantization follow.
 Existing chunked-KV correctness checks do not imply chunked-prefill scheduling.
 
 ## Future plans

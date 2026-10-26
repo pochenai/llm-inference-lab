@@ -145,9 +145,11 @@ pub(super) mod ops {
         out.store(result);
     }
 
-    /// Causal GQA reads the shared per-layer flat KV vectors through the slot table.
-    #[cutile::entry()]
-    pub(super) fn attention(
+    /// Gather BK physical KV slots per iteration, then update online softmax by block.
+    /// Mask the final block at each query's causal boundary; slots need not be contiguous.
+    /// Target two resident CTAs per SM on SM120 to reduce register pressure.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn attention<const BK: i32>(
         out: &mut Tensor<f32, { [1, 64] }>,
         q: &Tensor<f32, { [-1, -1] }>,
         k: &Tensor<f32, { [-1, -1] }>,
@@ -178,26 +180,88 @@ pub(super) mod ops {
         );
         let head = pid.1 / (qheads / kvheads);
         let query = q.partition(shape![1, 64]).load([pid.0, pid.1]);
+        let query: Tile<f32, { [BK, 64] }> = query.broadcast(shape![BK, 64]);
         let mut maximum: Tile<f32, { [1, 1] }> = constant(f32::NEG_INFINITY, shape![1, 1]);
         let mut denominator: Tile<f32, { [1, 1] }> = constant(0.0f32, shape![1, 1]);
         let mut acc: Tile<f32, { [1, 64] }> = constant(0.0f32, shape![1, 64]);
-        for pos in history_start..(position + 1) {
-            let slot: i32 = tile_to_scalar(
-                table
-                    .partition(shape![1, 1])
-                    .load([row, pos])
-                    .reshape(shape![]),
+        let zero_values: Tile<f32, { [BK, 64] }> = constant(0.0f32, shape![BK, 64]);
+        let scale: Tile<f32, { [BK] }> = constant(0.125f32, shape![BK]);
+        let negative_infinity: Tile<f32, { [BK] }> = constant(f32::NEG_INFINITY, shape![BK]);
+        let local: Tile<i32, { [BK] }> = iota(shape![BK]);
+        let columns: Tile<i32, { [64] }> = iota(shape![64]);
+        let columns: Tile<i32, { [1, 64] }> = columns.reshape(shape![1, 64]);
+        let columns: Tile<i32, { [BK, 64] }> = columns.broadcast(shape![BK, 64]);
+        let table_base: PointerTile<*const i32, { [] }> = pointer_to_tile(table.as_ptr());
+        let table_base: PointerTile<*const i32, { [] }> = table_base.offset(row * table.shape()[1]);
+        let table_base: PointerTile<*const i32, { [1] }> = table_base.reshape(shape![1]);
+        let table_base: PointerTile<*const i32, { [BK] }> = table_base.broadcast(shape![BK]);
+        let kp: PointerTile<*const f32, { [] }> = pointer_to_tile(k.as_ptr());
+        let kp: PointerTile<*const f32, { [1, 1] }> = kp.reshape(shape![1, 1]);
+        let kp: PointerTile<*const f32, { [BK, 64] }> = kp.broadcast(shape![BK, 64]);
+        let vp: PointerTile<*const f32, { [] }> = pointer_to_tile(v.as_ptr());
+        let vp: PointerTile<*const f32, { [1, 1] }> = vp.reshape(shape![1, 1]);
+        let vp: PointerTile<*const f32, { [BK, 64] }> = vp.broadcast(shape![BK, 64]);
+        for block in 0i32..((position - history_start + BK) / BK) {
+            let positions = local + (history_start + block * BK).broadcast(shape![BK]);
+            let valid = lt_tile(positions, (position + 1).broadcast(shape![BK]));
+            // Read only mapped, visible positions; masked lanes never dereference a slot.
+            let table_ptrs: PointerTile<*const i32, { [BK] }> = table_base.offset_tile(positions);
+            let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
+                table_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid),
+                Some(0i32),
+                None,
+                Latency::<1>,
             );
-            let key = k.partition(shape![1, 64]).load([slot, head]);
-            let dot: Tile<f32, { [1] }> = reduce_sum(query * key, 1);
-            let score = dot.reshape(shape![1, 1]) * constant(0.125f32, shape![1, 1]);
-            let next = max_tile(maximum, score);
+            let offsets =
+                slots * (kvheads * 64).broadcast(shape![BK]) + (head * 64).broadcast(shape![BK]);
+            let offsets: Tile<i32, { [BK, 1] }> = offsets.reshape(shape![BK, 1]);
+            let offsets: Tile<i32, { [BK, 64] }> = offsets.broadcast(shape![BK, 64]);
+            let offsets = offsets + columns;
+            let mask: Tile<bool, { [BK, 1] }> = valid.reshape(shape![BK, 1]);
+            let mask: Tile<bool, { [BK, 64] }> = mask.broadcast(shape![BK, 64]);
+            let key_ptrs: PointerTile<*const f32, { [BK, 64] }> = kp.offset_tile(offsets);
+            let (keys, _token): (Tile<f32, { [BK, 64] }>, Token) = load_ptr_tko(
+                key_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None::<f32>,
+                None,
+                Latency::<1>,
+            );
+            // cuTile 0.4 scalar padding cannot broadcast to a 2D pointer-load result.
+            let keys = select(mask, keys, zero_values);
+            let dots: Tile<f32, { [BK] }> = reduce_sum(keys * query, 1);
+            // Preserve the symbolic BK shape after reduction in cuTile 0.4's type checker.
+            let dots: Tile<f32, { [BK] }> = dots.reshape(shape![BK]);
+            let scores = select(valid, dots * scale, negative_infinity);
+            let block_max: Tile<f32, { [1] }> = reduce_max(scores, 0);
+            let next = max_tile(maximum, block_max.reshape(shape![1, 1]));
             let alpha = exp(maximum - next);
-            let probability = exp(score - next);
-            acc = acc * alpha.broadcast(shape![1, 64])
-                + v.partition(shape![1, 64]).load([slot, head])
-                    * probability.broadcast(shape![1, 64]);
-            denominator = denominator * alpha + probability;
+            let next_vector: Tile<f32, { [1] }> = next.reshape(shape![1]);
+            let next_vector: Tile<f32, { [BK] }> = next_vector.broadcast(shape![BK]);
+            let probabilities = exp(scores - next_vector);
+            let value_ptrs: PointerTile<*const f32, { [BK, 64] }> = vp.offset_tile(offsets);
+            let (values, _token): (Tile<f32, { [BK, 64] }>, Token) = load_ptr_tko(
+                value_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None::<f32>,
+                None,
+                Latency::<1>,
+            );
+            let values = select(mask, values, zero_values);
+            let weights: Tile<f32, { [BK, 1] }> = probabilities.reshape(shape![BK, 1]);
+            let weights: Tile<f32, { [BK, 64] }> = weights.broadcast(shape![BK, 64]);
+            let weighted = values * weights;
+            let block_acc: Tile<f32, { [64] }> = reduce_sum(weighted, 0);
+            let block_sum: Tile<f32, { [1] }> = reduce_sum(probabilities, 0);
+            acc = acc * alpha.broadcast(shape![1, 64]) + block_acc.reshape(shape![1, 64]);
+            denominator = denominator * alpha + block_sum.reshape(shape![1, 1]);
             maximum = next;
         }
         out.store(true_div(acc, denominator.broadcast(shape![1, 64])));
