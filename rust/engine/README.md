@@ -420,8 +420,12 @@ The first attention optimization gathers 32 logical KV slots per iteration and
 uses occupancy target 2, preserving the existing KV layout and lifecycle. This is
 a compute tile, not a cache allocation page. The local
 [attention optimization report](../profiling/qwen2/attention-tiling/RESULTS.md)
-compares release runs and hardware counters. Prefill linear tiling and split-KV
-decode remain candidates; Qwen CUDA Graph is a later submission-cost experiment.
+compares release runs and hardware counters. Subsequent
+[batch tuning](../profiling/qwen2/batch-tuning/RESULTS.md) selects 16x64 linear
+output tiles for at least 16 packed rows, retaining 4x32 tiles for smaller inputs
+and the LM head at batch sizes 1/2/4. On SM120, linear targets occupancy 2 and
+attention targets 4; both hints live on their kernel definitions. No additional GPU scratch is required.
+Split-KV decode remains a candidate; Qwen CUDA Graph is a later submission-cost experiment.
 
 The example supplies the explicit two-message Qwen2 chat template and uses pure
 greedy decoding (no repetition penalty or stochastic sampling).

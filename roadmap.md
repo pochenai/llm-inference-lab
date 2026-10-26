@@ -1,6 +1,6 @@
 # LLM Inference 学习路线图
 
-更新日期：2026-10-25。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
+更新日期：2026-10-26。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
 
 ## Current checkpoint and next work
 
@@ -18,13 +18,17 @@ comparison reduces B1/4K prefill from 32.86 s to 5.78 s and decode from 45.19 ms
 17.28 ms/step; the local [attention report](rust/profiling/qwen2/attention-tiling/RESULTS.md)
 includes hardware counters, alternatives, correctness checks and limits.
 
-1. Profile/tile prefill linear execution: it now accounts for about 66% of B1/4K
-   kernel time. Evaluate larger M/N tiles and data reuse against the FP32 reference.
-2. Improve long single-request decode parallelism if that workload is the target:
-   attention still accounts for about 56% of B1/4K kernel time and launches only
-   14 query/head blocks. Investigate split-KV partial softmax reduction separately.
-   Revisit CUDA Graph when host submission becomes material; current replay
-   supports SimpleMLP only.
+Subsequent [batch tuning](rust/profiling/qwen2/batch-tuning/RESULTS.md) compares
+32/4096-token prompts at batch sizes 1, 2 and 4. Linear now uses 16x64 output
+tiles for at least 16 packed rows and 4x32 for smaller inputs. SM120 entry hints
+target occupancy 2 for linear and 4 for attention, without additional GPU scratch.
+
+1. Use the updated kernel-time breakdown to choose further linear reuse or
+   long-context attention work. Single-request decode still launches only 14
+   query/head blocks; investigate split-KV partial softmax reduction separately.
+2. Revisit CUDA Graph when host submission becomes material; current replay
+   supports SimpleMLP only. Compare CPU submission, GPU work and timeline gaps
+   without treating their durations as additive.
 3. Build minimal continuous batching on that executor. Add chunked-prefill
    scheduling when mixed long/short arrivals demonstrate decode interference.
    Radix prefix caching and quantization remain subsequent experiments.
@@ -294,7 +298,8 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 
 - [x] Profile the release packed GPU path for short/long prefill and decode at batch sizes 1 and 4; separate wall time, kernel time, host submission and readback.
 - [x] Add KV-block attention, compare block sizes/occupancy targets, and validate ragged/causal/cache behavior against CPU and real-model references.
-- [ ] Improve prefill linear tiling and long-context decode parallelism against the recorded release baseline.
+- [x] Compare prefill linear tiles and attention occupancy at batch sizes 1, 2 and 4; retain measured improvements with CPU/checkpoint regressions and unchanged workspace capacity.
+- [ ] Improve long-context decode parallelism against the recorded release baseline.
 - Port CUDA Graph if host submission overhead warrants it; schedule changing
   request membership in W6 using the packed executor.
 - Add selected intermediate-tensor checks when changing numerical kernels.

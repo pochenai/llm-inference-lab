@@ -44,23 +44,24 @@ pub(super) mod ops {
 
     /// PyTorch checkpoint weights are [out,in]; transpose each tile in registers.
     /// Optional projection bias is fused into the epilogue before the single store.
-    #[cutile::entry()]
-    pub(super) fn linear<const K: i32, const HAS_BIAS: bool>(
-        out: &mut Tensor<f32, { [4, 32] }>,
+    /// BM token rows reuse weights; BN covers output channels independently of heads.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn linear<const K: i32, const HAS_BIAS: bool, const BM: i32, const BN: i32>(
+        out: &mut Tensor<f32, { [BM, BN] }>,
         x: &Tensor<f32, { [-1, K] }>,
         w: &Tensor<f32, { [-1, K] }>,
         bias: &Tensor<f32, { [-1] }>,
     ) {
         let pid = get_tile_block_id();
-        let px = x.partition(shape![4, 32]);
-        let pw = w.partition(shape![32, 32]);
-        let mut acc: Tile<f32, { [4, 32] }> = constant(0.0f32, shape![4, 32]);
+        let px = x.partition(shape![BM, 32]);
+        let pw = w.partition(shape![BN, 32]);
+        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
         for i in 0i32..(K / 32) {
             acc = mma(px.load([pid.0, i]), pw.load([pid.1, i]).transpose(), acc);
         }
         if HAS_BIAS {
-            let bias_tile = bias.partition(shape![32]).load([pid.1]);
-            acc = acc + bias_tile.reshape(shape![1, 32]).broadcast(shape![4, 32]);
+            let bias_tile = bias.partition(shape![BN]).load([pid.1]);
+            acc = acc + bias_tile.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
         }
         out.store(acc);
     }
@@ -147,8 +148,8 @@ pub(super) mod ops {
 
     /// Gather BK physical KV slots per iteration, then update online softmax by block.
     /// Mask the final block at each query's causal boundary; slots need not be contiguous.
-    /// Target two resident CTAs per SM on SM120 to reduce register pressure.
-    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    /// Target four resident CTAs per SM on SM120 to reduce register pressure.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 4,),))]
     pub(super) unsafe fn attention<const BK: i32>(
         out: &mut Tensor<f32, { [1, 64] }>,
         q: &Tensor<f32, { [-1, -1] }>,

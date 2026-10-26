@@ -64,6 +64,8 @@ use std::{ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
 const KV_TOKENS_PER_TILE: i32 = 32;
+const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
+const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
 
 type Weight = Arc<Tensor<f32>>;
 
@@ -626,8 +628,19 @@ impl Qwen2Engine {
         let has_bias = bias.is_some();
         // Bias-free specializations never read this existing rank-one weight.
         let bias = bias.unwrap_or_else(|| self.norm.clone());
-        kernels::linear(out.partition([4, 32]), x, w, bias)
-            .generics(vec![k.to_string(), has_bias.to_string()])
+        // Reuse weights across packed token rows; keep small tiles for decode.
+        let tile = if x.shape()[0] as usize >= LINEAR_PREFILL_TILE[0] {
+            LINEAR_PREFILL_TILE
+        } else {
+            LINEAR_DECODE_TILE
+        };
+        kernels::linear(out.partition(tile), x, w, bias)
+            .generics(vec![
+                k.to_string(),
+                has_bias.to_string(),
+                tile[0].to_string(),
+                tile[1].to_string(),
+            ])
             .execute(exec)?;
         Ok(())
     }
@@ -1304,47 +1317,68 @@ mod tests {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = cuda_async::device_context::global_policy(0)?;
         let cache = ReadbackCache::default();
-        let input = Arc::new((0..96).map(|i| (i / 32 + 1) as f32).collect());
-        let weights = Arc::new((0..64 * 32).map(|i| (i / 32 % 7 + 1) as f32).collect());
-        let biases = Arc::new((0..64).map(|i| i as f32 * 0.25).collect());
-        for has_bias in [false, true] {
-            let actual = with_context(|exec| {
-                value((|| -> Result<_, ModelError> {
-                    // SAFETY: producers and D2H share exec; host reads follow await.
-                    unsafe {
-                        let x = api::copy_host_vec_to_device(&input)
-                            .execute(exec)?
-                            .reshape(&[3, 32])?;
-                        let w = api::copy_host_vec_to_device(&weights)
-                            .execute(exec)?
-                            .reshape(&[64, 32])?;
-                        let bias = api::copy_host_vec_to_device(&biases).execute(exec)?;
-                        let out = kernels::linear(
-                            Tensor::<f32>::uninitialized(3 * 64)
-                                .execute(exec)?
-                                .assume_init()
-                                .reshape(&[3, 64])?
-                                .partition([4, 32]),
-                            x,
-                            w,
-                            bias,
-                        )
-                        .generics(vec!["32".into(), has_bias.to_string()])
-                        .map(|(out, ..)| out)
-                        .unpartition()
-                        .execute(exec)?;
-                        Ok(enqueue_readback(out, &cache, exec)?)
+        // Exercise both dispatch tiles, including partial input rows and output columns.
+        for (rows, width) in [(3, 32), (35, 64), (33, 96)] {
+            let input: Arc<Vec<f32>> = Arc::new(
+                (0..rows * width)
+                    .map(|i| ((i * 17 % 31) as f32 - 15.0) / 32.0)
+                    .collect(),
+            );
+            let weights: Arc<Vec<f32>> = Arc::new(
+                (0..96 * width)
+                    .map(|i| ((i * 7 % 29) as f32 - 14.0) / 64.0)
+                    .collect(),
+            );
+            let biases: Arc<Vec<f32>> = Arc::new((0..96).map(|i| i as f32 / 128.0).collect());
+            for tile in [LINEAR_DECODE_TILE, LINEAR_PREFILL_TILE] {
+                for has_bias in [false, true] {
+                    let actual = with_context(|exec| {
+                        value((|| -> Result<_, ModelError> {
+                            // SAFETY: producers and D2H share exec; host reads follow await.
+                            unsafe {
+                                let x = api::copy_host_vec_to_device(&input)
+                                    .execute(exec)?
+                                    .reshape(&[rows, width])?;
+                                let w = api::copy_host_vec_to_device(&weights)
+                                    .execute(exec)?
+                                    .reshape(&[96, width])?;
+                                let bias = api::copy_host_vec_to_device(&biases).execute(exec)?;
+                                let out = kernels::linear(
+                                    Tensor::<f32>::uninitialized(rows * 96)
+                                        .execute(exec)?
+                                        .assume_init()
+                                        .reshape(&[rows, 96])?
+                                        .partition(tile),
+                                    x,
+                                    w,
+                                    bias,
+                                )
+                                .generics(vec![
+                                    width.to_string(),
+                                    has_bias.to_string(),
+                                    tile[0].to_string(),
+                                    tile[1].to_string(),
+                                ])
+                                .map(|(out, ..)| out)
+                                .unpartition()
+                                .execute(exec)?;
+                                Ok(enqueue_readback(out, &cache, exec)?)
+                            }
+                        })())
+                    })
+                    .schedule(&policy)?
+                    .await??;
+                    for (index, &value) in actual.as_slice().iter().enumerate() {
+                        let row = index / 96;
+                        let column = index % 96;
+                        let expected: f32 = (0..width)
+                            .map(|k| input[row * width + k] * weights[column * width + k])
+                            .sum::<f32>()
+                            + if has_bias { biases[column] } else { 0.0 };
+                        assert!((value - expected).abs() < 1e-5,
+                            "tile={tile:?}, rows={rows}, bias={has_bias}, index={index}: {value} vs {expected}");
                     }
-                })())
-            })
-            .schedule(&policy)?
-            .await??;
-            for (index, &value) in actual.as_slice().iter().enumerate() {
-                let row = index / 64;
-                let column = index % 64;
-                let expected = 32.0 * (row + 1) as f32 * (column % 7 + 1) as f32
-                    + if has_bias { biases[column] } else { 0.0 };
-                assert_eq!(value, expected);
+                }
             }
         }
         Ok(())
