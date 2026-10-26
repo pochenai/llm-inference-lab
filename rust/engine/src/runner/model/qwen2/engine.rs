@@ -1458,11 +1458,10 @@ mod tests {
         let device = Device::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let model = Qwen2Engine::load(Path::new(&model_dir), &policy).await?;
-        let pool = NaiveKVPool::new(
-            model.kv_pool_config(tokens.len() + expected_ids.len() + 1)?,
-            &policy,
-        )
-        .await?;
+        let mut runner_config = model.kv_pool_config(tokens.len() + expected_ids.len() + 1)?;
+        runner_config.max_rows = 2;
+        runner_config.num_slots *= 2;
+        let pool = NaiveKVPool::new(runner_config, &policy).await?;
         let initial = pool.metrics();
         let mut full = KVContext::new(pool.clone())?;
         let invalid = model
@@ -1698,7 +1697,13 @@ mod tests {
                 max_new_tokens: Some(expected_ids.len()),
                 ..Default::default()
             });
-            assert_eq!(scheduler.execute(full).await?.output, streamed_text);
+            assert_eq!(scheduler.execute(full.clone()).await?.output, streamed_text);
+            // Distinct requests share Runner's dynamic packed batch and retain the
+            // same output as the independently validated single-request path.
+            let (left, right) =
+                tokio::join!(scheduler.execute(full.clone()), scheduler.execute(full),);
+            assert_eq!(left?.output, streamed_text);
+            assert_eq!(right?.output, streamed_text);
             let id = scheduler.open_session().await?;
             let mut first = crate::types::SessionRequest::new(Some(id), prompt);
             first.sampling = Some(crate::types::SamplingConfig {
@@ -1721,14 +1726,16 @@ mod tests {
         task.await?;
         result?;
         let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 3);
-        assert_eq!(observed[0].generated_tokens, Some(expected_ids.len()));
-        assert_eq!(observed[1].generated_tokens, Some(turn_len));
-        assert_eq!(observed[2].generated_tokens, Some(1));
-        assert!(observed[0].time_to_first_text.is_some());
-        assert!(observed[1].time_to_first_text.is_some());
+        assert_eq!(observed.len(), 5);
+        for stats in &observed[..3] {
+            assert_eq!(stats.generated_tokens, Some(expected_ids.len()));
+            assert!(stats.time_to_first_text.is_some());
+        }
+        assert_eq!(observed[3].generated_tokens, Some(turn_len));
+        assert_eq!(observed[4].generated_tokens, Some(1));
+        assert!(observed[3].time_to_first_text.is_some());
         assert_eq!(
-            observed[2].time_to_first_text.is_some(),
+            observed[4].time_to_first_text.is_some(),
             !expected_text.is_empty()
         );
         for stats in observed.iter() {

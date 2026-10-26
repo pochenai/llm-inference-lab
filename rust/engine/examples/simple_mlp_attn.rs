@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 /// Profile uniform batches through Scheduler, Runner, and the attention MLP.
 #[derive(Parser)]
 #[command(
-    after_help = "Batch size 5 fills the Scheduler dispatch limit; smaller batches include its 100ms collection window."
+    after_help = "Scheduler forwards immediately; Runner forms GPU batches from ready requests at step boundaries."
 )]
 struct Options {
     /// Number of requests per batch (1..=5).

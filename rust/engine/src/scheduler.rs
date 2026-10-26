@@ -6,7 +6,6 @@ use crate::{error::EngineError, types::*};
 use dashmap::DashMap;
 use futures::{stream, Stream, TryStreamExt};
 use std::{
-    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,14 +15,10 @@ use std::{
 use tokio::{
     sync::{mpsc, oneshot},
     task::AbortHandle,
-    time::{sleep_until, Instant},
+    time::Instant,
 };
 
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-
-// Candidate dispatch bound; Runner chooses execution batches using local capacity.
-const MAX_DISPATCH_SIZE: usize = 5;
-const BATCH_WAIT: Duration = Duration::from_millis(100);
 
 struct PendingRequest {
     reply_tx: mpsc::UnboundedSender<Result<Option<LLMResponse>, EngineError>>,
@@ -69,7 +64,7 @@ impl Scheduler {
         let task_tracker = TaskTracker::new();
         let tasks = vec![
             task_tracker
-                .spawn(Self::run_dispatch_batch(
+                .spawn(Self::run_dispatch(
                     command_rx,
                     runner_command_tx,
                     cancel_token.clone(),
@@ -193,7 +188,8 @@ impl Scheduler {
         }
     }
 
-    /// Queue close after earlier requests and wait for Runner to release the session.
+    /// Release an idle session. Clients await their previous turn before closing;
+    /// Runner rejects an active session instead of queueing the close.
     pub async fn close_session(&self, id: SessionId) -> Result<(), EngineError> {
         if self.cancel_token.is_cancelled() {
             return Err(EngineError::ChannelClosed);
@@ -234,70 +230,30 @@ impl Scheduler {
         }
     }
 
-    async fn run_dispatch_batch(
+    /// Forward admission order immediately; Runner forms GPU batches at step boundaries.
+    async fn run_dispatch(
         mut command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
         runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
         cancel_token: CancellationToken,
     ) {
-        let mut submissions = Vec::with_capacity(MAX_DISPATCH_SIZE);
-        let mut sessions = HashSet::new();
-        let mut deadline = Instant::now();
-        let flush = |batch: &mut BatchIn, sessions: &mut HashSet<SessionId>| {
-            if !batch.is_empty() {
-                runner_command_tx
-                    .send(RunnerCommand::Execute(std::mem::take(batch)))
-                    .map_err(|_| EngineError::ChannelClosed)?;
-                sessions.clear();
-            }
-            Ok::<(), EngineError>(())
-        };
-        let result = async {
-            loop {
-                let command = tokio::select! {
-                    biased;
-                    _ = sleep_until(deadline), if !submissions.is_empty() => {
-                        flush(&mut submissions, &mut sessions)?;
-                        continue;
-                    }
-                    command = command_rx.recv() => command,
-                };
-                match command {
-                    Some(RunnerCommand::Execute(batch)) => {
-                        for request in batch {
-                            if request.session_id.is_some_and(|id| sessions.contains(&id)) {
-                                flush(&mut submissions, &mut sessions)?;
-                            }
-                            if submissions.is_empty() {
-                                deadline = Instant::now() + BATCH_WAIT;
-                            }
-                            if let Some(id) = request.session_id {
-                                sessions.insert(id);
-                            }
-                            submissions.push(request);
-                            if submissions.len() == MAX_DISPATCH_SIZE {
-                                flush(&mut submissions, &mut sessions)?;
-                            }
-                        }
-                    }
-                    Some(command) => {
-                        // Session management is a FIFO barrier: flush earlier requests first.
-                        flush(&mut submissions, &mut sessions)?;
-                        runner_command_tx
-                            .send(command)
-                            .map_err(|_| EngineError::ChannelClosed)?;
-                    }
-                    None => {
-                        flush(&mut submissions, &mut sessions)?;
-                        break;
-                    }
+        loop {
+            let command = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => break,
+                _ = runner_command_tx.closed() => {
+                    cancel_token.cancel();
+                    break;
                 }
+                command = command_rx.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+            if runner_command_tx.send(command).is_err() {
+                // Reply routing owns terminal callbacks and pending-request cleanup.
+                cancel_token.cancel();
+                break;
             }
-            Ok::<(), EngineError>(())
-        }
-        .await;
-        if result.is_err() {
-            // Routing owns completion callbacks, preserving per-request event order.
-            cancel_token.cancel();
         }
     }
 
@@ -310,8 +266,9 @@ impl Scheduler {
         loop {
             let output = tokio::select! {
                 biased;
-                _ = cancel_token.cancelled() => break,
+                // Preserve queued completions when command-transport closure signals shutdown.
                 output = batch_reply_rx.recv() => match output { Some(output) => output, None => break },
+                _ = cancel_token.cancelled() => break,
             };
             match output {
                 RunnerReply::Delta(response) => {
@@ -620,9 +577,13 @@ mod tests {
         let finish = Arc::new(tokio::sync::Notify::new());
         let permit = finish.clone();
         let worker = tokio::spawn(async move {
-            let Some(RunnerCommand::Execute(batch)) = rx.recv().await else {
-                panic!("batch")
-            };
+            let mut batch = Vec::new();
+            while batch.len() < 3 {
+                let Some(RunnerCommand::Execute(mut requests)) = rx.recv().await else {
+                    panic!("requests")
+                };
+                batch.append(&mut requests);
+            }
             for request in &batch {
                 if request.input != "empty" {
                     replies
@@ -737,7 +698,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batches_defer_repeated_sessions_without_dropping_or_reordering() {
+    async fn queued_completion_survives_transport_cancellation() {
+        let requests = Arc::new(DashMap::new());
+        let (reply_tx, mut response_rx) = mpsc::unbounded_channel();
+        requests.insert(
+            0,
+            PendingRequest {
+                reply_tx,
+                request_id: 0,
+                started: Instant::now(),
+                first_text: None,
+            },
+        );
+        let (replies, rx) = mpsc::unbounded_channel();
+        replies
+            .send(RunnerReply::Delta(LLMResponse {
+                request_id: 0,
+                output: "done".into(),
+            }))
+            .unwrap();
+        replies
+            .send(RunnerReply::Finished {
+                request_id: 0,
+                generated_tokens: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        Scheduler::run_recv_resp(rx, requests.clone(), cancel, Vec::new().into()).await;
+        assert_eq!(
+            response_rx.try_recv().unwrap().unwrap().unwrap().output,
+            "done"
+        );
+        assert!(response_rx.try_recv().unwrap().unwrap().is_none());
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_preserves_order_without_waiting_for_more_requests() {
         let (tx, rx) = mpsc::unbounded_channel();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
         let inputs = [
@@ -763,18 +762,17 @@ mod tests {
             .with_request_id(id as u64)]))
                 .unwrap();
         }
+        let dispatch = Scheduler::run_dispatch(rx, batch_tx, CancellationToken::new());
+        tokio::pin!(dispatch);
+        assert!(futures::poll!(dispatch.as_mut()).is_pending());
+        assert_eq!(batch_rx.len(), inputs.len());
         drop(tx);
-        Scheduler::run_dispatch_batch(rx, batch_tx, CancellationToken::new()).await;
+        dispatch.await;
         let mut sizes = Vec::new();
         let mut observed = Vec::new();
         while let Some(RunnerCommand::Execute(batch)) = batch_rx.recv().await {
-            assert!(batch.len() <= MAX_DISPATCH_SIZE);
             sizes.push(batch.len());
-            let mut sessions = HashSet::new();
             for request in batch {
-                if let Some(id) = request.session_id {
-                    assert!(sessions.insert(id));
-                }
                 observed.push((
                     request.assigned_request_id(),
                     request.session_id,
@@ -782,7 +780,7 @@ mod tests {
                 ));
             }
         }
-        assert_eq!(sizes, vec![4, 3, 5, 1]);
+        assert_eq!(sizes, vec![1; inputs.len()]);
         let expected: Vec<_> = inputs
             .iter()
             .enumerate()
@@ -847,7 +845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_commands_flush_earlier_repeated_requests_in_fifo_order() {
+    async fn session_commands_preserve_transport_order() {
         let (tx, rx) = mpsc::unbounded_channel();
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         for (id, text) in [(1, "first"), (2, "second")] {
@@ -871,7 +869,7 @@ mod tests {
         .with_request_id(3)]))
             .unwrap();
         drop(tx);
-        Scheduler::run_dispatch_batch(rx, runner_tx, CancellationToken::new()).await;
+        Scheduler::run_dispatch(rx, runner_tx, CancellationToken::new()).await;
         let mut observed = Vec::new();
         while let Some(command) = runner_rx.recv().await {
             match command {

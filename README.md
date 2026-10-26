@@ -10,7 +10,8 @@ The Rust/cuTile engine now runs Qwen2.5-0.5B-Instruct through Scheduler/Runner,
 with streaming greedy generation, sessions, reusable scratch and metrics.
 Packed GPU batches support ragged prefill and decode. Release profiling led to
 KV-block attention with a measured occupancy target and larger prefill linear tiles.
-Next: long-context decode parallelism, before continuous batching, prefix reuse and quantization.
+Runner now supports minimal continuous batching. Next: chunked-prefill budgets,
+with further kernel work, prefix reuse and quantization guided by measurements.
 Profiling and numerical/lifecycle checks accompany every phase. Week labels are
 learning units; speculative decoding and the later plan remain unchanged.
 
@@ -21,7 +22,7 @@ learning units; speculative decoding and the later plan remain unchanged.
 | 3 | KVPool/KVContext, token-slot indirection, attention, and fused KV writes | ✅ Baseline implemented |
 | 4 | CUDA Graph, pooled workspace/replay, and mapped host output | ✅ SimpleMLP implemented; Qwen pending |
 | 5 | Qwen2.5-0.5B-Instruct: operators, reference checks, scratch reuse, metrics and benchmark | ✅ Done |
-| 6 | Continuous batching and chunked-prefill scheduling on the existing token-step API | ⬜ Planned |
+| 6 | Continuous batching and chunked-prefill scheduling on the existing token-step API | 🚧 Continuous batching implemented; chunked prefill pending |
 | 7 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
 | 8 | Quantization on Qwen | ⬜ Planned |
 | 9 | Speculative decoding | ⬜ Planned |
@@ -50,8 +51,9 @@ record short/long prefill and decode at batch sizes 1 and 4. The subsequent
 [batch tuning report](rust/profiling/qwen2/batch-tuning/RESULTS.md) compares batch
 sizes 1, 2 and 4 with larger prefill linear tiles and attention occupancy targets.
 Split-KV decode remains open before revisiting Qwen CUDA Graph submission costs.
-Continuous batching and chunked-prefill scheduling build on the packed executor;
-radix caching and quantization follow.
+Continuous batching admits new requests between packed forwards and releases
+finished requests independently. Chunked-prefill scheduling is next; radix caching
+and quantization follow.
 Existing chunked-KV correctness checks do not imply chunked-prefill scheduling.
 
 ## Future plans

@@ -29,8 +29,9 @@ target occupancy 2 for linear and 4 for attention, without additional GPU scratc
 2. Revisit CUDA Graph when host submission becomes material; current replay
    supports SimpleMLP only. Compare CPU submission, GPU work and timeline gaps
    without treating their durations as additive.
-3. Build minimal continuous batching on that executor. Add chunked-prefill
-   scheduling when mixed long/short arrivals demonstrate decode interference.
+3. Minimal continuous batching now admits new requests between forwards and
+   releases completed KV independently; clients serialize turns of one session. Next add chunked-prefill
+   budgets and measure interference on mixed long/short arrivals.
    Radix prefix caching and quantization remain subsequent experiments.
 
 Packed Qwen GPU execution is implemented: ragged suffixes, different cached
@@ -113,7 +114,7 @@ prerequisite week.
 Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
 Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
 Qwen uses eager execution with packed ragged GPU batches. Chunked appends are numerically
-validated; interleaved chunked-prefill scheduling, continuous batching and radix
+validated; interleaved chunked-prefill scheduling and radix
 prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
 commands and metric contracts.
 
@@ -307,10 +308,11 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 
 #### W6: step-level generation, continuous batching, and chunked prefill
 
-Status: planned on top of the existing Runner generation/lifecycle baseline.
-Packed Qwen execution is implemented; changing active batch membership remains
-open. Correct chunked KV appends do not yet establish an interleaved chunked-prefill
-scheduler.
+Status: minimal continuous batching implemented; chunked-prefill scheduling remains open.
+Runner admits requests at forward boundaries, dynamically changes packed batch membership,
+protects active requests' future KV budget, and rejects accidental same-session overlap
+under the client-serialized session contract.
+Correct chunked KV appends do not yet establish an interleaved chunked-prefill scheduler.
 
 **Focus**
 
@@ -329,8 +331,8 @@ scheduler.
 
 - [x] Runner token stepping, EOS/length stopping, session continuation, streaming and independent request completion are covered by regressions.
 - [x] Packed and serial Qwen execution agree for ragged prefill, different cached-prefix lengths and decode.
-- [ ] Continuously batched execution agrees with the packed baseline.
-- [ ] A new request can join while existing requests decode; finished/cancelled requests release resources without disturbing peers.
+- [x] Dynamic arrivals and session continuations agree with serial generation; existing packed Qwen numerical checks remain required.
+- [x] New requests join ongoing decodes, completed requests release resources independently, and shutdown cancellation releases active/pending work. Per-request cancellation remains deferred.
 - [ ] Compare at least two prefill budgets on the same mixed long/short workload; report request/first-text latency, per-step latency and throughput. Add an explicit Runner-start event before claiming exact queue time.
 - [ ] CUDA Graph bucket selection and dynamic metadata remain correct when batch membership changes.
 

@@ -52,22 +52,47 @@ private `open_session` / `close_session` methods manage history lifetimes.
 Applications use `Scheduler::open_session().await` to obtain a SessionId,
 `Scheduler::execute` to append prompt deltas, and `Scheduler::close_session(id).await`
 to release the session. Creation returns only after Runner acknowledges success.
-Session commands share the generation queue; pending batches flush before open/close,
-so close cannot overtake earlier requests. None remains a temporary, stateless request.
-Request execution is internal and enters through `Scheduler::execute`. Construct requests with `SessionRequest::new(session_id, input)`; the
-private request ID starts as None. Scheduler assigns a fresh ID per admission
-using a counter shared across clones, then forwards the assigned envelope to
-Runner. Responses expose the assigned ID; internal execution trusts Scheduler
-to assign unique IDs, without repeating admission checks. Execution uses
-`&self` and per-session locks. Runner awaits one batch at a time, taking locks
-in input order; future concurrent batch execution would require consistent lock
-ordering. Scheduler guarantees unique session IDs per batch, carrying a repeated session
-into the next candidate batch in FIFO order. Runner filters individual invalid
-requests and splits candidates by local KV token/context capacity. Submission failures invalidate affected
-sessions; ordinary validation errors preserve them. Runner uses local states and
-existing mutex guards with explicit success/error cleanup. Cancellation after
-taking session state releases it and leaves the entry invalid until close. `release_state` drops context
-ownership; retained submission leases prevent recycling rows/slots still in use.
+Scheduler forwards immediately. Clients serialize turns of one session and await
+completion before its next request or close. Runner rejects accidental overlap
+with a busy-session error; it does not queue turns or wait for session locks.
+None uses temporary, stateless state. Construct requests with `SessionRequest::new(session_id, input)`;
+Scheduler assigns fresh request IDs across clones and responses expose those IDs.
+
+Runner performs one packed forward at a time. At each step boundary it admits
+waiting requests, lets new prefills join ongoing decodes, and removes finished
+requests. It holds one private ActiveRequest per turn with the existing session
+state/guard and library text decoder. Try-locks reject busy sessions without waiting.
+Admission accounts for active requests' future decode slots, as well as the new
+prompt/output budget and context rows. Capacity-limited work waits for active
+requests to finish; requests that still cannot fit fail individually. This is
+capacity waiting across requests, independently of client-side session serialization.
+
+Generated history is restored and temporary KV released before per-request EOF.
+Validation errors preserve session state; changed/pending KV on a model failure is
+invalidated. Cancellation drops active local states, and GPU submission leases
+keep storage alive until in-flight accesses finish. Dropping an output stream
+still stops delivery rather than cancelling generation.
+
+This follows SGLang's normal loop (local source revision `0263fdacb2`):
+`event_loop_normal` receives work, `get_next_batch_to_run` selects/merges requests,
+then one forward runs and results update the running batch. Our existing packed
+backend permits full prefills and decodes in the same forward. Chunked-prefill
+budgets, preemption, scheduling/GPU overlap and Qwen CUDA Graph remain deferred.
+A full long prefill can still delay decodes; this change establishes dynamic
+membership and lifecycle correctness, without a throughput claim.
+
+`Qwen2Engine::kv_pool_config` defaults to one context row. Applications enabling
+concurrency must size their pool accordingly, for example:
+
+```rust
+let mut config = model.kv_pool_config(max_seq_len)?;
+config.max_rows = 2;
+config.num_slots *= config.max_rows;
+```
+
+Rows also include retained idle sessions. The Runner uses available rows/slots
+for admission; there is no separate fixed GPU batch-size limit in Scheduler.
+
 Packed suffixes share embedding, QKV projection, and MLP computation. One attention
 launch uses per-query history metadata; K/V stores use borrowed packed slices.
 Pool metrics report assigned/free bytes separately from allocated backing bytes.
@@ -91,7 +116,7 @@ support does not establish operator support; this model executes only in f32.
 
 Public interfaces cover application ingress, Runner construction/lifecycle,
 model/pool extension traits, and loader/export operations. Runner dispatch
-(`execute_batch`), decoding, and its assembly
+(`drive`), decoding, and its assembly
 constructor are private. Tests collect the same RunnerReply events as Scheduler. Read/write view
 fields are private; their types stay public for trait signatures. Read views expose
 const pointers through safe accessors; writable handles require a distinct WriteView.
@@ -135,7 +160,7 @@ nsys profile --trace=cuda,nvtx,osrt --gpu-metrics-devices=0 --capture-range=cuda
 
 The defaults are five requests, sixteen tokens per request, and one execution
 stream. `--batch-size` accepts 1..5 and `--tokens` accepts 1..512. Smaller batches
-include Scheduler's 100ms collection window; the default fills its dispatch limit.
+are forwarded immediately; Runner forms batches from ready work at each step boundary.
 Profiler start/stop excludes weight/pool initialization, JIT, and warmup. CUDA
 tracing selects hardware trace where supported; GPU metrics sample device 0.
 Profiling can perturb timings, so compare wall times without the profiler.

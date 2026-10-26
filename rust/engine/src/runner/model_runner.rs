@@ -1,8 +1,23 @@
-use std::{future::Future, sync::Arc};
+//! Each Runner schedules one complete model forward at a time: all layers, the
+//! LM head and token selection, then GPU completion and KV commit. At that boundary
+//! it admits new requests and removes finished ones, subject to available capacity.
+//!
+//! ```text
+//! await forward([A, B]);       // C arrives while A and B are still generating.
+//! await forward([A, B, C]);    // A finishes; B and C continue.
+//! await forward([B, C]);
+//! ```
+//! This is request concurrency through dynamic batch membership, rather than
+//! concurrent independent forward(batch_1), forward(batch_2), forward(batch_3).
+//! Scheduling does not switch requests between individual layers or CTAs.
+//! Shared-reference APIs/resource pools permit broader use but do not change this
+//! Runner policy. Tokens/KV survive across steps; hidden intermediates are temporary.
+
+use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use cuda_async::{device_context::global_policy, scheduling_policies::SchedulingPolicy};
 use dashmap::DashMap;
-use tokenizers::Encoding;
+use tokenizers::{Encoding, Tokenizer};
 use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -13,11 +28,20 @@ use crate::{
         model::{CausalModel, ModelError, ModelInput, SimpleMLPEngine},
     },
     types::{
-        BatchIn, LLMResponse, RunnerCommand, RunnerReply, SamplingConfig, SessionId, SessionRequest,
+        LLMResponse, RequestId, RunnerCommand, RunnerReply, SamplingConfig, SessionId,
+        SessionRequest,
     },
 };
 
 type Policy = Arc<dyn SchedulingPolicy + 'static>;
+type Decoder<'a> = tokenizers::DecodeStream<
+    'a,
+    tokenizers::ModelWrapper,
+    tokenizers::NormalizerWrapper,
+    tokenizers::PreTokenizerWrapper,
+    tokenizers::PostProcessorWrapper,
+    tokenizers::DecoderWrapper,
+>;
 
 /// Static factory contract; each implementation returns its concrete, Send future.
 pub trait AsyncFactory<Args>: Send {
@@ -148,7 +172,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
 type SessionEntry<P> = Arc<Mutex<Option<SessionState<P>>>>;
 
 pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
-    command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
+    command_rx: Option<mpsc::UnboundedReceiver<RunnerCommand>>,
     batch_reply_tx: mpsc::UnboundedSender<RunnerReply>,
     model: M,
     pool: Arc<P>,
@@ -167,6 +191,68 @@ struct SessionState<P: KVPool> {
     sampling: SamplingConfig,
 }
 
+/// Owns one turn across forward boundaries; dropping it invalidates an unfinished
+/// persistent turn and releases temporary KV through the existing context leases.
+/// State/counters/decoder are used per step; guard/progress/errors serve cleanup.
+/// Keep compiler-selected layout: this single-owner record spans multiple cache
+/// lines, so fixed alignment needs CPU-profile evidence rather than field ordering.
+struct ActiveRequest<'a, P: KVPool> {
+    request_id: RequestId,
+    guard: OwnedMutexGuard<Option<SessionState<P>>>,
+    state: SessionState<P>,
+    original_progress: SessionProgress,
+    sampling: SamplingConfig,
+    remaining: usize,
+    generated_tokens: usize,
+    model_error: Option<ModelError>,
+    decode_error: Option<ModelError>,
+    emitted: bool,
+    decoder: Decoder<'a>,
+}
+
+impl<P: KVPool> ActiveRequest<'_, P> {
+    /// Account for future appends before admitting peers; physical slots are still
+    /// allocated incrementally by prepare_append on each completed model step.
+    fn unreserved_tokens(&self) -> usize {
+        self.state.tokens.len() - self.state.kv.ready_len() + self.remaining.saturating_sub(1)
+    }
+
+    fn finish(mut self, replies: &mpsc::UnboundedSender<RunnerReply>) {
+        let generated = self.model_error.is_none();
+        drop(self.decoder);
+        let result = match self.model_error.or(self.decode_error) {
+            Some(error) => Err(error.into()),
+            None => {
+                if !self.emitted {
+                    let _ = replies.send(RunnerReply::Delta(LLMResponse {
+                        request_id: self.request_id,
+                        output: String::new(),
+                    }));
+                }
+                Ok(())
+            }
+        };
+        if generated {
+            self.state.sampling = self.sampling;
+            *self.guard = Some(self.state);
+        } else if !self.state.kv.is_pending()
+            && self.state.kv.ready_len() == self.original_progress.ready_len
+        {
+            Arc::make_mut(&mut self.state.tokens).truncate(self.original_progress.token_count);
+            *self.guard = Some(self.state);
+        } else {
+            drop(self.state);
+        }
+        // Restore/unlock sessions and release temporary KV before publishing EOF.
+        drop(self.guard);
+        let _ = replies.send(RunnerReply::Finished {
+            request_id: self.request_id,
+            generated_tokens: self.generated_tokens,
+            result,
+        });
+    }
+}
+
 impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
     fn new(
         command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
@@ -176,7 +262,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         policy: Policy,
     ) -> Self {
         Self {
-            command_rx,
+            command_rx: Some(command_rx),
             batch_reply_tx,
             model,
             pool,
@@ -202,15 +288,18 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         }
     }
 
-    /// Wait for this session's active turn, release its state, and invalidate queued users
-    /// of the old entry. A newly opened session with the same ID has a distinct entry.
-    async fn close_session(&self, id: SessionId) -> Result<(), EngineError> {
+    /// Clients close after their turn finishes; reject an active session rather than
+    /// waiting inside the step loop. Existing GPU leases still protect released storage.
+    fn close_session(&self, id: SessionId) -> Result<(), EngineError> {
         let entry = self
             .sessions
             .get(&id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| EngineError::InvalidInput("unknown session".into()))?;
-        let mut guard = entry.clone().lock_owned().await;
+        let mut guard = entry
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| EngineError::InvalidInput("session is busy".into()))?;
         if let Some(state) = guard.take() {
             state.kv.release();
         }
@@ -219,123 +308,210 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         Ok(())
     }
 
-    /// Stream each request independently and finish it after restoring or releasing its KV.
-    /// Cancellation drops states still executing, even if they already emitted text.
-    async fn execute_model_batch(
+    /// Encode once at ingress; waiting requests retain token IDs without repeatedly
+    /// tokenizing their prompts while waiting for KV capacity.
+    fn enqueue(
         &self,
-        encoded: Vec<SessionRequest<Encoding>>,
-        mut guards: Vec<Option<OwnedMutexGuard<Option<SessionState<P>>>>>,
+        command: RunnerCommand,
+        waiting: &mut VecDeque<SessionRequest<Encoding>>,
         replies: &mpsc::UnboundedSender<RunnerReply>,
     ) {
-        let mut states: Vec<_> = guards
-            .iter_mut()
-            .map(|guard| guard.as_mut().unwrap().take())
-            .collect();
-        let original_progress: Vec<_> = states
-            .iter()
-            .map(|state| {
-                let state = state.as_ref().unwrap();
-                SessionProgress {
-                    token_count: state.tokens.len(),
-                    ready_len: state.kv.ready_len(),
-                }
-            })
-            .collect();
-        for (state, request) in states.iter_mut().zip(&encoded) {
-            let tokens = Arc::make_mut(&mut state.as_mut().unwrap().tokens);
-            tokens.reserve(
-                request.input.len()
-                    + request
-                        .sampling
-                        .as_ref()
-                        .unwrap()
-                        .max_new_tokens
-                        .unwrap_or(1),
-            );
-            tokens.extend_from_slice(request.input.get_ids());
-        }
-        let mut remaining: Vec<_> = encoded
-            .iter()
-            .map(|request| {
-                request
-                    .sampling
-                    .as_ref()
-                    .unwrap()
-                    .max_new_tokens
-                    .unwrap_or(1)
-            })
-            .collect();
-        let mut errors = vec![None::<ModelError>; states.len()];
-        let mut decode_errors = vec![None::<ModelError>; states.len()];
-        let mut emitted = vec![false; states.len()];
-        let mut decoders: Vec<_> = (0..states.len())
-            .map(|_| Some(self.model.tokenizer().decode_stream(true)))
-            .collect();
-        let mut active = Vec::with_capacity(states.len());
-        loop {
-            // Settle stopped requests before executing any peer's next step, including zero budgets.
-            for index in 0..states.len() {
-                if remaining[index] != 0 {
-                    continue;
-                }
-                let Some(mut state) = states[index].take() else {
-                    continue;
-                };
-                let request_id = encoded[index].assigned_request_id();
-                let generated = errors[index].is_none();
-                let generated_tokens = state.tokens.len()
-                    - original_progress[index].token_count
-                    - encoded[index].input.len();
-                drop(decoders[index].take());
-                let result = match errors[index].take().or_else(|| decode_errors[index].take()) {
-                    Some(error) => Err(error.into()),
-                    None => {
-                        // No extra decode/flush: emit only chunks produced by the library.
-                        if !emitted[index] {
-                            let _ = replies.send(RunnerReply::Delta(LLMResponse {
-                                request_id,
-                                output: String::new(),
-                            }));
+        match command {
+            RunnerCommand::Execute(batch) => {
+                for request in batch {
+                    match self.model.tokenizer().encode(request.input.as_str(), true) {
+                        Ok(tokens) => {
+                            if tokens.is_empty() {
+                                let _ = replies.send(RunnerReply::Finished {
+                                    request_id: request.assigned_request_id(),
+                                    generated_tokens: 0,
+                                    result: Err(EngineError::InvalidInput(
+                                        "prompt delta must not be empty".into(),
+                                    )),
+                                });
+                                continue;
+                            }
+                            let mut next = SessionRequest::new(request.session_id, tokens)
+                                .with_request_id(request.assigned_request_id());
+                            next.sampling = request.sampling;
+                            waiting.push_back(next);
                         }
-                        Ok(())
+                        Err(error) => {
+                            let _ = replies.send(RunnerReply::Finished {
+                                request_id: request.assigned_request_id(),
+                                generated_tokens: 0,
+                                result: Err(EngineError::InvalidInput(error.to_string())),
+                            });
+                        }
                     }
-                };
-                let mut guard = guards[index].take().unwrap();
-                let progress = &original_progress[index];
-                if generated {
-                    state.sampling = encoded[index].sampling.as_ref().unwrap().clone();
-                    *guard = Some(state);
-                } else if !state.kv.is_pending() && state.kv.ready_len() == progress.ready_len {
-                    Arc::make_mut(&mut state.tokens).truncate(progress.token_count);
-                    *guard = Some(state);
-                } else {
-                    drop(state);
                 }
-                // Unlock persistent sessions and release temporary contexts before announcing completion.
-                drop(guard);
-                let _ = replies.send(RunnerReply::Finished {
-                    request_id,
-                    generated_tokens,
-                    result,
-                });
             }
-            active.clear();
-            let mut inputs: Vec<_> = states
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(index, state)| {
-                    state.as_mut().map(|state| {
-                        active.push(index);
-                        ModelInput {
-                            token_ids: &state.tokens,
-                            kv: &mut state.kv,
+            RunnerCommand::OpenSession { id, reply } => {
+                let _ = reply.send(self.open_session(id));
+            }
+            RunnerCommand::CloseSession { id, reply } => {
+                let _ = reply.send(self.close_session(id));
+            }
+        }
+    }
+
+    /// Clients serialize a session's turns. Reject accidental overlap; only capacity
+    /// exhaustion is retried after active work can release resources.
+    fn try_admit<'a>(
+        &self,
+        request: &SessionRequest<Encoding>,
+        reserved_tokens: usize,
+        tokenizer: &'a Tokenizer,
+    ) -> Result<ActiveRequest<'a, P>, EngineError> {
+        let guard = match request.session_id {
+            Some(id) => {
+                let entry = self
+                    .sessions
+                    .get(&id)
+                    .map(|entry| entry.value().clone())
+                    .ok_or_else(|| EngineError::InvalidInput("unknown session".into()))?;
+                let guard = entry
+                    .try_lock_owned()
+                    .map_err(|_| EngineError::InvalidInput("session is busy".into()))?;
+                if guard.is_none() {
+                    return Err(EngineError::InvalidInput(
+                        "session closed or invalidated".into(),
+                    ));
+                }
+                Some(guard)
+            }
+            None => None,
+        };
+        let state = guard.as_ref().map(|guard| guard.as_ref().unwrap());
+        let old_len = state.map_or(0, |state| state.tokens.len());
+        let ready_len = state.map_or(0, |state| state.kv.ready_len());
+        let max_seq_len = state.map_or(self.pool.max_seq_len(), |state| state.kv.max_seq_len());
+        let full_len = old_len
+            .checked_add(request.input.len())
+            .filter(|&len| len <= max_seq_len)
+            .ok_or_else(|| EngineError::InvalidInput("KV context capacity exceeded".into()))?;
+        let sampling = request.sampling.clone().unwrap_or_else(|| {
+            state.map_or_else(SamplingConfig::default, |state| state.sampling.clone())
+        });
+        if sampling.do_sample == Some(true)
+            || sampling.temperature.is_some()
+            || sampling.top_k.is_some()
+            || sampling.top_p.is_some()
+        {
+            return Err(EngineError::InvalidInput(
+                "only pure greedy generation is supported".into(),
+            ));
+        }
+        self.model.validate_input(request.input.get_ids())?;
+        let remaining = sampling.max_new_tokens.unwrap_or(1);
+        let end = full_len
+            .checked_add(remaining.saturating_sub(1))
+            .filter(|&end| end <= max_seq_len)
+            .ok_or_else(|| {
+                EngineError::InvalidInput("generation exceeds KV context capacity".into())
+            })?;
+        if !self.pool.can_append(
+            reserved_tokens.saturating_add(end - ready_len),
+            usize::from(guard.is_none()),
+        ) {
+            return Err(KVPoolError::CapacityExhausted(
+                "insufficient KV capacity for request".into(),
+            )
+            .into());
+        }
+        let mut guard = match guard {
+            Some(guard) => guard,
+            None => Arc::new(Mutex::new(Some(SessionState {
+                tokens: Arc::new(Vec::new()),
+                kv: KVContext::new(self.pool.clone())?,
+                sampling: SamplingConfig::default(),
+            })))
+            .try_lock_owned()
+            .unwrap(),
+        };
+        let mut state = guard.take().unwrap();
+        let tokens = Arc::make_mut(&mut state.tokens);
+        tokens.reserve(request.input.len() + remaining);
+        tokens.extend_from_slice(request.input.get_ids());
+        Ok(ActiveRequest {
+            request_id: request.assigned_request_id(),
+            guard,
+            state,
+            original_progress: SessionProgress {
+                token_count: old_len,
+                ready_len,
+            },
+            sampling,
+            remaining,
+            generated_tokens: 0,
+            model_error: None,
+            decode_error: None,
+            emitted: false,
+            decoder: tokenizer.decode_stream(true),
+        })
+    }
+
+    /// One normal scheduling loop: ingest, admit, execute one packed forward, then
+    /// settle completions. Full prefills may join decodes; chunk budgets are deferred.
+    async fn drive(
+        &self,
+        commands: &mut mpsc::UnboundedReceiver<RunnerCommand>,
+        replies: &mpsc::UnboundedSender<RunnerReply>,
+    ) {
+        let tokenizer = self.model.tokenizer();
+        let mut waiting = VecDeque::<SessionRequest<Encoding>>::new();
+        let mut active: Vec<ActiveRequest<'_, P>> = Vec::new();
+        loop {
+            // A finite ingress snapshot prevents a continuous producer from starving GPU steps.
+            for _ in 0..commands.len() {
+                match commands.try_recv() {
+                    Ok(command) => self.enqueue(command, &mut waiting, replies),
+                    Err(_) => break,
+                }
+            }
+            let mut reserved_tokens = active.iter().fold(0usize, |sum, request| {
+                sum.saturating_add(request.unreserved_tokens())
+            });
+            for _ in 0..waiting.len() {
+                let request = waiting.pop_front().unwrap();
+                match self.try_admit(&request, reserved_tokens, tokenizer) {
+                    Ok(turn) => {
+                        if turn.remaining == 0 {
+                            turn.finish(replies);
+                        } else {
+                            reserved_tokens =
+                                reserved_tokens.saturating_add(turn.unreserved_tokens());
+                            active.push(turn);
                         }
-                    })
+                    }
+                    Err(EngineError::KVPool(KVPoolError::CapacityExhausted(_)))
+                        if !active.is_empty() =>
+                    {
+                        waiting.push_back(request)
+                    }
+                    Err(error) => {
+                        let _ = replies.send(RunnerReply::Finished {
+                            request_id: request.assigned_request_id(),
+                            generated_tokens: 0,
+                            result: Err(error),
+                        });
+                    }
+                }
+            }
+            if active.is_empty() {
+                match commands.recv().await {
+                    Some(command) => self.enqueue(command, &mut waiting, replies),
+                    None => break,
+                }
+                continue;
+            }
+            let mut inputs: Vec<_> = active
+                .iter_mut()
+                .map(|turn| ModelInput {
+                    token_ids: &turn.state.tokens,
+                    kv: &mut turn.state.kv,
                 })
                 .collect();
-            if inputs.is_empty() {
-                break;
-            }
             let outputs = self
                 .model
                 .next_tokens(&mut inputs, self.policy.clone())
@@ -345,27 +521,27 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 active.len(),
                 "one next-token result per input"
             );
-            for (index, output) in active.iter().copied().zip(outputs) {
+            for (turn, output) in active.iter_mut().zip(outputs) {
                 match output {
                     Ok(token) => {
-                        Arc::make_mut(&mut states[index].as_mut().unwrap().tokens).push(token);
-                        remaining[index] -= 1;
-                        match decoders[index].as_mut().unwrap().step(token) {
+                        Arc::make_mut(&mut turn.state.tokens).push(token);
+                        turn.remaining -= 1;
+                        turn.generated_tokens += 1;
+                        match turn.decoder.step(token) {
                             Ok(Some(output)) => {
-                                emitted[index] = true;
+                                turn.emitted = true;
                                 let _ = replies.send(RunnerReply::Delta(LLMResponse {
-                                    request_id: encoded[index].assigned_request_id(),
+                                    request_id: turn.request_id,
                                     output,
                                 }));
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                decode_errors[index] =
-                                    Some(ModelError::Execution(error.to_string()));
-                                remaining[index] = 0;
+                                turn.decode_error = Some(ModelError::Execution(error.to_string()));
+                                turn.remaining = 0;
                             }
                         }
-                        let eos = match &encoded[index].sampling.as_ref().unwrap().eos_token_id {
+                        let eos = match &turn.sampling.eos_token_id {
                             Some(crate::runner::loader::EosTokenId::One(id)) => token == *id,
                             Some(crate::runner::loader::EosTokenId::Many(ids)) => {
                                 ids.contains(&token)
@@ -373,201 +549,33 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                             None => self.model.is_eos(token),
                         };
                         if eos {
-                            remaining[index] = 0;
+                            turn.remaining = 0;
                         }
                     }
                     Err(error) => {
-                        errors[index] = Some(error);
-                        remaining[index] = 0;
+                        turn.model_error = Some(error);
+                        turn.remaining = 0;
                     }
                 }
             }
+            for index in (0..active.len()).rev() {
+                if active[index].remaining == 0 {
+                    active.swap_remove(index).finish(replies);
+                }
+            }
+            // Even immediately-ready model futures must let ingress/routing tasks run.
+            tokio::task::yield_now().await;
         }
     }
 
-    /// Scheduler supplies candidates with unique Some(session_id). Runner validates each
-    /// request, then splits execution batches by local free KV tokens and context rows.
-    /// run is serial; concurrent multi-batch execution would need consistent lock order.
-    async fn prepare_batch(&self, batch: BatchIn, replies: &mpsc::UnboundedSender<RunnerReply>) {
-        let mut candidates = batch.into_iter();
-        let mut encoded = Vec::new();
-        let mut guards = Vec::new();
-        let mut append_tokens = 0usize;
-        loop {
-            let prepared = if let Some(request) = candidates.next() {
-                let request_id = request.assigned_request_id();
-                let prepared = async {
-                    let tokens = self
-                        .model
-                        .tokenizer()
-                        .encode(request.input.as_str(), true)
-                        .map_err(|error| EngineError::InvalidInput(error.to_string()))?;
-                    if tokens.is_empty() {
-                        return Err(EngineError::InvalidInput(
-                            "prompt delta must not be empty".into(),
-                        ));
-                    }
-                    let guard = match request.session_id {
-                        Some(id) => {
-                            let entry = self
-                                .sessions
-                                .get(&id)
-                                .map(|entry| entry.value().clone())
-                                .ok_or_else(|| {
-                                EngineError::InvalidInput("unknown session".into())
-                            })?;
-                            let guard = entry.lock_owned().await;
-                            if guard.is_none() {
-                                return Err(EngineError::InvalidInput(
-                                    "session closed or invalidated".into(),
-                                ));
-                            }
-                            Some(guard)
-                        }
-                        None => None,
-                    };
-                    let state = guard.as_ref().map(|guard| guard.as_ref().unwrap());
-                    let old_len = state.map_or(0, |state| state.tokens.len());
-                    let ready_len = state.map_or(0, |state| state.kv.ready_len());
-                    let max_seq_len =
-                        state.map_or(self.pool.max_seq_len(), |state| state.kv.max_seq_len());
-                    let full_len = old_len
-                        .checked_add(tokens.len())
-                        .filter(|&len| len <= max_seq_len)
-                        .ok_or_else(|| {
-                            EngineError::InvalidInput("KV context capacity exceeded".into())
-                        })?;
-                    let sampling = request.sampling.clone().unwrap_or_else(|| {
-                        state.map_or_else(SamplingConfig::default, |state| state.sampling.clone())
-                    });
-                    if sampling.do_sample == Some(true)
-                        || sampling.temperature.is_some()
-                        || sampling.top_k.is_some()
-                        || sampling.top_p.is_some()
-                    {
-                        return Err(EngineError::InvalidInput(
-                            "only pure greedy generation is supported".into(),
-                        ));
-                    }
-                    self.model.validate_input(tokens.get_ids())?;
-                    let generated_kv = sampling.max_new_tokens.unwrap_or(1).saturating_sub(1);
-                    let end = full_len
-                        .checked_add(generated_kv)
-                        .filter(|&end| end <= max_seq_len)
-                        .ok_or_else(|| {
-                            EngineError::InvalidInput(
-                                "generation exceeds KV context capacity".into(),
-                            )
-                        })?;
-                    let mut encoded = SessionRequest::new(request.session_id, tokens)
-                        .with_request_id(request.assigned_request_id());
-                    encoded.sampling = Some(sampling);
-                    Ok((encoded, guard, end - ready_len))
-                }
-                .await;
-                let (request, guard, needed) = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        let _ = replies.send(RunnerReply::Finished {
-                            request_id,
-                            generated_tokens: 0,
-                            result: Err(error),
-                        });
-                        continue;
-                    }
-                };
-                Some((request, guard, needed))
-            } else {
-                None
-            };
-            // Capacity boundaries and end-of-input flush through the same execution path.
-            let flush = prepared.as_ref().is_none_or(|(_, guard, needed)| {
-                !self.pool.can_append(
-                    append_tokens.saturating_add(*needed),
-                    usize::from(guard.is_none()),
-                )
-            });
-            if flush && !encoded.is_empty() {
-                self.execute_model_batch(
-                    std::mem::take(&mut encoded),
-                    std::mem::take(&mut guards),
-                    replies,
-                )
-                .await;
-                append_tokens = 0;
-            }
-            let Some((request, guard, needed)) = prepared else {
-                break;
-            };
-            let new_contexts = usize::from(guard.is_none());
-            if !self
-                .pool
-                .can_append(append_tokens.saturating_add(needed), new_contexts)
-            {
-                drop(guard);
-                let _ = replies.send(RunnerReply::Finished {
-                    request_id: request.assigned_request_id(),
-                    generated_tokens: 0,
-                    result: Err(KVPoolError::CapacityExhausted(
-                        "insufficient KV capacity for request".into(),
-                    )
-                    .into()),
-                });
-                continue;
-            }
-            let guard = match guard {
-                Some(guard) => guard,
-                None => {
-                    let kv = match KVContext::new(self.pool.clone()) {
-                        Ok(kv) => kv,
-                        Err(error) => {
-                            let _ = replies.send(RunnerReply::Finished {
-                                request_id: request.assigned_request_id(),
-                                generated_tokens: 0,
-                                result: Err(error.into()),
-                            });
-                            continue;
-                        }
-                    };
-                    Arc::new(Mutex::new(Some(SessionState {
-                        tokens: Arc::new(Vec::new()),
-                        kv,
-                        sampling: SamplingConfig::default(),
-                    })))
-                    .lock_owned()
-                    .await
-                }
-            };
-            append_tokens += needed;
-            encoded.push(request);
-            guards.push(Some(guard));
-        }
-    }
-
-    /// Execute Scheduler commands serially, preserving session lifecycle ordering.
+    /// Receive new work at every forward boundary; cancellation drops active turns
+    /// while GPU leases retain any storage still in flight.
     pub async fn run(mut self, cancel_token: CancellationToken) {
-        loop {
-            let command = tokio::select! {
-                biased;
-                _ = cancel_token.cancelled() => break,
-                command = self.command_rx.recv() => match command { Some(command) => command, None => break },
-            };
-            match command {
-                RunnerCommand::Execute(batch) => {
-                    // Delta and Finished are sent inside execution; this await only drives the batch.
-                    tokio::select! {
-                        biased;
-                        _ = cancel_token.cancelled() => break,
-                        _ = self.prepare_batch(batch, &self.batch_reply_tx) => {},
-                    }
-                }
-                RunnerCommand::OpenSession { id, reply } => {
-                    let _ = reply.send(self.open_session(id));
-                }
-                RunnerCommand::CloseSession { id, reply } => {
-                    let _ = reply.send(self.close_session(id).await);
-                }
-            }
+        let mut commands = self.command_rx.take().unwrap();
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {},
+            _ = self.drive(&mut commands, &self.batch_reply_tx) => {},
         }
         self.sessions.clear();
     }
@@ -576,11 +584,21 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RequestId;
-    use std::time::Duration;
-    use tokenizers::Tokenizer;
+    use crate::types::BatchIn;
+    use std::{collections::HashMap, time::Duration};
 
     impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
+        async fn prepare_batch(
+            &self,
+            batch: BatchIn,
+            replies: &mpsc::UnboundedSender<RunnerReply>,
+        ) {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            tx.send(RunnerCommand::Execute(batch)).unwrap();
+            drop(tx);
+            self.drive(&mut rx, replies).await;
+        }
+
         async fn execute_collect(
             &self,
             batch: BatchIn,
@@ -635,6 +653,313 @@ mod tests {
         ) -> Result<LLMResponse, EngineError> {
             self.execute_collect(vec![request]).await.pop().unwrap().1
         }
+    }
+
+    #[derive(Debug)]
+    struct ForwardStep {
+        histories: Vec<Vec<u32>>,
+        resume: tokio::sync::oneshot::Sender<()>,
+    }
+
+    impl ForwardStep {
+        fn members(&self) -> Vec<u32> {
+            self.histories.iter().map(|tokens| tokens[0]).collect()
+        }
+    }
+
+    struct SteppedModel {
+        inner: SimpleMLPEngine,
+        steps: mpsc::UnboundedSender<ForwardStep>,
+    }
+
+    impl CausalModel<NaiveKVPool> for SteppedModel {
+        fn tokenizer(&self) -> &Tokenizer {
+            self.inner.tokenizer()
+        }
+        fn validate_input(&self, ids: &[u32]) -> Result<(), ModelError> {
+            self.inner.validate_input(ids)
+        }
+        async fn next_tokens(
+            &self,
+            batch: &mut [ModelInput<'_, NaiveKVPool>],
+            policy: Policy,
+        ) -> Vec<Result<u32, ModelError>> {
+            let (resume, proceed) = tokio::sync::oneshot::channel();
+            self.steps
+                .send(ForwardStep {
+                    histories: batch.iter().map(|input| input.token_ids.to_vec()).collect(),
+                    resume,
+                })
+                .unwrap();
+            proceed.await.unwrap();
+            self.inner.next_tokens(batch, policy).await
+        }
+    }
+
+    struct ContinuousRunner {
+        scheduler: crate::scheduler::Scheduler,
+        pool: Arc<NaiveKVPool>,
+        steps: mpsc::UnboundedReceiver<ForwardStep>,
+        finished_tokens: Arc<std::sync::Mutex<HashMap<RequestId, usize>>>,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ContinuousRunner {
+        async fn new(config: NaiveKVPoolConfig) -> Result<Self, EngineError> {
+            let policy = global_policy(0)?;
+            let pool = NaiveKVPool::new(config, &policy).await?;
+            let (steps, step_rx) = mpsc::unbounded_channel();
+            let model = SteppedModel {
+                inner: SimpleMLPEngine::random(0).await?,
+                steps,
+            };
+            let cancel = CancellationToken::new();
+            let (commands, rx) = mpsc::unbounded_channel();
+            let (replies, reply_rx) = mpsc::unbounded_channel();
+            let finished_tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let recorded = finished_tokens.clone();
+            let scheduler = crate::scheduler::Scheduler::new_with_observers(
+                cancel.child_token(),
+                commands,
+                reply_rx,
+                vec![Arc::new(
+                    move |request_id: RequestId,
+                          stats: &crate::scheduler::RequestStats,
+                          _result: &Result<(), EngineError>| {
+                        if let Some(tokens) = stats.generated_tokens {
+                            recorded.lock().unwrap().insert(request_id, tokens);
+                        }
+                    },
+                )],
+            );
+            let runner = ModelRunner::new(rx, replies, model, pool.clone(), policy);
+            let task = tokio::spawn(runner.run(cancel.child_token()));
+            Ok(Self {
+                scheduler,
+                pool,
+                steps: step_rx,
+                finished_tokens,
+                cancel,
+                task,
+            })
+        }
+
+        async fn step(&mut self) -> ForwardStep {
+            tokio::time::timeout(Duration::from_secs(30), self.steps.recv())
+                .await
+                .expect("next forward must become runnable")
+                .expect("Runner must remain connected")
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            self.scheduler.wait_stopped().await;
+            self.task.await.unwrap();
+            assert_eq!(self.pool.metrics().index.assigned_bytes, 0);
+            assert_eq!(self.pool.metrics().layers.assigned_bytes, 0);
+        }
+    }
+
+    fn generation(session: Option<SessionId>, input: &str, budget: usize) -> SessionRequest {
+        let mut request = SessionRequest::new(session, input.to_owned());
+        request.sampling = Some(SamplingConfig {
+            max_new_tokens: Some(budget),
+            ..Default::default()
+        });
+        request
+    }
+
+    /// Happy path: [A] -> [A, B] -> [A] -> [C] -> [C, A2].
+    /// B joins before A finishes; A2 continues A's session only after A's EOF.
+    /// Pauses control arrival timing only; all forwards execute on the GPU.
+    #[tokio::test]
+    async fn continuous_batching_happy_path_matches_serial_generation() -> Result<(), EngineError> {
+        use futures::TryStreamExt;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let reference = runner().await?;
+        reference.open_session(0)?;
+        let expected_a = reference
+            .execute_session(generation(Some(0), "1 2", 3).with_request_id(100))
+            .await?
+            .output;
+        let expected_a2 = reference
+            .execute_session(generation(Some(0), "5", 1).with_request_id(101))
+            .await?
+            .output;
+        reference.close_session(0)?;
+        let expected_b = reference
+            .execute_session(generation(None, "3 4", 1).with_request_id(102))
+            .await?
+            .output;
+        let expected_c = reference
+            .execute_session(generation(None, "7 8", 2).with_request_id(103))
+            .await?
+            .output;
+
+        let mut harness = ContinuousRunner::new(NaiveKVPoolConfig {
+            max_rows: 2,
+            num_slots: 16,
+            max_seq_len: 16,
+            ..Default::default()
+        })
+        .await?;
+        let scheduler = harness.scheduler.clone();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let session = scheduler.open_session().await?;
+            let a = scheduler.execute_stream(generation(Some(session), "1 2", 3))?;
+            let first = harness.step().await;
+            assert_eq!(first.members(), [1]);
+            assert_eq!(first.histories[0], [1, 2]);
+            // Admit B while A still has two generation steps remaining.
+            let b = scheduler.execute_stream(generation(None, "3 4", 1))?;
+            first.resume.send(()).unwrap();
+            let second = harness.step().await;
+            assert_eq!(second.members(), [1, 3]);
+            // step() pauses before execution: A has appended exactly one token
+            // from the first completed forward, while B still has only its prompt.
+            assert_eq!(second.histories[0].len(), first.histories[0].len() + 1);
+            assert!(second.histories[0].starts_with(&first.histories[0]));
+            assert_eq!(second.histories[1], [3, 4]);
+            second.resume.send(()).unwrap();
+            let third = harness.step().await;
+            assert_eq!(third.members(), [1]);
+            assert_eq!(third.histories[0].len(), second.histories[0].len() + 1);
+            assert!(third.histories[0].starts_with(&second.histories[0]));
+            let actual_b = b.try_collect::<Vec<_>>().await?;
+            assert_eq!(harness.finished_tokens.lock().unwrap().get(&1), Some(&1));
+            assert_eq!(
+                actual_b
+                    .into_iter()
+                    .map(|response| response.output)
+                    .collect::<String>(),
+                expected_b
+            );
+            let c = scheduler.execute_stream(generation(None, "7 8", 2))?;
+            third.resume.send(()).unwrap();
+            let fourth = harness.step().await;
+            assert_eq!(fourth.members(), [7]);
+            assert_eq!(fourth.histories[0], [7, 8]);
+            let actual_a = a
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .map(|response| response.output)
+                .collect::<String>();
+            assert_eq!(actual_a, expected_a);
+            assert_eq!(harness.finished_tokens.lock().unwrap().get(&0), Some(&3));
+            // A's client submits its next turn only after observing completion.
+            let next = scheduler.execute_stream(generation(Some(session), "5", 1))?;
+            fourth.resume.send(()).unwrap();
+            let fifth = harness.step().await;
+            assert_eq!(fifth.members(), [7, 1]);
+            assert_eq!(fifth.histories[0].len(), fourth.histories[0].len() + 1);
+            assert!(fifth.histories[0].starts_with(&fourth.histories[0]));
+            assert_eq!(fifth.histories[1].len(), 6);
+            assert_eq!(fifth.histories[1].last(), Some(&5));
+            fifth.resume.send(()).unwrap();
+            let actual_a2 = next
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .map(|response| response.output)
+                .collect::<String>();
+            assert_eq!(actual_a2, expected_a2);
+            let actual_c = c.try_collect::<Vec<_>>().await?;
+            // Scheduler assigns A/B/C/A2 IDs 0/1/2/3. Count model tokens, not text
+            // deltas: a decoder may buffer tokens or emit a variable-sized chunk.
+            assert_eq!(
+                *harness.finished_tokens.lock().unwrap(),
+                HashMap::from([(0, 3), (1, 1), (2, 2), (3, 1)])
+            );
+            assert_eq!(
+                actual_c
+                    .into_iter()
+                    .map(|response| response.output)
+                    .collect::<String>(),
+                expected_c
+            );
+            scheduler.close_session(session).await?;
+            assert_eq!(harness.pool.metrics().index.assigned_bytes, 0);
+            Ok::<_, EngineError>(())
+        })
+        .await;
+        harness.stop().await;
+        result.expect("dynamic membership and client-serialized turns must make progress")
+    }
+
+    #[tokio::test]
+    async fn continuous_admission_protects_future_decode_slots_and_skips_waiting_peers(
+    ) -> Result<(), EngineError> {
+        use futures::TryStreamExt;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let mut harness = ContinuousRunner::new(NaiveKVPoolConfig {
+            max_rows: 2,
+            num_slots: 4,
+            max_seq_len: 8,
+            ..Default::default()
+        })
+        .await?;
+        let scheduler = harness.scheduler.clone();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let a = scheduler.execute_stream(generation(None, "1", 3))?;
+            let first = harness.step().await;
+            assert_eq!(first.members(), [1]);
+            let b = scheduler.execute_stream(generation(None, "7 8", 1))?;
+            let c = scheduler.execute_stream(generation(None, "9", 1))?;
+            first.resume.send(()).unwrap();
+            let second = harness.step().await;
+            // A owns one slot and needs two more; only C fits the remaining budget.
+            assert_eq!(second.members(), [1, 9]);
+            second.resume.send(()).unwrap();
+            let third = harness.step().await;
+            assert_eq!(third.members(), [1]);
+            assert_eq!(c.try_collect::<Vec<_>>().await?.len(), 1);
+            third.resume.send(()).unwrap();
+            let fourth = harness.step().await;
+            assert_eq!(fourth.members(), [7]);
+            assert_eq!(a.try_collect::<Vec<_>>().await?.len(), 3);
+            assert_eq!(harness.pool.metrics().index.assigned_bytes, 8 * 4);
+            fourth.resume.send(()).unwrap();
+            assert_eq!(b.try_collect::<Vec<_>>().await?.len(), 1);
+            Ok::<_, EngineError>(())
+        })
+        .await;
+        harness.stop().await;
+        result.expect("waiting work must progress after active KV is released")
+    }
+
+    #[tokio::test]
+    async fn continuous_cancellation_releases_active_and_waiting_requests(
+    ) -> Result<(), EngineError> {
+        use futures::TryStreamExt;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let mut harness = ContinuousRunner::new(NaiveKVPoolConfig {
+            max_rows: 2,
+            num_slots: 16,
+            max_seq_len: 8,
+            ..Default::default()
+        })
+        .await?;
+        let scheduler = harness.scheduler.clone();
+        let a = scheduler.execute_stream(generation(None, "1 2", 3))?;
+        let b = scheduler.execute_stream(generation(None, "3 4", 3))?;
+        let first = harness.step().await;
+        assert_eq!(first.members(), [1, 3]);
+        let waiting = scheduler.execute_stream(generation(None, "7", 1))?;
+        first.resume.send(()).unwrap();
+        let second = harness.step().await;
+        assert_eq!(second.members(), [1, 3]);
+        harness.stop().await;
+        for result in [
+            a.try_collect::<Vec<_>>().await,
+            b.try_collect::<Vec<_>>().await,
+            waiting.try_collect::<Vec<_>>().await,
+        ] {
+            assert!(matches!(result, Err(EngineError::ChannelClosed)));
+        }
+        drop(second);
+        Ok(())
     }
 
     #[test]
@@ -951,8 +1276,8 @@ mod tests {
         runner.execute_session(resumed).await?;
         let entry = runner.sessions.get(&20).unwrap().value().clone();
         assert_eq!(entry.lock().await.as_ref().unwrap().kv.ready_len(), 5);
-        runner.close_session(10).await?;
-        runner.close_session(20).await?;
+        runner.close_session(10)?;
+        runner.close_session(20)?;
         assert_eq!(runner.pool.metrics(), initial);
         Ok(())
     }
@@ -1044,7 +1369,7 @@ mod tests {
             &[1, 2, first.output.parse::<u32>().unwrap()]
         );
         assert_eq!(runner.pool.metrics(), retained);
-        runner.close_session(10).await?;
+        runner.close_session(10)?;
         assert_eq!(runner.pool.metrics(), initial);
         Ok(())
     }
@@ -1162,8 +1487,8 @@ mod tests {
             .execute_collect(vec![request(3, Some(10), "1 2"), request(4, Some(20), "8")])
             .await;
         assert!(reply.iter().all(|(_, result)| result.is_ok()));
-        runner.close_session(10).await?;
-        runner.close_session(20).await?;
+        runner.close_session(10)?;
+        runner.close_session(20)?;
         assert_eq!(pool.metrics(), initial);
         Ok(())
     }
@@ -1215,7 +1540,7 @@ mod tests {
         let entry = runner.sessions.get(&10).unwrap().value().clone();
         assert!(entry.lock().await.is_none());
         assert_eq!(pool.metrics(), initial);
-        runner.close_session(10).await?;
+        runner.close_session(10)?;
         assert!(!runner.sessions.contains_key(&10));
         runner.open_session(20)?;
         let entered = runner.model.entered.clone();
@@ -1302,38 +1627,37 @@ mod tests {
         assert_eq!(entry.lock().await.as_ref().unwrap().tokens.len(), 7);
         runner.execute_session(request(8, Some(10), "9")).await?;
         assert!(runner.execute_collect(vec![]).await.is_empty());
-        runner.close_session(10).await?;
-        runner.close_session(20).await?;
-        assert!(runner.close_session(10).await.is_err());
+        runner.close_session(10)?;
+        runner.close_session(20)?;
+        assert!(runner.close_session(10).is_err());
         assert_eq!(runner.pool.metrics(), initial);
         Ok(())
     }
 
     #[tokio::test]
-    async fn blocked_session_does_not_block_another_session() -> Result<(), EngineError> {
+    async fn busy_session_is_rejected_without_blocking_another_session() -> Result<(), EngineError>
+    {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let runner = runner().await?;
         runner.open_session(10)?;
         runner.open_session(20)?;
         let entry = runner.sessions.get(&10).unwrap().value().clone();
         let held = entry.lock_owned().await;
-        let (blocked, independent) =
-            tokio::join!(runner.execute_session(request(1, Some(10), "1 2")), async {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    runner.execute_session(request(2, Some(20), "8 9 7")),
-                )
-                .await;
-                drop(held);
-                result
-            });
-        blocked?;
-        independent.expect("an unrelated session must not wait for session 10")?;
-        // Same-session concurrent turns must preserve both deltas with no lost updates.
-        let (a, b) = tokio::join!(
-            runner.execute_session(request(3, Some(10), "3")),
-            runner.execute_session(request(4, Some(10), "4"))
-        );
+        assert!(matches!(runner.close_session(10),
+            Err(EngineError::InvalidInput(message)) if message == "session is busy"));
+        let replies = runner
+            .execute_collect(vec![
+                request(1, Some(10), "1 2"),
+                request(2, Some(20), "8 9 7"),
+            ])
+            .await;
+        assert!(matches!(&replies[0].1,
+            Err(EngineError::InvalidInput(message)) if message == "session is busy"));
+        assert!(replies[1].1.is_ok());
+        drop(held);
+        runner.execute_session(request(3, Some(10), "1 2")).await?;
+        let a = runner.execute_session(request(4, Some(10), "3")).await;
+        let b = runner.execute_session(request(5, Some(10), "4")).await;
         let a_token = a?.output.parse::<u32>().unwrap();
         let b_token = b?.output.parse::<u32>().unwrap();
         let entry = runner.sessions.get(&10).unwrap().value().clone();
@@ -1351,8 +1675,8 @@ mod tests {
         expected.sort();
         assert_eq!(generated, expected);
         drop(guard);
-        runner.close_session(10).await?;
-        runner.close_session(20).await?;
+        runner.close_session(10)?;
+        runner.close_session(20)?;
         assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
         Ok(())
     }
@@ -1392,7 +1716,7 @@ mod tests {
         for id in [10, 20] {
             let entry = runner.sessions.get(&id).unwrap().value().clone();
             assert_eq!(entry.lock().await.as_ref().unwrap().kv.ready_len(), 3);
-            runner.close_session(id).await?;
+            runner.close_session(id)?;
         }
         assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
         Ok(())
@@ -1436,13 +1760,14 @@ mod tests {
             ))
         ));
         scheduler.close_session(second).await?;
-        let (a, b, stateless) = tokio::join!(
+        let (a, stateless) = tokio::join!(
             scheduler.execute(SessionRequest::new(Some(session_id), "1 2".into())),
-            scheduler.execute(SessionRequest::new(Some(session_id), "3".into())),
             scheduler.execute(SessionRequest::new(None, "8 9".into()))
         );
         let a = a?;
-        let b = b?;
+        let b = scheduler
+            .execute(SessionRequest::new(Some(session_id), "3".into()))
+            .await?;
         let next = scheduler
             .execute(SessionRequest::new(Some(session_id), "4 5".into()))
             .await;
