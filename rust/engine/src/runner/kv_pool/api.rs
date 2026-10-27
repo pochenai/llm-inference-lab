@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use cuda_async::device_operation::ExecutionContext;
 use cutile::tensor::TensorView;
@@ -114,11 +114,15 @@ pub struct KVPoolMetrics {
 
 /// Logical progress independent of the pool's physical layout.
 pub struct KVContext<P: KVPool> {
+    /// Physical storage owner; logical progress does not depend on its layout.
     pool: Arc<P>,
+    /// Backend ownership, temporarily absent while moved into a submission task.
     state: Option<P::ContextState>,
+    /// End of the prefix whose GPU work completed successfully and was committed.
     ready_len: usize,
-    allocated_len: usize,
-    pending: Option<Range<usize>>,
+    /// FIFO ends of at most two uncommitted appends; starts follow ready_len/previous end.
+    /// Example: ready_len=10, ends=[14,15] means [10..14,14..15]; only the last is writable.
+    pending_ends: VecDeque<usize>,
 }
 
 impl<P: KVPool> KVContext<P> {
@@ -128,8 +132,7 @@ impl<P: KVPool> KVContext<P> {
             pool,
             state: Some(state),
             ready_len: 0,
-            allocated_len: 0,
-            pending: None,
+            pending_ends: VecDeque::new(),
         })
     }
 
@@ -138,22 +141,33 @@ impl<P: KVPool> KVContext<P> {
         self.state.as_ref().unwrap()
     }
 
-    /// Logical append range; returning a copy does not expose mutable progress.
+    /// Newest reserved append, not the full in-flight FIFO; returning a copy
+    /// does not expose mutable progress.
     pub fn pending_range(&self) -> Option<Range<usize>> {
-        self.pending.clone()
+        let end = *self.pending_ends.back()?;
+        let start = self
+            .pending_ends
+            .iter()
+            .rev()
+            .nth(1)
+            .copied()
+            .unwrap_or(self.ready_len);
+        Some(start..end)
     }
 
     pub fn ready_len(&self) -> usize {
         self.ready_len
     }
+    /// Logical reservation cursor, derived from the newest append or committed prefix.
+    /// After a backend prepare failure it includes attempted work; release the context.
     pub fn allocated_len(&self) -> usize {
-        self.allocated_len
+        self.pending_ends.back().copied().unwrap_or(self.ready_len)
     }
     pub fn max_seq_len(&self) -> usize {
         self.pool.max_seq_len()
     }
     pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
+        !self.pending_ends.is_empty()
     }
 
     /// Reserve an append and enqueue GPU mapping updates without advancing ready_len.
@@ -163,7 +177,7 @@ impl<P: KVPool> KVContext<P> {
     /// invalidates this context until release; rollback/truncate is not implemented.
     pub fn prepare_append(&mut self, count: usize, exec: &ExecutionContext) -> ContextResult<()> {
         let _range = crate::profiling::ScopedRange::new(c"prepare_append");
-        if self.pending.is_some() || count == 0 {
+        if !self.pending_ends.is_empty() || count == 0 {
             return Err(KVContextError::InvalidState(
                 "append must be nonempty and context idle".into(),
             ));
@@ -175,10 +189,9 @@ impl<P: KVPool> KVContext<P> {
             .ok_or(KVContextError::CapacityExceeded)?;
         let positions = self.ready_len..end;
         // Mark pending before submission: partial failure must never expose ready KV.
-        self.pending = Some(positions.clone());
+        self.pending_ends.push_back(end);
         self.pool
             .prepare_append(self.state.as_mut().unwrap(), positions, exec)?;
-        self.allocated_len = end;
         Ok(())
     }
 
@@ -192,7 +205,17 @@ impl<P: KVPool> KVContext<P> {
         if appends.is_empty() {
             return Ok(());
         }
-        Self::prepare_batch_with(appends, exec, |pool, states, exec| {
+        Self::prepare_batch_with(appends, exec, false, |pool, states, exec| {
+            pool.prepare_append_batch(states, exec)
+        })
+    }
+
+    /// Ordered compute-stream path; at most the previous and current appends coexist.
+    pub(in crate::runner) fn prepare_queued_append_batch(
+        appends: &mut [(&mut Self, usize)],
+        exec: &ExecutionContext,
+    ) -> ContextResult<()> {
+        Self::prepare_batch_with(appends, exec, true, |pool, states, exec| {
             pool.prepare_append_batch(states, exec)
         })
     }
@@ -200,6 +223,7 @@ impl<P: KVPool> KVContext<P> {
     pub(super) fn prepare_batch_with<T>(
         appends: &mut [(&mut Self, usize)],
         exec: &ExecutionContext,
+        queued: bool,
         prepare: impl FnOnce(
             &P,
             &mut [(&mut P::ContextState, Range<usize>)],
@@ -217,34 +241,32 @@ impl<P: KVPool> KVContext<P> {
                     "append batch must use one KV pool".into(),
                 ));
             }
-            if context.pending.is_some() || *count == 0 {
+            if (!queued && !context.pending_ends.is_empty())
+                || context.pending_ends.len() >= 2
+                || *count == 0
+            {
                 return Err(KVContextError::InvalidState(
                     "append must be nonempty and context idle".into(),
                 ));
             }
             context
-                .ready_len
+                .allocated_len()
                 .checked_add(*count)
                 .filter(|&end| end <= pool.max_seq_len())
                 .ok_or(KVContextError::CapacityExceeded)?;
         }
         for (context, count) in appends.iter_mut() {
-            context.pending = Some(context.ready_len..context.ready_len + *count);
+            let end = context.allocated_len() + *count;
+            context.pending_ends.push_back(end);
         }
         let mut states: Vec<_> = appends
             .iter_mut()
             .map(|(context, _)| {
-                (
-                    context.state.as_mut().unwrap(),
-                    context.pending.clone().unwrap(),
-                )
+                let positions = context.pending_range().unwrap();
+                (context.state.as_mut().unwrap(), positions)
             })
             .collect();
-        let output = prepare(&pool, &mut states, exec)?;
-        for (context, _) in appends {
-            context.allocated_len = context.pending.as_ref().unwrap().end;
-        }
-        Ok(output)
+        Ok(prepare(&pool, &mut states, exec)?)
     }
 
     /// View all reserved positions, including history and the current pending append.
@@ -252,7 +274,7 @@ impl<P: KVPool> KVContext<P> {
     pub fn read_view(&self, layer: usize) -> ContextResult<P::ReadView<'_>> {
         Ok(self
             .pool
-            .read_view(self.state(), layer, 0..self.allocated_len)?)
+            .read_view(self.state(), layer, 0..self.allocated_len())?)
     }
 
     /// Expose only the current pending append as writable destinations; callers cannot
@@ -276,8 +298,7 @@ impl<P: KVPool> KVContext<P> {
         exec: &'a ExecutionContext,
     ) -> ContextResult<P::WriteView<'a>> {
         let positions = self
-            .pending
-            .clone()
+            .pending_range()
             .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
         Ok(self
             .pool
@@ -296,8 +317,7 @@ impl<P: KVPool> KVContext<P> {
         exec: &ExecutionContext,
     ) -> ContextResult<()> {
         let positions = self
-            .pending
-            .clone()
+            .pending_range()
             .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
         let dst = self
             .pool
@@ -311,19 +331,42 @@ impl<P: KVPool> KVContext<P> {
     /// layers, e.g. after the outer scheduled operation is awaited or sync_on succeeds.
     pub(in crate::runner) fn commit_append(&mut self) -> ContextResult<()> {
         let _range = crate::profiling::ScopedRange::new(c"commit_append");
-        let pending = self
-            .pending
-            .take()
+        self.ready_len = self
+            .pending_ends
+            .pop_front()
             .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
-        self.ready_len = pending.end;
         Ok(())
     }
 
-    /// Release ownership, including failed pending appends. Pool leases protect GPU work.
-    pub fn release(mut self) {
-        if let Some(state) = self.state.take() {
-            self.pool.release_state(state);
+    /// Move ownership into a submission task. The vacant source must be restored
+    /// before scheduling/access, or invalidated on a failed/cancelled submission.
+    pub(in crate::runner) fn take_context_for_gpu_submission(&mut self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            state: self.state.take(),
+            ready_len: self.ready_len,
+            pending_ends: std::mem::take(&mut self.pending_ends),
         }
+    }
+
+    /// False only after ownership was taken for submission or released.
+    pub(in crate::runner) fn has_owned_pool_state(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Commit the FIFO append only after its particular completion succeeded.
+    pub(in crate::runner) fn commit_completed_append(&mut self, end: usize) -> ContextResult<()> {
+        if self.pending_ends.front().copied() != Some(end) {
+            return Err(KVContextError::InvalidState(
+                "KV completions must commit in submission order".into(),
+            ));
+        }
+        self.commit_append()
+    }
+
+    /// Release ownership, including failed pending appends. Pool leases protect GPU work.
+    pub fn release(self) {
+        drop(self);
     }
 }
 

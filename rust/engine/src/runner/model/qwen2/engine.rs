@@ -41,6 +41,9 @@
 //! Greedy argmax -> next token ID
 //! ```
 
+use super::super::submission::{
+    submit_model_batch_and_restore_kv_contexts, GpuWorkCompletionFuture,
+};
 use super::{
     kernels,
     metrics::{Instruments, WorkspaceMetrics},
@@ -53,7 +56,8 @@ use crate::runner::{
     upload::UploadPool,
 };
 use crate::{
-    AttentionBackend, CausalModel, DeviceToken, ModelError, ModelInput, ModelTokens, NextToken,
+    AttentionBackend, CausalModel, GpuTokenPredictionHandle, ModelError, ModelInput, ModelTokens,
+    NextToken, SubmittedGpuWorkWithCompletion,
 };
 use cuda_async::{
     device_operation::*,
@@ -64,6 +68,7 @@ use cutile::{
     tensor::{PartitionMut, Reshape, Tensor},
     tile_kernel::TileKernel,
 };
+use futures::FutureExt;
 use serde::Deserialize;
 use std::{ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
@@ -136,6 +141,13 @@ pub struct Qwen2Engine {
     token_readbacks: Arc<ReadbackCache<i32>>,
     readback_policy: Arc<dyn SchedulingPolicy>,
     logit_readbacks: ReadbackCache<f32>,
+}
+
+/// GPU output and its producing stream; context restoration belongs to the submission helper.
+struct QwenForwardStateAfterSubmission {
+    gpu_output: Result<StepOutput<Tensor<i32>, Tensor<f32>>, ModelError>,
+    /// Raw CUDA stream handle used as the identity for ordered GPU feedback.
+    compute_stream_id: usize,
 }
 
 impl Qwen2Engine {
@@ -389,15 +401,19 @@ impl Qwen2Engine {
             ));
         }
         match &input.token_ids {
-            ModelTokens::Host(tokens) => self.validate_input(&tokens[kv.ready_len()..]),
+            ModelTokens::BorrowedHost(_) | ModelTokens::SharedHost { .. } => {
+                self.validate_input(&input.token_ids.host()?[kv.allocated_len()..])
+            }
             ModelTokens::Device(token)
                 if token.values.device_id() == self.embedding.device_id()
-                    && token.vocab_size == self.config.vocab_size =>
+                    && token.vocab_size == self.config.vocab_size
+                    && token.position == kv.ready_len()
+                    && token.producer_stream_id.is_none() =>
             {
                 Ok(())
             }
             ModelTokens::Device(_) => Err(ModelError::InvalidInput(
-                "token feedback has incompatible device or vocabulary".into(),
+                "expected completed feedback at the context cursor; queued feedback uses enqueue_forward_and_return_completion".into(),
             )),
         }
     }
@@ -426,7 +442,7 @@ impl Qwen2Engine {
         let start = Instant::now();
         let result = Self::execute_append_batch(batch, &policy, |batch, exec| {
             // SAFETY: every GPU access, including D2H, belongs to this submission.
-            unsafe { self.submit(batch, read_logits, exec) }
+            unsafe { self.enqueue_forward_with_host_readback(batch, read_logits, exec) }
         })
         .await;
         let step_wall_seconds = start.elapsed().as_secs_f64();
@@ -443,13 +459,15 @@ impl Qwen2Engine {
         result
     }
 
-    unsafe fn submit(
+    /// Enqueue a forward and token/optional-logit D2H on the same exec.
+    /// Caller must await this submission before accessing its host buffers.
+    unsafe fn enqueue_forward_with_host_readback(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         read_logits: bool,
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
-        let output = self.submit_device(batch, exec)?;
+        let output = self.submit_forward_kernels(batch, exec)?;
         let token = enqueue_readback(output.token, &self.token_readbacks, exec)?;
         let logits = if read_logits {
             Some(enqueue_readback(
@@ -467,7 +485,9 @@ impl Qwen2Engine {
         })
     }
 
-    unsafe fn submit_device(
+    /// Enqueue packed Transformer layers, KV writes and argmax on exec's stream.
+    /// Returned tensors are GPU handles; their values may still be pending.
+    unsafe fn submit_forward_kernels(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         exec: &ExecutionContext,
@@ -475,10 +495,13 @@ impl Qwen2Engine {
         let submit_started = Instant::now();
         // Thread-local NVTX range covers synchronous submission only, never the await.
         let _range = crate::profiling::ScopedRange::new(
-            if batch
-                .iter()
-                .any(|input| input.kv.ready_len() == 0 || input.uncached_len() > 1)
-            {
+            if batch.iter().any(|input| {
+                input
+                    .kv
+                    .pending_range()
+                    .is_some_and(|range| range.start == 0)
+                    || input.uncached_len() > 1
+            }) {
                 c"qwen2.prefill.submit"
             } else {
                 c"qwen2.decode.submit"
@@ -516,11 +539,11 @@ impl Qwen2Engine {
         };
         if batch
             .iter()
-            .all(|input| matches!(input.token_ids, ModelTokens::Host(_)))
+            .all(|input| !matches!(input.token_ids, ModelTokens::Device(_)))
         {
             let ids = self.input_uploads.upload_iter(
                 batch.iter().flat_map(|input| {
-                    input.token_ids.host().unwrap()[input.kv.ready_len()..]
+                    input.token_ids.host().unwrap()[input.kv.pending_range().unwrap().start..]
                         .iter()
                         .copied()
                 }),
@@ -568,9 +591,12 @@ impl Qwen2Engine {
             let sources = self.embedding_sources.upload_iter(
                 batch.iter().flat_map(|input| {
                     (0..input.uncached_len()).flat_map(move |local| match &input.token_ids {
-                        ModelTokens::Host(tokens) => {
-                            [0, tokens[input.kv.ready_len() + local] as u64]
-                        }
+                        ModelTokens::BorrowedHost(_) | ModelTokens::SharedHost { .. } => [
+                            0,
+                            input.token_ids.host().unwrap()
+                                [input.kv.pending_range().unwrap().start + local]
+                                as u64,
+                        ],
                         ModelTokens::Device(token) => [
                             token.values.device_pointer().cu_deviceptr()
                                 + (token.index * std::mem::size_of::<i32>()) as u64,
@@ -709,12 +735,52 @@ impl Qwen2Engine {
             blocks as i32,
         )
         .execute(exec)?;
-        // These tensors are handed out only after the compute submission completes.
+        // GPU handles may escape after enqueue; consumers must observe stream order or completion.
         Ok(StepOutput {
             token: scratch.winner,
             logits: Some(scratch.logits),
             host_submit_seconds: submit_started.elapsed().as_secs_f64(),
         })
+    }
+
+    /// Wrap sampled GPU storage; one shared D2H future waits for producer completion.
+    /// GPU feedback can be consumed earlier on the same ordered compute stream.
+    fn build_gpu_token_handles_with_deferred_readback(
+        &self,
+        values: Tensor<i32>,
+        positions: Vec<usize>,
+        completion: GpuWorkCompletionFuture,
+        producer_stream_id: Option<usize>,
+    ) -> impl Iterator<Item = GpuTokenPredictionHandle> + 'static {
+        let values = Arc::new(values);
+        let source = values.clone();
+        let cache = self.token_readbacks.clone();
+        let policy = self.readback_policy.clone();
+        let duration = self.instruments.readback_duration.clone();
+        let host = async move {
+            completion.await?;
+            let started = Instant::now();
+            let result: Result<Readback<i32>, ModelError> = async {
+                let output = with_context(|exec| {
+                    // SAFETY: producer completed; the D2H submission retains both owners.
+                    value(unsafe { enqueue_readback(source, &cache, exec) })
+                })
+                .schedule(&policy)?
+                .await??;
+                Ok(output)
+            }
+            .await;
+            let readback_wall_seconds = started.elapsed().as_secs_f64();
+            duration.record(readback_wall_seconds);
+            tracing::debug!(target: "engine::qwen2", event = "readback_completed",
+                readback_wall_seconds, success = result.is_ok());
+            result
+        };
+        GpuTokenPredictionHandle::batch(values, host, self.config.vocab_size, positions.into_iter())
+            .map(move |mut token| {
+                token.producer_stream_id = producer_stream_id;
+                token
+            })
     }
 
     unsafe fn linear(
@@ -957,7 +1023,12 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         let prefill = batch.iter().zip(&outputs).any(|(input, output)| {
             output.is_ok() && (input.kv.ready_len() == 0 || input.uncached_len() > 1)
         });
+        let submit = |batch: &mut [ModelInput<'_, NaiveKVPool>], exec: &ExecutionContext| {
+            // SAFETY: all layers and their resources belong to this submission.
+            unsafe { self.submit_forward_kernels(batch, exec) }
+        };
         let result = if outputs.iter().any(Result::is_err) {
+            // only execute non-error request
             let mut valid: Vec<_> = batch
                 .iter_mut()
                 .zip(&outputs)
@@ -971,17 +1042,9 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             if valid.is_empty() {
                 return outputs;
             }
-            Self::execute_append_batch(&mut valid, &policy, |batch, exec| {
-                // SAFETY: all layers and their resources belong to this submission.
-                unsafe { self.submit_device(batch, exec) }
-            })
-            .await
+            Self::execute_append_batch(&mut valid, &policy, submit).await
         } else {
-            Self::execute_append_batch(batch, &policy, |batch, exec| {
-                // SAFETY: all layers and their resources belong to this submission.
-                unsafe { self.submit_device(batch, exec) }
-            })
-            .await
+            Self::execute_append_batch(batch, &policy, submit).await
         };
         let host_submit_seconds = result
             .as_ref()
@@ -999,30 +1062,18 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             host_submit_seconds, success = result.is_ok());
         match result {
             Ok(result) => {
-                let device = Arc::new(result.token);
-                let source = device.clone();
-                let cache = self.token_readbacks.clone();
-                let copy_policy = self.readback_policy.clone();
-                let readback_duration = self.instruments.readback_duration.clone();
-                let host = async move {
-                    let start = Instant::now();
-                    let result: Result<Readback<i32>, ModelError> = async {
-                        let values = with_context(|exec| {
-                            // SAFETY: producer completed; exec retains both DMA owners.
-                            value(unsafe { enqueue_readback(source, &cache, exec) })
-                        })
-                        .schedule(&copy_policy)?
-                        .await??;
-                        Ok(values)
-                    }
-                    .await;
-                    let readback_wall_seconds = start.elapsed().as_secs_f64();
-                    readback_duration.record(readback_wall_seconds);
-                    tracing::debug!(target: "engine::qwen2", event = "readback_completed",
-                        readback_wall_seconds, success = result.is_ok());
-                    result
-                };
-                let tokens = DeviceToken::batch(device, host, self.config.vocab_size);
+                let positions = batch
+                    .iter()
+                    .zip(&outputs)
+                    .filter(|(_, output)| output.is_ok())
+                    .map(|(input, _)| input.kv.ready_len())
+                    .collect();
+                let tokens = self.build_gpu_token_handles_with_deferred_readback(
+                    result.token,
+                    positions,
+                    futures::future::ready(Ok(())).boxed().shared(),
+                    None,
+                );
                 for (output, token) in outputs
                     .iter_mut()
                     .filter(|output| output.is_ok())
@@ -1043,6 +1094,171 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             batch_wall_seconds = start.elapsed().as_secs_f64(),
             failed = outputs.iter().filter(|output| output.is_err()).count());
         outputs
+    }
+
+    /// Enqueue one packed forward and restore KV owners before returning GPU handles.
+    /// Runner waits for gpu_completion later, then commits KV and processes predictions.
+    async fn enqueue_forward_and_return_completion(
+        self: Arc<Self>,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        policy: Arc<dyn SchedulingPolicy>,
+    ) -> SubmittedGpuWorkWithCompletion {
+        let mut outputs: Vec<_> = batch
+            .iter()
+            .map(|input| {
+                let end = input.sequence_len();
+                if end <= input.kv.allocated_len()
+                    || end > input.kv.max_seq_len()
+                    || end > self.config.max_position_embeddings
+                {
+                    return Err(ModelError::InvalidInput(
+                        "invalid queued model input range".into(),
+                    ));
+                }
+                match &input.token_ids {
+                    ModelTokens::Device(token)
+                        if token.position != input.kv.allocated_len()
+                            || token.values.device_id() != self.embedding.device_id()
+                            || token.vocab_size != self.config.vocab_size =>
+                    {
+                        Err(ModelError::InvalidInput(
+                            "stale or incompatible GPU feedback".into(),
+                        ))
+                    }
+                    ModelTokens::Device(_) => Ok(NextToken::Host(0)),
+                    _ => self
+                        .validate_input(&input.token_ids.host()?[input.kv.allocated_len()..])
+                        .map(|()| NextToken::Host(0)),
+                }
+            })
+            .collect();
+        if outputs.iter().all(Result::is_err) {
+            return SubmittedGpuWorkWithCompletion::from_completed_output(outputs);
+        }
+        let positions: Vec<_> = batch
+            .iter()
+            .zip(&outputs)
+            .filter(|(_, result)| result.is_ok())
+            .map(|(input, _)| input.sequence_len())
+            .collect();
+        let rows: usize = batch
+            .iter()
+            .zip(&outputs)
+            .filter(|(_, result)| result.is_ok())
+            .map(|(input, _)| input.uncached_len())
+            .sum();
+        let prefill = batch.iter().zip(&outputs).any(|(input, result)| {
+            result.is_ok()
+                && (!matches!(input.token_ids, ModelTokens::Device(_)) || input.uncached_len() > 1)
+        });
+        let selected = outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| result.is_ok().then_some(index));
+        let model = self.clone();
+        let started = Instant::now();
+        // The helper restores KV ownership before returning; GPU completion is awaited later.
+        let submitted = submit_model_batch_and_restore_kv_contexts(
+            batch,
+            selected,
+            &policy,
+            move |inputs, exec| {
+                let result = (|| {
+                    for input in inputs.iter() {
+                        if let ModelTokens::Device(token) = &input.token_ids {
+                            if token.producer_stream_id.is_some_and(|stream| {
+                                stream != exec.get_cuda_stream().cu_stream() as usize
+                            }) {
+                                return Err(ModelError::InvalidInput(
+                                    "queued feedback requires the same compute stream".into(),
+                                ));
+                            }
+                        }
+                    }
+                    let mut appends: Vec<_> = inputs
+                        .iter_mut()
+                        .map(|input| {
+                            let count = input.uncached_len();
+                            (&mut *input.kv, count)
+                        })
+                        .collect();
+                    KVContext::prepare_queued_append_batch(&mut appends, exec)?;
+                    // SAFETY: the normal DeviceFuture retains every submitted resource.
+                    unsafe { model.submit_forward_kernels(inputs, exec) }
+                })();
+                QwenForwardStateAfterSubmission {
+                    gpu_output: result,
+                    compute_stream_id: exec.get_cuda_stream().cu_stream() as usize,
+                }
+            },
+        )
+        .await;
+        let SubmittedGpuWorkWithCompletion {
+            output: qwen_state,
+            gpu_completion,
+        } = match submitted {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|result| result.is_ok()) {
+                    *output = Err(error.clone());
+                }
+                return SubmittedGpuWorkWithCompletion::from_completed_output(outputs);
+            }
+        };
+        let result = qwen_state.gpu_output;
+        let batch_size = batch.len();
+        let host_submit_seconds = result
+            .as_ref()
+            .ok()
+            .map(|output| output.host_submit_seconds);
+        let model = self.clone();
+        let gpu_completion = async move {
+            let result = gpu_completion.await;
+            model.instruments.step(
+                prefill,
+                rows,
+                started.elapsed().as_secs_f64(),
+                if result.is_ok() {
+                    host_submit_seconds
+                } else {
+                    None
+                },
+            );
+            let batch_wall_seconds = started.elapsed().as_secs_f64();
+            tracing::debug!(target: "engine::qwen2", event = "step_completed",
+                phase = if prefill { "prefill" } else { "decode" }, input_tokens = rows,
+                batch_size, step_wall_seconds = batch_wall_seconds, host_submit_seconds,
+                success = result.is_ok() && host_submit_seconds.is_some());
+            model.instruments.batch(batch_size, batch_wall_seconds);
+            tracing::debug!(target: "engine::qwen2", event = "batch_completed",
+                batch_size, batch_wall_seconds, success = result.is_ok() && host_submit_seconds.is_some());
+            result
+        }
+        .boxed()
+        .shared();
+        match result {
+            Ok(result) => {
+                for (output, token) in outputs.iter_mut().filter(|result| result.is_ok()).zip(
+                    self.build_gpu_token_handles_with_deferred_readback(
+                        result.token,
+                        positions,
+                        gpu_completion.clone(),
+                        Some(qwen_state.compute_stream_id),
+                    ),
+                ) {
+                    *output = Ok(NextToken::Device(token));
+                }
+            }
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|result| result.is_ok()) {
+                    *output = Err(error.clone());
+                }
+            }
+        }
+        SubmittedGpuWorkWithCompletion {
+            output: outputs,
+            gpu_completion,
+        }
     }
 
     fn is_eos(&self, token: u32) -> bool {
@@ -1669,7 +1885,7 @@ mod tests {
             .schedule(&policy)?
             .await??;
             // Negative/invalid feedback clamps only to prevent an unsafe GPU
-            // load; DeviceToken::read still reports invalid sampled IDs separately.
+            // load; GpuTokenPredictionHandle::read still reports invalid sampled IDs separately.
             for (row, id) in [9, 3, 2, 7, 6, 5, 0, 9].into_iter().enumerate() {
                 for column in 0..width {
                     assert_eq!(
@@ -1774,6 +1990,19 @@ mod tests {
                 policy.clone(),
             )
             .await;
+        let stale = model
+            .forward(
+                &mut [ModelInput {
+                    token_ids: ModelTokens::Device(first[0].clone()),
+                    kv: &mut a,
+                }],
+                policy.clone(),
+            )
+            .await;
+        assert!(
+            stale[0].is_err(),
+            "completed entry must reject stale feedback positions"
+        );
         assert_eq!(first[0].read().await?, expected[0][0]);
         assert_eq!(first[1].read().await?, expected[1][0]);
         let second: Vec<_> = second
@@ -1815,6 +2044,146 @@ mod tests {
     }
 
     /// Real-checkpoint regression, explicitly enabled with local reference artifacts.
+    #[tokio::test]
+    async fn queued_gpu_feedback_matches_serial_and_commits_fifo() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let device =
+            cutile::cuda_core::Device::new(0).map_err(cuda_async::error::DeviceError::from)?;
+        let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
+        let model = Arc::new(tiny_model(&policy).await?);
+        let mut config = model.kv_pool_config(32)?;
+        config.max_rows = 3;
+        config.num_slots *= 3;
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let prompts = [vec![1, 2, 3], vec![9], vec![17, 18]];
+        let mut expected = Vec::new();
+        for prompt in &prompts {
+            let mut history = prompt.clone();
+            let mut kv = KVContext::new(pool.clone())?;
+            let mut result = Vec::new();
+            for _ in 0..2 {
+                let token = model
+                    .next_tokens(
+                        &mut [ModelInput {
+                            token_ids: (&history).into(),
+                            kv: &mut kv,
+                        }],
+                        policy.clone(),
+                    )
+                    .await
+                    .pop()
+                    .unwrap()?;
+                history.push(token);
+                result.push(token);
+            }
+            expected.push(result);
+        }
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let mut c = KVContext::new(pool.clone())?;
+        let first = model
+            .clone()
+            .enqueue_forward_and_return_completion(
+                &mut [
+                    ModelInput {
+                        token_ids: (&prompts[0]).into(),
+                        kv: &mut a,
+                    },
+                    ModelInput {
+                        token_ids: (&prompts[1]).into(),
+                        kv: &mut b,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        let tokens: Vec<_> = first
+            .output
+            .iter()
+            .map(|output| match output.as_ref().unwrap() {
+                NextToken::Device(token) => token.clone(),
+                _ => panic!("expected GPU feedback"),
+            })
+            .collect();
+        assert_eq!((a.ready_len(), a.allocated_len()), (0, 3));
+        assert_eq!(a.pending_range(), Some(0..3));
+        let second = model
+            .clone()
+            .enqueue_forward_and_return_completion(
+                &mut [
+                    ModelInput {
+                        token_ids: ModelTokens::Device(tokens[1].clone()),
+                        kv: &mut b,
+                    },
+                    ModelInput {
+                        token_ids: ModelTokens::Device(tokens[0].clone()),
+                        kv: &mut a,
+                    },
+                    ModelInput {
+                        token_ids: (&prompts[2]).into(),
+                        kv: &mut c,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        for output in &second.output {
+            assert!(output.is_ok(), "queued output failed");
+        }
+        assert_eq!((a.ready_len(), a.allocated_len()), (0, 4));
+        assert_eq!(a.pending_range(), Some(3..4));
+        assert!(
+            a.commit_completed_append(4).is_err(),
+            "cannot commit the later append first"
+        );
+        first.gpu_completion.clone().await?;
+        a.commit_completed_append(3)?;
+        b.commit_completed_append(1)?;
+        assert!(a.is_pending());
+        assert_eq!((a.ready_len(), a.allocated_len()), (3, 4));
+        assert_eq!(a.pending_range(), Some(3..4));
+        for (output, index) in first.output.iter().zip([0, 1]) {
+            assert_eq!(
+                output.as_ref().unwrap().clone().read().await?,
+                expected[index][0]
+            );
+        }
+        second.gpu_completion.clone().await?;
+        a.commit_completed_append(4)?;
+        b.commit_completed_append(2)?;
+        c.commit_completed_append(2)?;
+        assert_eq!((a.ready_len(), a.allocated_len()), (4, 4));
+        assert_eq!(a.pending_range(), None);
+        assert!(!a.is_pending());
+        for (output, (index, step)) in second.output.iter().zip([(1, 1), (0, 1), (2, 0)]) {
+            assert_eq!(
+                output.as_ref().unwrap().clone().read().await?,
+                expected[index][step]
+            );
+        }
+        // Reusing an old feedback position must not append or disturb valid peers.
+        let invalid = model
+            .clone()
+            .enqueue_forward_and_return_completion(
+                &mut [ModelInput {
+                    token_ids: ModelTokens::Device(tokens[0].clone()),
+                    kv: &mut a,
+                }],
+                policy,
+            )
+            .await;
+        assert!(invalid.output[0].is_err());
+        assert_eq!(a.ready_len(), 4);
+        drop((tokens, first, second, invalid));
+        a.release();
+        b.release();
+        c.release();
+        assert_eq!(pool.metrics(), initial);
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires QWEN2_MODEL_DIR and QWEN2_REFERENCE_DIR; see engine README"]
     async fn real_checkpoint_matches_reference_and_chunked_kv() -> anyhow::Result<()> {

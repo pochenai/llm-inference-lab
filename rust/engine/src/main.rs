@@ -14,6 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduler = Scheduler::new(cancel_token.child_token(), command_tx, batch_reply_rx);
     let runner_tasks = TaskTracker::new();
     let runner = RunnerBuilder::default()
+        // SimpleMLP returns Host tokens and uses the serial execution path.
+        .with_overlap(false)
         .build(command_rx, batch_reply_tx)
         .await?;
     runner_tasks.spawn(runner.run(cancel_token.child_token()));

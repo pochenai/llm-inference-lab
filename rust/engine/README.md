@@ -317,12 +317,11 @@ one token per existing decode, fills the rest with prefill chunks in active orde
 and executes them together. Without prefill work/budget, it executes decode alone.
 A turn enters decode after its first generated token; a one-token prompt remains
 prefill. Admission and result/KV settlement stay in Runner. Requests that do not fit wait
-until a later forward. Each prefill chunk completes all model layers and commits
-KV; only the final chunk appends/emits a generated token and consumes max_new_tokens.
+until a later forward. Each prefill chunk submits all model layers on the ordered compute stream; only the final chunk appends/emits a generated token and consumes max_new_tokens.
 Intermediate chunks compute and discard the LM-head prediction without starting
 Qwen's deferred D2H readback.
-Accepted CPU history stays intact; ModelInput borrows a prefix ending at the chunk
-boundary. Session continuation also computes any uncached last output token first.
+Accepted CPU history stays intact; Runner shares an Arc history prefix ending at
+the chunk boundary, avoiding a history copy for owned submission. Session continuation also computes any uncached last output token first.
 The token budget bounds packed scratch rows, not cached-history attention latency;
 it does not replace full-turn KV admission or implement preemption.
 The Qwen example exposes the same setting as `--max-batch-tokens`, for example
@@ -344,8 +343,11 @@ RMSNorm gathers each request's last packed row, then LM-head/argmax produce one
 token per request in a single D2H readback. Invalid inputs are filtered before
 submission; valid peers stay in one batch and results retain the original order.
 Append batches require one KV pool. SimpleMLP retains CUDA Graph replay; Qwen is
-eager. ModelInput now accepts ModelTokens::Host(history_prefix) or one
-ModelTokens::Device(token). `CausalModel::forward` commits GPU work/KV and returns
+eager. ModelInput accepts BorrowedHost(history_prefix), SharedHost { tokens: Arc<Vec<u32>>,
+end } or Device(token). BorrowedHost retains the zero-copy slice API for direct
+callers; Runner uses SharedHost so owned tasks share history without copying it.
+Input storage does not determine output storage: Qwen's CPU inputs still produce
+NextToken::Device predictions. `CausalModel::forward` commits GPU work/KV and returns
 NextToken::Device for Qwen; its shared readback future is independent of the GPU
 feedback handle. `next_tokens` still returns CPU u32 values for direct callers.
 
@@ -359,17 +361,41 @@ and contiguous device-only batches keep their existing single-launch fast paths
 without that table. The local [launch-count comparison](../profiling/qwen2/embedding-batch/RESULTS.md)
 records the measured scope and limits.
 
-Runner uses the GPU handle for the next decode and processes the previous CPU
-result concurrently. Readback uses a separate stream; text processing can overlap
-GPU execution without uploading the sampled ID again. EOS may cause one already
-submitted extra step: it drains, its prediction is discarded, and its KV covers
-only the accepted EOS input. Request EOF follows cleanup. The final max_new_tokens
-output is read without lookahead, preserving the original KV-capacity budget.
-No dummy token is appended to CPU history. Every model implements forward:
-SimpleMLP returns ready Host tokens, while Qwen returns deferred Device tokens.
-The trait's default next_tokens calls forward and waits for CPU values; models
-never implement forward by calling next_tokens. `RunnerBuilder::with_overlap(false)` or the
-Qwen example's `--disable-overlap` provides a serial baseline.
+Runner uses submission-first overlap with one round of lookahead: enqueue F(N),
+then complete/commit/read/process F(N-1). It does not wait for F(N) before planning
+the next iteration. All forwards use one ordered compute stream; D2H uses a separate
+stream after producer completion. GPU feedback never requires a CPU ID/H2D round trip.
+
+CausalModel::enqueue_forward_and_return_completion is the Runner entry. Qwen temporarily moves selected
+KVContext owners into an owned DeviceOp, builds borrowed ModelInput views inside
+execute, and returns contexts/predictions through a handoff after the normal
+DeviceFuture's first poll. That poll registers completion before the next submit;
+the library continues to retain/release GPU resources. No cuda-async modifications,
+manual completion waiter, or dependency upgrade are required. The default method
+wraps an already completed forward, preserving SimpleMLP and other implementations.
+The generic SubmittedGpuWorkWithCompletion<T> holds both helper handoff output and
+model predictions, replacing separate Submission/SubmittedForward containers. Runner
+combines the former BatchMember/PendingBatch data into per-request records and calls
+wait_commit_kv_and_forward for GPU wait, KV commit and token processing.
+Direct forward still awaits GPU completion and commits KV; next_tokens then reads
+CPU values. Models never implement forward by calling next_tokens.
+
+KV allocated_len is the reservation cursor; ready_len advances only when the matching
+completion succeeds. A FIFO permits at most two pending appends, and GpuTokenPredictionHandle
+carries its absolute position. Runner retains a Vec<RequestForwardAwaitingGpuCompletion>;
+each record owns identity, KV append end, prediction and shared GPU completion rather
+than request borrows. Only the newest append is writable, and FIFO commits cannot
+publish a later append first. Admission budgets already reserved positions once.
+
+EOS may cause one extra submitted step: it drains and its prediction is discarded.
+EOF follows cleanup. The final max_new_tokens output is settled without another
+append, preserving the original KV-capacity budget. No dummy token enters CPU history.
+RunnerBuilder::with_overlap(false), or Qwen --disable-overlap, provides a serial
+baseline: next_tokens returns CPU IDs, accepted in the same iteration without
+pending completion records. Only the overlap path retains pending results; the
+setting selects the path without inspecting prediction variants. Host-only
+SimpleMLP examples disable overlap explicitly. Cancellation uses cuda-async's existing drain-on-drop safety, which can
+block the host while in-flight GPU work finishes.
 
 Token/logit readbacks enqueue asynchronous D2H into reusable pinned buffers and become
 readable only after outer completion. Dropping an in-flight model step may require

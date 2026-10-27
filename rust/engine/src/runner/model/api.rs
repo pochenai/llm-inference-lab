@@ -6,11 +6,11 @@ use tokenizers::Tokenizer;
 
 use crate::runner::kv_pool::{KVContext, KVPool};
 
-use super::{ModelError, ModelTokens, NextToken};
+use super::{ModelError, ModelTokens, NextToken, SubmittedGpuWorkWithCompletion};
 
 pub struct ModelInput<'a, P: KVPool> {
     /// A host history prefix through this step's end, or one GPU-resident decode
-    /// token. Host inputs compute only [kv.ready_len()..]; device inputs append one.
+    /// token. Host inputs advance allocated_len; device inputs append at their position.
     pub token_ids: ModelTokens<'a>,
     pub kv: &'a mut KVContext<P>,
 }
@@ -19,14 +19,22 @@ impl<P: KVPool> ModelInput<'_, P> {
     /// Logical history end after this input is computed, independent of CPU readback.
     pub fn sequence_len(&self) -> usize {
         match &self.token_ids {
-            ModelTokens::Host(tokens) => tokens.len(),
-            ModelTokens::Device(_) => self.kv.ready_len() + 1,
+            ModelTokens::BorrowedHost(tokens) => tokens.len(),
+            ModelTokens::SharedHost { end, .. } => *end,
+            ModelTokens::Device(token) => token.position + 1,
         }
     }
 
-    /// Invalid host histories return zero; model validation reports the input error.
+    /// Before prepare, count from the reservation cursor; inside submit, use the
+    /// newest matching append. Invalid histories return zero for model validation.
     pub fn uncached_len(&self) -> usize {
-        self.sequence_len().saturating_sub(self.kv.ready_len())
+        let end = self.sequence_len();
+        let start = self
+            .kv
+            .pending_range()
+            .filter(|range| range.end == end)
+            .map_or(self.kv.allocated_len(), |range| range.start);
+        end.saturating_sub(start)
     }
 }
 
@@ -90,14 +98,30 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
         }
     }
 
-    /// Return one ordered token result after computation and successful KV commit.
-    /// Device results defer CPU reads; ready CPU results use NextToken::Host.
-    /// Validate pending contexts, input bounds/IDs, and compatible pool layout.
+    /// Complete computation and commit KV; return ordered Host or GPU prediction handles.
+    /// Validate inputs/pool layout; Device results may still await CPU readback.
     fn forward(
         &self,
         batch: &mut [ModelInput<'_, P>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> impl Future<Output = Vec<Result<NextToken, ModelError>>> + Send;
+
+    /// Enqueue a forward and return output plus GPU completion; Runner later commits KV.
+    /// Default models wrap an already completed forward whose KV is already committed.
+    fn enqueue_forward_and_return_completion(
+        self: Arc<Self>,
+        batch: &mut [ModelInput<'_, P>],
+        policy: Arc<dyn SchedulingPolicy>,
+    ) -> impl Future<Output = SubmittedGpuWorkWithCompletion> + Send
+    where
+        Self: 'static,
+        P: 'static,
+    {
+        async move {
+            let outputs = self.forward(batch, policy).await;
+            SubmittedGpuWorkWithCompletion::from_completed_output(outputs)
+        }
+    }
 
     /// Convenience API: run forward, then await each token's CPU value.
     fn next_tokens(

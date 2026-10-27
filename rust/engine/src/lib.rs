@@ -5,5 +5,6 @@ pub mod scheduler;
 pub mod types;
 
 pub use runner::model::{
-    AttentionBackend, CausalModel, DeviceToken, ModelError, ModelInput, ModelTokens, NextToken,
+    AttentionBackend, CausalModel, GpuTokenPredictionHandle, ModelError, ModelInput, ModelTokens,
+    NextToken, SubmittedGpuWorkWithCompletion,
 };

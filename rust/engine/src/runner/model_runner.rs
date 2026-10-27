@@ -1,29 +1,30 @@
-//! Each Runner schedules one complete model forward at a time: all layers, the
-//! LM head and token selection, then GPU completion and KV commit. At that boundary
-//! it admits new requests and removes finished ones, subject to available capacity.
+//! Each Runner submits complete model forwards on one ordered compute stream.
+//! Membership changes between full submissions, never between layers or CTAs.
 //!
 //! ```text
-//! await forward([A, B]);       // C arrives while A and B are still generating.
-//! await forward([A, B, C]);    // A finishes; B and C continue.
-//! await forward([B, C]);
+//! submit F0([A,B]);
+//! submit F1([A,B,C]); wait/commit/process F0;
+//! submit F2([B,C]);   wait/commit/process F1;
 //! ```
-//! This is request concurrency through dynamic batch membership, rather than
-//! concurrent independent forward(batch_1), forward(batch_2), forward(batch_3).
-//! Scheduling does not switch requests between individual layers or CTAs.
-//! Shared-reference APIs/resource pools permit broader use but do not change this
-//! Runner policy. Tokens/KV survive across steps; hidden intermediates are temporary.
-//! MixedChunkPolicy reserves decode tokens and fills the rest with prefill chunks.
-//! Intermediate chunks commit KV without appending or emitting their sampled token.
-//! GPU-feedback models can overlap the next forward with the previous CPU result:
-//! computation/KV still complete one step at a time, while CPU history/EOS/text can
-//! lag one prediction per request. Finished waits for any lookahead to drain.
+//! One-round lookahead overlaps submission/GPU work with the previous result.
+//! GPU execution stays ordered; this is not several independent batches racing
+//! across compute streams. Pending records retain IDs, predictions and shared GPU completion,
+//! not request borrows. KV allocated_len includes reservations; ready_len advances
+//! after matching completion. CPU history/EOS/text may lag one prediction.
+//! Finished requests drain any submitted extra member before cleanup/EOF.
+//! MixedChunkPolicy budgets packed input tokens; intermediate prefill predictions
+//! are discarded. Tokens/KV survive steps; hidden intermediates belong to a forward.
 
 mod batch_policy;
 
 use self::batch_policy::{BatchPolicy, MixedChunkPolicy};
+use super::model::GpuWorkCompletionFuture;
 use std::{collections::VecDeque, future::Future, num::NonZeroUsize, sync::Arc};
 
-use cuda_async::{device_context::global_policy, scheduling_policies::SchedulingPolicy};
+use cuda_async::{
+    device_context::global_policy,
+    scheduling_policies::{SchedulingPolicy, SingleStream},
+};
 use dashmap::DashMap;
 use tokenizers::{Encoding, Tokenizer};
 use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
@@ -34,8 +35,8 @@ use crate::{
     runner::{
         kv_pool::{KVContext, KVPool, KVPoolError, NaiveKVPool, NaiveKVPoolConfig},
         model::{
-            CausalModel, DeviceToken, ModelError, ModelInput, ModelTokens, NextToken,
-            SimpleMLPEngine,
+            CausalModel, GpuTokenPredictionHandle, ModelError, ModelInput, ModelTokens, NextToken,
+            SimpleMLPEngine, SubmittedGpuWorkWithCompletion,
         },
     },
     types::{
@@ -171,8 +172,8 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
         self
     }
 
-    /// Overlap one step of CPU result handling with the next GPU forward when
-    /// the model supplies device feedback. Disable for a serial baseline.
+    /// Enqueue one lookahead forward before settling the previous completion and
+    /// CPU result, when the model supports submission-first feedback. Disable for serial.
     pub fn with_overlap(mut self, enabled: bool) -> Self {
         self.overlap = enabled;
         self
@@ -184,8 +185,8 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
         batch_reply_tx: mpsc::UnboundedSender<RunnerReply>,
     ) -> impl Future<Output = Result<ModelRunner<M, P>, EngineError>> + Send
     where
-        P: KVPool,
-        M: CausalModel<P>,
+        P: KVPool + 'static,
+        M: CausalModel<P> + 'static,
         MF: AsyncFactory<(), Output = M>,
         PF: AsyncFactory<Policy, Output = Arc<P>>,
         SF: FnOnce() -> Result<Policy, EngineError> + Send,
@@ -208,7 +209,7 @@ type SessionEntry<P> = Arc<Mutex<Option<SessionState<P>>>>;
 pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
     command_rx: Option<mpsc::UnboundedReceiver<RunnerCommand>>,
     batch_reply_tx: mpsc::UnboundedSender<RunnerReply>,
-    model: M,
+    model: Arc<M>,
     pool: Arc<P>,
     policy: Policy,
     sessions: DashMap<SessionId, SessionEntry<P>>,
@@ -216,7 +217,8 @@ pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
     overlap: bool,
 }
 
-struct SessionProgress {
+/// CPU history length and confirmed KV progress saved for unchanged-state rollback.
+struct SessionProgressBeforeRequest {
     token_count: usize,
     ready_len: usize,
 }
@@ -236,14 +238,14 @@ struct ActiveRequest<'a, P: KVPool> {
     request_id: RequestId,
     guard: OwnedMutexGuard<Option<SessionState<P>>>,
     state: SessionState<P>,
-    original_progress: SessionProgress,
-    generation: GenerationState<'a>,
-    gpu_token: Option<DeviceToken>,
+    original_progress: SessionProgressBeforeRequest,
+    generation: RequestTokenGenerationState<'a>,
+    gpu_token: Option<GpuTokenPredictionHandle>,
 }
 
-/// CPU-owned output processing is separate from KV, so it can run while the next
-/// forward borrows the context. Tokens are appended only after successful D2H.
-struct GenerationState<'a> {
+/// Per-turn sampling budget, decoder and errors, kept separate from session KV ownership.
+/// Accepted CPU tokens advance this state only after successful D2H.
+struct RequestTokenGenerationState<'a> {
     sampling: SamplingConfig,
     remaining: usize,
     generated_tokens: usize,
@@ -253,7 +255,7 @@ struct GenerationState<'a> {
     decoder: Decoder<'a>,
 }
 
-impl GenerationState<'_> {
+impl RequestTokenGenerationState<'_> {
     fn accept(
         &mut self,
         tokens: &mut Arc<Vec<u32>>,
@@ -296,23 +298,38 @@ impl GenerationState<'_> {
 }
 
 impl<P: KVPool> ActiveRequest<'_, P> {
-    fn is_decode(&self) -> bool {
+    /// A sampled GPU prediction enters decode before its CPU history is updated.
+    fn is_decoding_or_has_gpu_feedback(&self) -> bool {
         self.generation.generated_tokens > 0 || self.gpu_token.is_some()
     }
 
-    fn has_pending_token(&self) -> bool {
-        self.gpu_token.is_some() && self.state.tokens.len() == self.state.kv.ready_len()
+    /// Whether the latest GPU prediction has not yet been appended to CPU history.
+    fn has_pending_gpu_prediction(&self) -> bool {
+        self.gpu_token
+            .as_ref()
+            .is_some_and(|token| token.position >= self.state.tokens.len())
     }
 
     fn sequence_len(&self) -> usize {
-        self.state.tokens.len() + usize::from(self.has_pending_token())
+        self.gpu_token
+            .as_ref()
+            .map_or(self.state.tokens.len(), |token| {
+                self.state.tokens.len().max(token.position + 1)
+            })
+    }
+
+    /// Require uncomputed input and budget beyond any unaccepted GPU prediction.
+    /// A final pending prediction is processed without enqueueing another append.
+    fn has_input_and_budget_for_forward(&self) -> bool {
+        self.generation.remaining > usize::from(self.has_pending_gpu_prediction())
+            && self.sequence_len() > self.state.kv.allocated_len()
     }
 
     /// Account for future appends before admitting peers; physical slots are still
-    /// allocated incrementally by prepare_append on each completed model step.
-    fn unreserved_tokens(&self) -> usize {
-        self.state.tokens.len() - self.state.kv.ready_len()
-            + self.generation.remaining.saturating_sub(1)
+    /// allocated incrementally by prepare_append on each submitted model step.
+    fn unreserved_kv_tokens_for_generation(&self) -> usize {
+        (self.state.tokens.len() + self.generation.remaining.saturating_sub(1))
+            .saturating_sub(self.state.kv.allocated_len())
     }
 
     fn finish(mut self, replies: &mpsc::UnboundedSender<RunnerReply>) {
@@ -333,7 +350,8 @@ impl<P: KVPool> ActiveRequest<'_, P> {
         if generated {
             self.state.sampling = self.generation.sampling;
             *self.guard = Some(self.state);
-        } else if !self.state.kv.is_pending()
+        } else if self.state.kv.has_owned_pool_state()
+            && !self.state.kv.is_pending()
             && self.state.kv.ready_len() == self.original_progress.ready_len
         {
             Arc::make_mut(&mut self.state.tokens).truncate(self.original_progress.token_count);
@@ -351,7 +369,64 @@ impl<P: KVPool> ActiveRequest<'_, P> {
     }
 }
 
-impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
+/// One request's submitted range, prediction and shared batch GPU completion.
+/// Keeps request IDs, not ActiveRequest borrows, until KV and token processing finishes.
+struct RequestForwardAwaitingGpuCompletion {
+    request_id: RequestId,
+    compute_end: usize,
+    /// Only a final prefill chunk or decode step can advance output history/budget.
+    produces_output_token: bool,
+    prediction: Result<NextToken, ModelError>,
+    gpu_completion: GpuWorkCompletionFuture,
+}
+
+impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
+    /// Wait for GPU completion, commit each request's FIFO KV append, then accept its token.
+    /// Discard intermediate-prefill predictions and drain extra work after EOS/errors.
+    async fn complete_forward_and_emit_tokens(
+        &self,
+        pending_requests: Vec<RequestForwardAwaitingGpuCompletion>,
+        active: &mut [ActiveRequest<'_, P>],
+        replies: &mpsc::UnboundedSender<RunnerReply>,
+    ) {
+        for pending in pending_requests {
+            let completed = pending.gpu_completion.await;
+            let request = active
+                .iter_mut()
+                .find(|request| request.request_id == pending.request_id)
+                .expect("in-flight requests must remain active until drained");
+            let result = completed.and(pending.prediction).and_then(|token| {
+                if !request.state.kv.has_owned_pool_state() {
+                    return Err(ModelError::Execution(
+                        "context invalidated by later submission".into(),
+                    ));
+                }
+                // Default completed models already committed; queued Qwen appends commit here.
+                if request.state.kv.ready_len() < pending.compute_end {
+                    request
+                        .state
+                        .kv
+                        .commit_completed_append(pending.compute_end)?;
+                }
+                Ok(token)
+            });
+            let output = match result {
+                Ok(_) if !pending.produces_output_token || request.generation.remaining == 0 => {
+                    continue;
+                }
+                Ok(token) => token.read().await,
+                Err(error) => Err(error),
+            };
+            request.generation.accept(
+                &mut request.state.tokens,
+                output,
+                request.request_id,
+                replies,
+                |id| self.model.is_eos(id),
+            );
+        }
+    }
+
     fn new(
         command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
         batch_reply_tx: mpsc::UnboundedSender<RunnerReply>,
@@ -362,7 +437,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         Self {
             command_rx: Some(command_rx),
             batch_reply_tx,
-            model,
+            model: Arc::new(model),
             pool,
             policy,
             sessions: DashMap::new(),
@@ -537,12 +612,12 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
             request_id: request.assigned_request_id(),
             guard,
             state,
-            original_progress: SessionProgress {
+            original_progress: SessionProgressBeforeRequest {
                 token_count: old_len,
                 ready_len,
             },
             gpu_token: None,
-            generation: GenerationState {
+            generation: RequestTokenGenerationState {
                 sampling,
                 remaining,
                 generated_tokens: 0,
@@ -554,9 +629,8 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         })
     }
 
-    /// One normal scheduling loop: ingest, admit, execute one packed forward, then
-    /// settle completions. Decode gets budget first; prefill advances in bounded
-    /// chunks. Only the last prompt chunk consumes a generation token budget.
+    /// Ingest/admit, enqueue a packed forward, then wait/commit/process previous results.
+    /// Decode gets budget first; only final prefill chunks consume generation budget.
     async fn drive(
         &self,
         commands: &mut mpsc::UnboundedReceiver<RunnerCommand>,
@@ -566,21 +640,17 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         let mut waiting = VecDeque::<SessionRequest<Encoding>>::new();
         let mut active: Vec<ActiveRequest<'_, P>> = Vec::new();
         let mut batch_policy = MixedChunkPolicy::new(self.max_batch_tokens);
+        // Only overlap execution retains results across scheduling iterations.
+        let mut pending = Vec::<RequestForwardAwaitingGpuCompletion>::new();
+        let mut compute_policy: Option<Policy> = None;
         loop {
-            for turn in &mut active {
-                if turn.has_pending_token() && turn.generation.remaining <= 1 {
-                    let token = turn.gpu_token.as_ref().unwrap().read().await;
-                    turn.generation.accept(
-                        &mut turn.state.tokens,
-                        token,
-                        turn.request_id,
-                        replies,
-                        |id| self.model.is_eos(id),
-                    );
-                }
-            }
             for index in (0..active.len()).rev() {
-                if active[index].generation.remaining == 0 {
+                if active[index].generation.remaining == 0
+                    && (!self.overlap
+                        || !pending
+                            .iter()
+                            .any(|request| request.request_id == active[index].request_id))
+                {
                     active.swap_remove(index).finish(replies);
                 }
             }
@@ -592,7 +662,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 }
             }
             let mut reserved_tokens = active.iter().fold(0usize, |sum, request| {
-                sum.saturating_add(request.unreserved_tokens())
+                sum.saturating_add(request.unreserved_kv_tokens_for_generation())
             });
             for _ in 0..waiting.len() {
                 let request = waiting.pop_front().unwrap();
@@ -601,8 +671,8 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                         if turn.generation.remaining == 0 {
                             turn.finish(replies);
                         } else {
-                            reserved_tokens =
-                                reserved_tokens.saturating_add(turn.unreserved_tokens());
+                            reserved_tokens = reserved_tokens
+                                .saturating_add(turn.unreserved_kv_tokens_for_generation());
                             active.push(turn);
                         }
                     }
@@ -628,94 +698,133 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 continue;
             }
             let mut scheduled = batch_policy.plan(&mut active);
-            let outputs = {
-                let mut inputs = Vec::with_capacity(scheduled.len());
-                let mut cpu_work = Vec::new();
-                for step in &mut scheduled {
-                    let pending = step.request.has_pending_token();
+            // quick path for empty requests
+            if scheduled.is_empty() {
+                drop(scheduled);
+                if self.overlap {
+                    self.complete_forward_and_emit_tokens(
+                        std::mem::take(&mut pending),
+                        &mut active,
+                        replies,
+                    )
+                    .await;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let mut inputs: Vec<_> = scheduled
+                .iter_mut()
+                .map(|step| {
                     let request = &mut *step.request;
-                    let generation = &mut request.generation;
-                    let tokens = &mut request.state.tokens;
-                    let kv = &mut request.state.kv;
-                    if let Some(token) = request.gpu_token.take() {
-                        inputs.push(ModelInput {
-                            token_ids: ModelTokens::Device(token.clone()),
-                            kv,
-                        });
-                        let request_id = request.request_id;
-                        let model = &self.model;
-                        cpu_work.push(async move {
-                            if pending {
-                                generation.accept(
-                                    tokens,
-                                    token.read().await,
-                                    request_id,
-                                    replies,
-                                    |id| model.is_eos(id),
-                                );
-                            }
-                        });
+                    let token_ids = if self.overlap {
+                        match &request.gpu_token {
+                            Some(token) => ModelTokens::Device(token.clone()),
+                            None => ModelTokens::SharedHost {
+                                tokens: request.state.tokens.clone(),
+                                end: step.compute_end,
+                            },
+                        }
                     } else {
-                        inputs.push(ModelInput {
-                            token_ids: (&tokens[..step.compute_end]).into(),
-                            kv,
-                        });
+                        ModelTokens::BorrowedHost(&request.state.tokens[..step.compute_end])
+                    };
+                    ModelInput {
+                        token_ids,
+                        kv: &mut request.state.kv,
+                    }
+                })
+                .collect();
+            let policy = match &compute_policy {
+                Some(policy) => Ok(policy.clone()),
+                None => self.policy.next_stream().and_then(|stream| {
+                    SingleStream::new(stream.device()).map(|policy| {
+                        let policy: Policy = Arc::new(policy);
+                        compute_policy = Some(policy.clone());
+                        policy
+                    })
+                }),
+            };
+            // sequential scenario
+            if !self.overlap {
+                // Serial mode returns CPU IDs and consumes them in this iteration.
+                // It creates neither a submission wrapper nor pending request records.
+                let outputs = match policy {
+                    Ok(policy) => self.model.next_tokens(&mut inputs, policy).await,
+                    Err(error) => (0..inputs.len())
+                        .map(|_| Err(ModelError::from(error.clone())))
+                        .collect(),
+                };
+                assert_eq!(outputs.len(), inputs.len(), "one prediction per input");
+                drop(inputs);
+                for (step, output) in scheduled.into_iter().zip(outputs) {
+                    if step.compute_end == step.request.sequence_len() || output.is_err() {
+                        let request = step.request;
+                        request.generation.accept(
+                            &mut request.state.tokens,
+                            output,
+                            request.request_id,
+                            replies,
+                            |id| self.model.is_eos(id),
+                        );
                     }
                 }
-                // Poll submission first. CPU readback uses another stream and its
-                // processing overlaps this forward; KV commits still await GPU success.
-                let forward = async {
-                    if self.overlap {
-                        self.model.forward(&mut inputs, self.policy.clone()).await
-                    } else {
-                        self.model
-                            .next_tokens(&mut inputs, self.policy.clone())
-                            .await
-                            .into_iter()
-                            .map(|output| output.map(NextToken::Host))
-                            .collect()
-                    }
-                };
-                let (outputs, _) = tokio::join!(biased;
-                    forward,
-                    futures::future::join_all(cpu_work),
-                );
-                outputs
+                tokio::task::yield_now().await;
+                continue;
+            }
+            // overlap scenario
+            let forward = match policy {
+                Ok(policy) => {
+                    self.model
+                        .clone()
+                        .enqueue_forward_and_return_completion(&mut inputs, policy)
+                        .await
+                }
+                Err(error) => SubmittedGpuWorkWithCompletion::from_completed_output(
+                    (0..inputs.len())
+                        .map(|_| Err(ModelError::from(error.clone())))
+                        .collect(),
+                ),
             };
             assert_eq!(
-                outputs.len(),
-                scheduled.len(),
-                "one next-token result per input"
+                forward.output.len(),
+                inputs.len(),
+                "one prediction per input"
             );
-            for (step, output) in scheduled.into_iter().zip(outputs) {
-                let turn = step.request;
-                match output {
-                    Ok(_) if turn.generation.remaining == 0 => {
-                        // Previous CPU output reached EOS/failed decoding. The extra
-                        // forward has drained; its prediction must never be exposed.
+            drop(inputs);
+            let current = scheduled
+                .into_iter()
+                .zip(forward.output)
+                .map(|(step, prediction)| {
+                    let produces_output_token = step.compute_end == step.request.sequence_len();
+                    if produces_output_token {
+                        step.request.gpu_token = match &prediction {
+                            Ok(NextToken::Device(token)) => Some(token.clone()),
+                            _ => None,
+                        };
                     }
-                    Ok(_) if step.compute_end < turn.state.tokens.len() => {
-                        // Intermediate prefill chunks commit KV only.
+                    RequestForwardAwaitingGpuCompletion {
+                        request_id: step.request.request_id,
+                        compute_end: step.compute_end,
+                        produces_output_token,
+                        prediction,
+                        gpu_completion: forward.gpu_completion.clone(),
                     }
-                    Ok(NextToken::Device(token)) => turn.gpu_token = Some(token),
-                    Ok(NextToken::Host(token)) => turn.generation.accept(
-                        &mut turn.state.tokens,
-                        Ok(token),
-                        turn.request_id,
-                        replies,
-                        |id| self.model.is_eos(id),
-                    ),
-                    Err(error) => {
-                        turn.generation.model_error = Some(error);
-                        turn.generation.remaining = 0;
-                    }
+                })
+                .collect::<Vec<_>>();
+            // Enqueue current first, then complete/process the prior iteration.
+            self.complete_forward_and_emit_tokens(pending, &mut active, replies)
+                .await;
+            // Known errors stop rescheduling now; their GPU work still drains via pending.
+            for failed in &current {
+                if let Err(error) = &failed.prediction {
+                    let request = active
+                        .iter_mut()
+                        .find(|request| request.request_id == failed.request_id)
+                        .unwrap();
+                    request.generation.model_error = Some(error.clone());
+                    request.generation.remaining = 0;
                 }
             }
-            for index in (0..active.len()).rev() {
-                if active[index].generation.remaining == 0 {
-                    active.swap_remove(index).finish(replies);
-                }
-            }
+            pending = current;
             // Even immediately-ready model futures must let ingress/routing tasks run.
             tokio::task::yield_now().await;
         }
@@ -740,7 +849,7 @@ mod tests {
     use crate::types::BatchIn;
     use std::{collections::HashMap, time::Duration};
 
-    impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
+    impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
         async fn prepare_batch(
             &self,
             batch: BatchIn,
@@ -900,6 +1009,8 @@ mod tests {
             );
             let mut runner = ModelRunner::new(rx, replies, model, pool.clone(), policy);
             runner.max_batch_tokens = max_batch_tokens;
+            // SteppedModel wraps Host-only SimpleMLP; accept its tokens in the same iteration.
+            runner.overlap = false;
             let task = tokio::spawn(runner.run(cancel.child_token()));
             Ok(Self {
                 scheduler,
@@ -964,7 +1075,7 @@ mod tests {
             };
             use std::sync::atomic::Ordering;
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            if call == 1 {
+            if call == 1 && self.gate_first {
                 assert!(
                     matches!(batch[0].token_ids, ModelTokens::Device(_)),
                     "next forward must use GPU feedback before CPU history is available"
@@ -1016,59 +1127,177 @@ mod tests {
                 }
                 Ok(values)
             };
-            DeviceToken::batch(values, host, 256)
-                .into_iter()
-                .map(|token| Ok(NextToken::Device(token)))
-                .collect()
+            GpuTokenPredictionHandle::batch(
+                values,
+                host,
+                256,
+                batch.iter().map(|input| input.kv.ready_len()),
+            )
+            .into_iter()
+            .map(|token| Ok(NextToken::Device(token)))
+            .collect()
         }
     }
 
     #[tokio::test]
-    async fn overlap_submits_gpu_feedback_before_cpu_output_and_drains_eos(
-    ) -> Result<(), EngineError> {
+    async fn overlap_and_serial_modes_control_feedback_and_eos_lookahead() -> Result<(), EngineError>
+    {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let template = runner().await?;
-        for (budget, eos, expected_calls, expected_history, expected_ready) in [
-            (3, None, 3, vec![1, 42, 42, 42], 3),
-            (4, Some(42), 2, vec![1, 42], 2),
-            (1, None, 1, vec![1, 42], 1),
-        ] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let model = FeedbackModel {
-                tokenizer: template.model.tokenizer().clone(),
-                calls: calls.clone(),
-                release_host: Arc::default(),
-                gate_first: budget > 1,
-                fail_host: false,
-                host_started: None,
-            };
-            let (_, rx) = mpsc::unbounded_channel();
-            let (tx, _) = mpsc::unbounded_channel();
-            let runner = ModelRunner::new(
-                rx,
-                tx,
-                model,
-                template.pool.clone(),
-                template.policy.clone(),
-            );
-            runner.open_session(0)?;
-            let mut request = generation(Some(0), "1", budget).with_request_id(0);
-            request.sampling.as_mut().unwrap().eos_token_id =
-                eos.map(crate::runner::loader::EosTokenId::One);
-            tokio::time::timeout(Duration::from_secs(20), runner.execute_session(request))
-                .await
-                .expect("CPU readback must not gate the next GPU submission")?;
-            assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
-            let entry = runner.sessions.get(&0).unwrap().value().clone();
-            let guard = entry.lock().await;
-            let state = guard.as_ref().unwrap();
-            assert_eq!(*state.tokens, expected_history);
-            assert_eq!(state.kv.ready_len(), expected_ready);
-            drop(guard);
-            runner.close_session(0)?;
-            assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
+        struct CompletionGated {
+            inner: FeedbackModel,
+            released: tokio::sync::Notify,
         }
+        impl CausalModel<NaiveKVPool> for CompletionGated {
+            fn tokenizer(&self) -> &Tokenizer {
+                self.inner.tokenizer()
+            }
+            async fn forward(
+                &self,
+                batch: &mut [ModelInput<'_, NaiveKVPool>],
+                policy: Policy,
+            ) -> Vec<Result<NextToken, ModelError>> {
+                assert!(batch
+                    .iter()
+                    .all(|input| matches!(input.token_ids, ModelTokens::BorrowedHost(_))));
+                self.inner.forward(batch, policy).await
+            }
+            async fn enqueue_forward_and_return_completion(
+                self: Arc<Self>,
+                batch: &mut [ModelInput<'_, NaiveKVPool>],
+                policy: Policy,
+            ) -> SubmittedGpuWorkWithCompletion {
+                use futures::FutureExt;
+                let call = self.inner.calls.load(Ordering::Relaxed);
+                let outputs = self.inner.forward(batch, policy).await;
+                if call == 1 {
+                    self.released.notify_one();
+                }
+                let completion = async move {
+                    // A hidden await of F0 before submission of F1 deadlocks this test.
+                    if self.inner.gate_first && call == 0 {
+                        self.released.notified().await;
+                    }
+                    Ok(())
+                }
+                .boxed()
+                .shared();
+                SubmittedGpuWorkWithCompletion {
+                    output: outputs,
+                    gpu_completion: completion,
+                }
+            }
+        }
+        for overlap in [false, true] {
+            for (budget, eos, expected_calls, expected_history, expected_ready) in [
+                (3, None, 3, vec![1, 42, 42, 42], 3),
+                (
+                    4,
+                    Some(42),
+                    if overlap { 2 } else { 1 },
+                    vec![1, 42],
+                    if overlap { 2 } else { 1 },
+                ),
+                (1, None, 1, vec![1, 42], 1),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let model = FeedbackModel {
+                    tokenizer: template.model.tokenizer().clone(),
+                    calls: calls.clone(),
+                    release_host: Arc::default(),
+                    gate_first: overlap && budget > 1,
+                    fail_host: false,
+                    host_started: None,
+                };
+                let model = CompletionGated {
+                    inner: model,
+                    released: tokio::sync::Notify::new(),
+                };
+                let (_, rx) = mpsc::unbounded_channel();
+                let (tx, _) = mpsc::unbounded_channel();
+                let mut runner = ModelRunner::new(
+                    rx,
+                    tx,
+                    model,
+                    template.pool.clone(),
+                    template.policy.clone(),
+                );
+                runner.overlap = overlap;
+                runner.open_session(0)?;
+                let mut request = generation(Some(0), "1", budget).with_request_id(0);
+                request.sampling.as_mut().unwrap().eos_token_id =
+                    eos.map(crate::runner::loader::EosTokenId::One);
+                tokio::time::timeout(Duration::from_secs(20), runner.execute_session(request))
+                    .await
+                    .expect(
+                        "neither prior completion nor CPU readback may gate the next submission",
+                    )?;
+                assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+                let entry = runner.sessions.get(&0).unwrap().value().clone();
+                let guard = entry.lock().await;
+                let state = guard.as_ref().unwrap();
+                assert_eq!(*state.tokens, expected_history);
+                assert_eq!(state.kv.ready_len(), expected_ready);
+                drop(guard);
+                runner.close_session(0)?;
+                assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_host_and_device_predictions_wait_for_missing_feedback() -> Result<(), EngineError>
+    {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let template = runner().await?;
+        struct MixedFeedback(FeedbackModel);
+        impl CausalModel<NaiveKVPool> for MixedFeedback {
+            fn tokenizer(&self) -> &Tokenizer {
+                self.0.tokenizer()
+            }
+            async fn forward(
+                &self,
+                batch: &mut [ModelInput<'_, NaiveKVPool>],
+                policy: Policy,
+            ) -> Vec<Result<NextToken, ModelError>> {
+                let mut outputs = self.0.forward(batch, policy).await;
+                outputs[0] = Ok(NextToken::Host(42));
+                outputs
+            }
+        }
+        let model = MixedFeedback(FeedbackModel {
+            tokenizer: template.model.tokenizer().clone(),
+            calls: Arc::default(),
+            release_host: Arc::default(),
+            gate_first: false,
+            fail_host: false,
+            host_started: None,
+        });
+        let expected = model.tokenizer().decode(&[42, 42, 42], true).unwrap();
+        let (_, rx) = mpsc::unbounded_channel();
+        let (tx, _) = mpsc::unbounded_channel();
+        let runner = ModelRunner::new(
+            rx,
+            tx,
+            model,
+            template.pool.clone(),
+            template.policy.clone(),
+        );
+        let outputs = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner.execute_collect(vec![
+                generation(None, "1", 3).with_request_id(0),
+                generation(None, "2", 3).with_request_id(1),
+            ]),
+        )
+        .await
+        .unwrap();
+        for (_, output) in outputs {
+            assert_eq!(output?.output, expected);
+        }
+        assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
         Ok(())
     }
 
@@ -1857,6 +2086,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let (tx, _rx) = mpsc::unbounded_channel();
         let build = RunnerBuilder::default()
+            .with_overlap(false)
             .with_model_factory(|| async {
                 let model = SimpleMLPEngine::random(0).await?;
                 Ok(model)

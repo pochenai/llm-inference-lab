@@ -53,6 +53,27 @@
 - Keep the root pytest configuration updated when adding another week's tests.
 - Preserve unrelated user changes, and do not claim verification without running it.
 
+### GPU stream ordering tests
+
+- Prefer a `Gate::arm(&stream)` test helper over sleeps or elapsed-time assertions
+  when testing submission ordering, in-flight resource ownership, or independent
+  completion. It enqueues a host callback that waits on a channel: earlier stream
+  work can finish, while later work stays blocked until the gate is released.
+- Reference implementation: `../cuda-rust/cutile-rs/cutile/tests/gpu/submission_lifetimes.rs`.
+  `Gate` is a local test helper, not a public cuda-async API. Reuse an existing
+  helper or adapt the minimal pattern; callbacks must not call CUDA APIs.
+- Warm up kernel compilation/module loading and required allocations before
+  arming a gate: context-wide synchronization during initialization can otherwise
+  wait on the test's own blocked stream. Engine GPU tests use `GPU_TEST_LOCK`.
+- Release the gate before awaiting or dropping a future that drains the blocked
+  stream on the same thread; use an independent releaser when testing that drain.
+  Give the callback a bounded wait and a Drop-based release path so failures do
+  not hang indefinitely. A Tokio timeout cannot interrupt a blocking poll/drop.
+- Assert ordering and ownership directly: a gated future remains Pending; releasing
+  the first gate lets its future complete while a later gate still holds its
+  submission/resources. Detect gate expiration separately and fail diagnostically;
+  an expired gate must not make an ordering test pass.
+
 ## Secret handling
 
 - Never read, print, search, summarize, quote, diff, copy, or otherwise access real

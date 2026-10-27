@@ -144,7 +144,7 @@ impl KVContext<NaiveKVPool> {
         appends: &mut [(&mut Self, usize)],
         exec: &ExecutionContext,
     ) -> std::result::Result<NaiveMappingPlan, KVContextError> {
-        Self::prepare_batch_with(appends, exec, |pool, states, exec| {
+        Self::prepare_batch_with(appends, exec, false, |pool, states, exec| {
             pool.reserve_append_batch(states, exec)
         })
     }
@@ -988,8 +988,13 @@ mod tests {
                 assert!(a.is_pending() && b.is_pending());
                 assert_eq!(a.ready_len(), 0);
                 assert_eq!(b.ready_len(), 0);
-                assert_eq!(a.allocated_len(), 0);
-                assert_eq!(b.allocated_len(), 0);
+                // Attempted boundaries stay pending after failure; neither context is reusable.
+                assert_eq!(a.allocated_len(), 2);
+                assert_eq!(b.allocated_len(), 2);
+                assert_eq!(a.pending_range(), Some(0..2));
+                assert_eq!(b.pending_range(), Some(0..2));
+                assert!(a.prepare_append(1, exec).is_err());
+                assert!(b.prepare_append(1, exec).is_err());
                 // The partially reserved slots stay leased until outer completion.
                 a.release();
                 b.release();

@@ -153,6 +153,8 @@ async fn main() -> Result<()> {
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
     let scheduler = Scheduler::new(cancel.child_token(), command_tx, reply_rx);
     let runner = RunnerBuilder::default()
+        // SimpleMLP returns Host tokens and uses the serial execution path.
+        .with_overlap(false)
         .with_model_factory(move || async move {
             let model = SimpleMLPEngine::random(0).await?;
             let model = if cuda_graph {

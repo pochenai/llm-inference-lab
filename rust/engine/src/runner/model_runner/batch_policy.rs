@@ -12,8 +12,9 @@ pub(super) struct ScheduledRequest<'a, 'tok, P: KVPool> {
 
 pub(super) trait BatchPolicy {
     /// Borrow selected requests only; leave KV progress and request state unchanged.
-    /// Each compute_end must be in (ready_len, tokens.len()]. Nonempty active
-    /// input must produce work. Runner executes and settles it before the next plan.
+    /// Each compute_end advances allocated_len. Requests awaiting their final
+    /// prediction or draining an extra step produce no work. Runner bounds in-flight
+    /// submissions and settles previous progress after enqueueing current work.
     fn plan<'a, 'tok, P: KVPool>(
         &mut self,
         active: &'a mut [ActiveRequest<'tok, P>],
@@ -41,15 +42,23 @@ impl BatchPolicy for MixedChunkPolicy {
         // decode only after producing its first real output token.
         let mut decode_budget = active
             .iter()
-            .filter(|request| request.is_decode())
+            .filter(|request| {
+                request.is_decoding_or_has_gpu_feedback()
+                    && request.has_input_and_budget_for_forward()
+            })
             .count()
             .min(self.max_batch_tokens.get());
         let mut prefill_budget = self.max_batch_tokens.get() - decode_budget;
         active
             .iter_mut()
             .filter_map(|request| {
-                let ready = request.state.kv.ready_len();
-                let count = if request.is_decode() {
+                // A Host prediction in a mixed-result batch has no GPU feedback;
+                // wait for its CPU acceptance before selecting it again.
+                if !request.has_input_and_budget_for_forward() {
+                    return None;
+                }
+                let ready = request.state.kv.allocated_len();
+                let count = if request.is_decoding_or_has_gpu_feedback() {
                     // decoding
                     if decode_budget == 0 {
                         return None;
