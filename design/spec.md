@@ -512,7 +512,7 @@ submission completion. Pure Host and contiguous GPU inputs keep table-free paths
 
 RunnerBuilder::with_overlap(false), exposed as Qwen --disable-overlap, keeps the
 serial baseline. This implementation does not batch text into 64/128-token chunks,
-add CUDA Graph replay, or enable BF16/quantization.
+add CUDA Graph replay or quantization. Native BF16 is supported independently.
 
 Validation includes a gated owned-handoff/resource-reclamation test, a Runner
 completion that only the next submission can release, and Qwen queued mixed/reordered
@@ -562,9 +562,9 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
 pub trait AttentionBackend<P: KVPool> {
     /// query_ranges[i] 标识 packed Q 中第 i 个 context 的本次 query 行。
     /// 整个 batch 一起提交 attention；KV 布局仍由关联 ReadView 抽象。
-    fn forward(&self, q: Arc<Tensor<f32>>, views: &[P::ReadView<'_>],
+    fn forward(&self, q: Arc<Tensor<P::Element>>, views: &[P::ReadView<'_>],
         query_ranges: &[Range<usize>], exec: &ExecutionContext)
-        -> Result<Arc<Tensor<f32>>, ModelError>;
+        -> Result<Arc<Tensor<P::Element>>, ModelError>;
 }
 ```
 
@@ -670,14 +670,14 @@ Single-input callers pass `&mut [ModelInput { token_ids, kv }]` without an input
 Dropping an in-flight step can leave KV pending, requiring release; GPU leases remain retained.
 
 The Qwen example uses Scheduler -> Runner -> CausalModel; diagnostic logits remain a direct model call. It loads
-BF16 checkpoint values into FP32 storage, implements its GQA backend through the
+weights directly into its selected BF16/FP32 storage, implements its GQA backend through the
 existing AttentionBackend trait, and uses NaiveKVPool with a flat per-token KV
 vector of `kv_heads * head_dim` elements (128 for two 64-dimensional heads).
 Token/logit D2H copies use reusable pinned host buffers retained by ExecutionContext.
 Submission only enqueues the copies; the outer Future awaits successful completion,
 commits KV, and then exposes host values. Cancellation retains in-flight resources;
 neither stack destinations nor explicit stream synchronization are used for readback.
-No common KV API changes are required. Its eager cuTile kernels provide the real
+KVPool::Element binds storage, store inputs and attention tensor types at compile time. Its eager cuTile kernels provide the real
 model correctness baseline. Qwen executes ragged suffixes in a single packed
 forward. Per-token context/position metadata is uploaded once and reused across
 layers; final hidden rows and argmax preserve request order. Invalid inputs are
@@ -706,6 +706,7 @@ Optional structured `tracing` events are enabled by the application subscriber.
 
 ```rust
 pub trait KVPool: Sized + Send + Sync {
+    type Element: DType;
     type ContextState: Send + Sync;
     type ReadView<'a> where Self: 'a;
     type WriteView<'a> where Self: 'a;
@@ -727,7 +728,7 @@ pub trait KVPool: Sized + Send + Sync {
         -> Result<Self::WriteView<'a>, KVPoolError>;
     /// Consume a write view and submit copies on its retained execution context.
     fn store(&self, dst: Self::WriteView<'_>,
-        k: TensorView<'_, f32>, v: TensorView<'_, f32>) -> Result<(), KVPoolError>;
+        k: TensorView<'_, Self::Element>, v: TensorView<'_, Self::Element>) -> Result<(), KVPoolError>;
     /// 移除 context 的所有权；在途 submission 的 lease 延迟实际 row/slot 回收。
     fn release_state(&self, state: Self::ContextState);
     fn metrics(&self) -> KVPoolMetrics;
@@ -758,8 +759,8 @@ impl<P: KVPool> KVContext<P> {
     pub fn write_view<'a>(&'a mut self, layer: usize, exec: &'a ExecutionContext)
         -> Result<P::WriteView<'a>, KVContextError>;
     /// 只向当前 pending 区间写入；借用的 tensor view 可来自 batch 大张量。
-    pub fn store(&mut self, layer: usize, k: TensorView<'_, f32>,
-        v: TensorView<'_, f32>, exec: &ExecutionContext) -> Result<(), KVContextError>;
+    pub fn store(&mut self, layer: usize, k: TensorView<'_, P::Element>,
+        v: TensorView<'_, P::Element>, exec: &ExecutionContext) -> Result<(), KVContextError>;
     /// 调用者已确认全部层、索引和 KV 写入执行成功，再推进 ready_len。
     pub(in crate::runner) fn commit_append(&mut self) -> Result<(), KVContextError>;
     /// Internal ordered path: reserve from allocated_len; max two pending appends.
@@ -809,9 +810,9 @@ is held across a GPU await. A completed exec cannot be reused for another submis
 ## NaiveKVPool: physical slots and GPU indirection
 
 ```rust
-pub struct NaiveKVPool {
+pub struct NaiveKVPool<T: DType = f32> {
     /// 单 head 示例使用 [num_slots, head_dim]；通用布局可为 [slots, heads, dim]。
-    layers: Vec<(Arc<Tensor<f32>>, Arc<Tensor<f32>>)>,
+    layers: Vec<(Arc<Tensor<T>>, Arc<Tensor<T>>)>,
     slot_table: Arc<Tensor<i32>>, // [context_row, token_position] -> slot.
     config: NaiveKVPoolConfig,
     allocation: Arc<Mutex<Allocation>>,
@@ -827,17 +828,17 @@ struct StateLease {
     slots: Mutex<Vec<i32>>,
     allocation: Arc<Mutex<Allocation>>,
 }
-struct LayerStorage<'a> {
-    k: &'a Arc<Tensor<f32>>,
-    v: &'a Arc<Tensor<f32>>,
+struct LayerStorage<'a, T: DType> {
+    k: &'a Arc<Tensor<T>>,
+    v: &'a Arc<Tensor<T>>,
     slot_table: &'a Arc<Tensor<i32>>,
     row: usize,
     positions: Range<usize>,
     lease: Arc<StateLease>,
 }
-pub struct NaiveReadView<'a> { inner: LayerStorage<'a> }
-pub struct NaiveWriteView<'a> {
-    inner: LayerStorage<'a>,
+pub struct NaiveReadView<'a, T: DType = f32> { inner: LayerStorage<'a, T> }
+pub struct NaiveWriteView<'a, T: DType = f32> {
+    inner: LayerStorage<'a, T>,
     exec: &'a ExecutionContext,
 }
 ```

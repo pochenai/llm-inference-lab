@@ -49,7 +49,7 @@ use super::{
 };
 use crate::runner::{
     kv_pool::{KVContext, NaiveKVPool, NaiveKVPoolConfig, NaiveReadView},
-    loader::{EosTokenId, WeightLoader},
+    loader::{EosTokenId, WeightElement, WeightLoader},
     upload::UploadPool,
 };
 use crate::{
@@ -59,8 +59,10 @@ use crate::{
 use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
+    core::ElementType,
     tensor::{PartitionMut, Reshape, Tensor},
     tile_kernel::TileKernel,
+    DType,
 };
 use futures::FutureExt;
 use serde::Deserialize;
@@ -71,7 +73,7 @@ const KV_TOKENS_PER_TILE: i32 = 32;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
 
-type Weight = Arc<Tensor<f32>>;
+type Weight<T> = Arc<Tensor<T>>;
 
 /// One invocation's outputs: GPU readbacks before outer completion, CPU values after it.
 struct StepOutput<Token, Logits> {
@@ -103,32 +105,34 @@ pub struct Qwen2Config {
     rope_scaling: Option<serde_json::Value>,
 }
 
-struct Layer {
-    input_norm: Weight,
-    post_norm: Weight,
-    q: Weight,
-    k: Weight,
-    v: Weight,
-    o: Weight,
-    q_bias: Weight,
-    k_bias: Weight,
-    v_bias: Weight,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
+struct Layer<T: DType> {
+    input_norm: Weight<T>,
+    post_norm: Weight<T>,
+    q: Weight<T>,
+    k: Weight<T>,
+    v: Weight<T>,
+    o: Weight<T>,
+    q_bias: Weight<T>,
+    k_bias: Weight<T>,
+    v_bias: Weight<T>,
+    gate: Weight<T>,
+    up: Weight<T>,
+    down: Weight<T>,
 }
 
-pub struct Qwen2Engine {
+/// T controls weight/activation/KV storage; reductions, MMA accumulation and logits use FP32.
+/// BF16 and FP32 paths are validated; token IDs and Runner scheduling are dtype-independent.
+pub struct Qwen2Engine<T: WeightElement + ElementType = f32> {
     config: Qwen2Config,
     tokenizer: Tokenizer,
-    embedding: Weight,
-    norm: Weight,
-    lm_head: Weight,
-    inv_freq: Weight,
-    layers: Vec<Layer>,
+    embedding: Weight<T>,
+    norm: Weight<T>,
+    lm_head: Weight<T>,
+    inv_freq: Weight<f32>,
+    layers: Vec<Layer<T>>,
     eos: Vec<u32>,
     attention: GqaAttention,
-    workspaces: Arc<WorkspacePool>,
+    workspaces: Arc<WorkspacePool<T>>,
     instruments: Instruments,
     input_uploads: Arc<UploadPool<u32>>,
     embedding_sources: Arc<UploadPool<u64>>,
@@ -136,9 +140,9 @@ pub struct Qwen2Engine {
     logit_readbacks: ReadbackCache<f32>,
 }
 
-impl Qwen2Engine {
+impl<T: WeightElement + ElementType> Qwen2Engine<T> {
     /// Load the supplied local checkpoint; missing or incompatible weights are errors.
-    /// BF16 checkpoint values are converted once to FP32 by the existing WeightLoader.
+    /// Checkpoint values load directly into T; BF16 -> BF16 preserves native bits.
     pub async fn load(path: &Path, policy: &Arc<dyn SchedulingPolicy>) -> Result<Self, ModelError> {
         let loader = WeightLoader::new(path)?;
         let config: Qwen2Config = loader.config()?;
@@ -295,7 +299,7 @@ impl Qwen2Engine {
             kv_heads: config.num_key_value_heads,
             metadata_uploads: Arc::default(),
         };
-        let workspaces: Arc<WorkspacePool> = Arc::default();
+        let workspaces: Arc<WorkspacePool<T>> = Arc::default();
         let instruments = Instruments::new(workspaces.metrics().model_instance);
         Ok(Self {
             token_readback: GpuTokenReadback::new(
@@ -349,7 +353,7 @@ impl Qwen2Engine {
     pub async fn step_with_logits(
         &self,
         tokens: &[u32],
-        kv: &mut KVContext<NaiveKVPool>,
+        kv: &mut KVContext<NaiveKVPool<T>>,
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Result<(u32, Vec<f32>), ModelError> {
         let output = self.step(tokens, kv, policy, true).await?;
@@ -359,7 +363,7 @@ impl Qwen2Engine {
     async fn step(
         &self,
         tokens: &[u32],
-        kv: &mut KVContext<NaiveKVPool>,
+        kv: &mut KVContext<NaiveKVPool<T>>,
         policy: Arc<dyn SchedulingPolicy>,
         read_logits: bool,
     ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
@@ -376,7 +380,10 @@ impl Qwen2Engine {
         })
     }
 
-    fn validate_step_input(&self, input: &ModelInput<'_, NaiveKVPool>) -> Result<(), ModelError> {
+    fn validate_step_input(
+        &self,
+        input: &ModelInput<'_, NaiveKVPool<T>>,
+    ) -> Result<(), ModelError> {
         let length = input.sequence_len();
         let kv = &input.kv;
         if kv.is_pending()
@@ -419,7 +426,7 @@ impl Qwen2Engine {
     /// and host reads. Mixed steps are labelled prefill if any input is not decode.
     async fn forward_batch(
         &self,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         policy: Arc<dyn SchedulingPolicy>,
         read_logits: bool,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
@@ -451,7 +458,7 @@ impl Qwen2Engine {
     /// Caller must await this submission before accessing its host buffers.
     unsafe fn enqueue_forward_with_host_readback(
         &self,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         read_logits: bool,
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
@@ -473,7 +480,7 @@ impl Qwen2Engine {
     /// Returned tensors are GPU handles; their values may still be pending.
     unsafe fn submit_forward_kernels(
         &self,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Tensor<i32>, Tensor<f32>>, ModelError> {
         let submit_started = Instant::now();
@@ -538,6 +545,7 @@ impl Qwen2Engine {
                 ids,
                 self.embedding.clone(),
             )
+            .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
         } else if let Some(first) = contiguous_feedback {
             // acquire retains the workspace lease on exec; this raw write covers
@@ -556,6 +564,7 @@ impl Qwen2Engine {
                 self.config.hidden_size.div_ceil(256) as u32,
                 1,
             ))
+            .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
         } else {
             // Source addresses bypass typed kernel arguments, so retain their owners
@@ -596,6 +605,7 @@ impl Qwen2Engine {
                 self.embedding.clone(),
                 self.config.vocab_size as i32,
             )
+            .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
         }
         // All layer accesses share exec's stream. A buffer is overwritten only after
@@ -609,8 +619,20 @@ impl Qwen2Engine {
                 false,
                 exec,
             )?;
-            self.linear(&mut scratch.q, &scratch.norm, layer.q.clone(), None, exec)?;
-            self.linear(&mut scratch.k, &scratch.norm, layer.k.clone(), None, exec)?;
+            self.linear(
+                &mut scratch.q,
+                &scratch.norm,
+                layer.q.clone(),
+                Some(layer.q_bias.clone()),
+                exec,
+            )?;
+            self.linear(
+                &mut scratch.k,
+                &scratch.norm,
+                layer.k.clone(),
+                Some(layer.k_bias.clone()),
+                exec,
+            )?;
             self.linear(
                 &mut scratch.v,
                 &scratch.norm,
@@ -618,20 +640,8 @@ impl Qwen2Engine {
                 Some(layer.v_bias.clone()),
                 exec,
             )?;
-            self.rope(
-                &mut scratch.rotated_q,
-                &scratch.q,
-                layer.q_bias.clone(),
-                &metadata,
-                exec,
-            )?;
-            self.rope(
-                &mut scratch.rotated_k,
-                &scratch.k,
-                layer.k_bias.clone(),
-                &metadata,
-                exec,
-            )?;
+            self.rope(&mut scratch.rotated_q, &scratch.q, &metadata, exec)?;
+            self.rope(&mut scratch.rotated_k, &scratch.k, &metadata, exec)?;
             for (input, range) in batch.iter_mut().zip(&query_ranges) {
                 input.kv.store(
                     index,
@@ -679,6 +689,7 @@ impl Qwen2Engine {
                 &scratch.gate,
                 &scratch.up,
             )
+            .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
             self.linear(
                 &mut scratch.q,
@@ -727,12 +738,12 @@ impl Qwen2Engine {
         })
     }
 
-    unsafe fn linear(
+    unsafe fn linear<O: DType>(
         &self,
-        out: &mut Tensor<f32>,
-        x: &Tensor<f32>,
-        w: Weight,
-        bias: Option<Weight>,
+        out: &mut Tensor<O>,
+        x: &Tensor<T>,
+        w: Weight<T>,
+        bias: Option<Weight<T>>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
         let k = x.shape()[1] as usize;
@@ -747,6 +758,8 @@ impl Qwen2Engine {
         };
         kernels::linear(out.partition(tile), x, w, bias)
             .generics(vec![
+                T::DTYPE.to_string(),
+                O::DTYPE.to_string(),
                 k.to_string(),
                 has_bias.to_string(),
                 tile[0].to_string(),
@@ -758,9 +771,9 @@ impl Qwen2Engine {
 
     unsafe fn normalize(
         &self,
-        out: &mut Tensor<f32>,
-        x: &Tensor<f32>,
-        w: Weight,
+        out: &mut Tensor<T>,
+        x: &Tensor<T>,
+        w: Weight<T>,
         metadata: &Tensor<i32>,
         gather: bool,
         exec: &ExecutionContext,
@@ -777,6 +790,7 @@ impl Qwen2Engine {
             last_rows_offset,
         )
         .generics(vec![
+            T::DTYPE.to_string(),
             width.next_power_of_two().to_string(),
             gather.to_string(),
         ])
@@ -786,20 +800,14 @@ impl Qwen2Engine {
 
     unsafe fn rope(
         &self,
-        out: &mut Tensor<f32>,
-        x: &Tensor<f32>,
-        bias: Weight,
+        out: &mut Tensor<T>,
+        x: &Tensor<T>,
         metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
-        kernels::rope(
-            out.partition([1, 64]),
-            x,
-            bias,
-            self.inv_freq.clone(),
-            metadata,
-        )
-        .execute(exec)?;
+        kernels::rope(out.partition([1, 64]), x, self.inv_freq.clone(), metadata)
+            .generics(vec![T::DTYPE.to_string()])
+            .execute(exec)?;
         Ok(())
     }
 }
@@ -815,10 +823,10 @@ impl GqaAttention {
     /// Per packed token: context row, absolute position, visible history start.
     /// The tail stores range.end - 1 for each request's final RMSNorm/LM-head row.
     /// Built/uploaded once per forward and reused by RoPE and every attention layer.
-    unsafe fn prepare_metadata(
+    unsafe fn prepare_metadata<T: DType>(
         &self,
         rows: usize,
-        views: &[NaiveReadView<'_>],
+        views: &[NaiveReadView<'_, T>],
         query_ranges: &[Range<usize>],
         exec: &ExecutionContext,
     ) -> Result<Arc<Tensor<i32>>, ModelError> {
@@ -875,11 +883,11 @@ impl GqaAttention {
     }
 
     /// Preparation retains all contexts on exec; view supplies shared layer storage.
-    unsafe fn submit_prepared(
+    unsafe fn submit_prepared<T: DType>(
         &self,
-        out: &mut Tensor<f32>,
-        q: &Tensor<f32>,
-        view: &NaiveReadView<'_>,
+        out: &mut Tensor<T>,
+        q: &Tensor<T>,
+        view: &NaiveReadView<'_, T>,
         metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
@@ -895,20 +903,20 @@ impl GqaAttention {
             self.q_heads as i32,
             self.kv_heads as i32,
         )
-        .generics(vec![KV_TOKENS_PER_TILE.to_string()])
+        .generics(vec![T::DTYPE.to_string(), KV_TOKENS_PER_TILE.to_string()])
         .execute(exec)?;
         Ok(())
     }
 }
 
-impl AttentionBackend<NaiveKVPool> for GqaAttention {
+impl<T: DType + ElementType> AttentionBackend<NaiveKVPool<T>> for GqaAttention {
     fn forward(
         &self,
-        q: Weight,
-        views: &[NaiveReadView<'_>],
+        q: Weight<T>,
+        views: &[NaiveReadView<'_, T>],
         query_ranges: &[std::ops::Range<usize>],
         exec: &ExecutionContext,
-    ) -> Result<Weight, ModelError> {
+    ) -> Result<Weight<T>, ModelError> {
         if q.shape().len() != 2 || q.shape()[1] as usize != self.q_heads * 64 {
             return Err(ModelError::InvalidInput(
                 "incompatible GQA query width".into(),
@@ -916,7 +924,7 @@ impl AttentionBackend<NaiveKVPool> for GqaAttention {
         }
         // SAFETY: the attention kernel writes every valid output before any read.
         unsafe {
-            let mut out = Tensor::<f32>::uninitialized(q.size())
+            let mut out = Tensor::<T>::uninitialized(q.size())
                 .execute(exec)?
                 .assume_init()
                 .reshape(&[q.shape()[0] as usize, self.q_heads * 64])?;
@@ -928,7 +936,7 @@ impl AttentionBackend<NaiveKVPool> for GqaAttention {
     }
 }
 
-impl CausalModel<NaiveKVPool> for Qwen2Engine {
+impl<T: WeightElement + ElementType> CausalModel<NaiveKVPool<T>> for Qwen2Engine<T> {
     fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
@@ -947,7 +955,7 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
 
     async fn forward(
         &self,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Vec<Result<NextToken, ModelError>> {
         let start = Instant::now();
@@ -967,7 +975,7 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         let prefill = batch.iter().zip(&outputs).any(|(input, output)| {
             output.is_ok() && (input.kv.ready_len() == 0 || input.uncached_len() > 1)
         });
-        let submit = |batch: &mut [ModelInput<'_, NaiveKVPool>], exec: &ExecutionContext| {
+        let submit = |batch: &mut [ModelInput<'_, NaiveKVPool<T>>], exec: &ExecutionContext| {
             // SAFETY: all layers and their resources belong to this submission.
             unsafe { self.submit_forward_kernels(batch, exec) }
         };
@@ -1045,7 +1053,7 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
     /// Runner waits for gpu_completion later, then commits KV and processes predictions.
     async fn enqueue_forward_and_return_completion(
         self: Arc<Self>,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> SubmittedGpuWorkWithCompletion {
         let mut outputs: Vec<_> = batch
@@ -1184,13 +1192,13 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
     }
 }
 
-async fn weight(
+async fn weight<T: WeightElement>(
     loader: &WeightLoader,
     name: &str,
     shape: &[usize],
     policy: &Arc<dyn SchedulingPolicy>,
-) -> Result<Weight, ModelError> {
-    let w = loader.load_device::<f32>(name, policy).await?;
+) -> Result<Weight<T>, ModelError> {
+    let w = loader.load_device::<T>(name, policy).await?;
     if !(w
         .shape()
         .iter()
@@ -1204,13 +1212,15 @@ async fn weight(
     Ok(w)
 }
 
-unsafe fn add(
-    out: &mut Tensor<f32>,
-    x: &Tensor<f32>,
-    y: &Tensor<f32>,
+unsafe fn add<T: DType>(
+    out: &mut Tensor<T>,
+    x: &Tensor<T>,
+    y: &Tensor<T>,
     exec: &ExecutionContext,
 ) -> Result<(), ModelError> {
-    kernels::add(out.partition([1, 256]), x, y).execute(exec)?;
+    kernels::add(out.partition([1, 256]), x, y)
+        .generics(vec![T::DTYPE.to_string()])
+        .execute(exec)?;
     Ok(())
 }
 
@@ -1226,6 +1236,12 @@ mod tests {
 
     /// Small deterministic weights exercise the full multi-layer/GQA batch path without HF files.
     async fn tiny_model(policy: &Arc<dyn SchedulingPolicy>) -> Result<Qwen2Engine, ModelError> {
+        tiny_model_with_dtype::<f32>(policy).await
+    }
+
+    async fn tiny_model_with_dtype<T: WeightElement + ElementType>(
+        policy: &Arc<dyn SchedulingPolicy>,
+    ) -> Result<Qwen2Engine<T>, ModelError> {
         with_context(|exec| {
             value((|| -> Result<_, ModelError> {
                 let config: Qwen2Config = serde_json::from_value(serde_json::json!({
@@ -1237,8 +1253,8 @@ mod tests {
                     "eos_token_id":256, "hidden_act":"silu"
                 }))
                 .unwrap();
-                let weight = |shape: &[usize], seed: usize| -> Result<Weight, ModelError> {
-                    let values = (0..shape.iter().product())
+                let weight = |shape: &[usize], seed: usize| -> Result<Weight<T>, ModelError> {
+                    let values: Vec<f32> = (0..shape.iter().product())
                         .map(|index: usize| {
                             if seed == 0 {
                                 1.0
@@ -1247,6 +1263,9 @@ mod tests {
                             }
                         })
                         .collect();
+                    let bytes: Vec<u8> =
+                        values.iter().flat_map(|v: &f32| v.to_le_bytes()).collect();
+                    let values = T::decode_weights(safetensors::Dtype::F32, &bytes)?;
                     // SAFETY: all uploads share exec; construction awaits completion.
                     Ok(Arc::new(unsafe {
                         api::copy_host_vec_to_device(&Arc::new(values))
@@ -1275,7 +1294,7 @@ mod tests {
                 let frequencies: Vec<_> = (0..32)
                     .map(|i| config.rope_theta.powf(-(i as f32) / 32.0))
                     .collect();
-                let workspaces: Arc<WorkspacePool> = Arc::default();
+                let workspaces: Arc<WorkspacePool<T>> = Arc::default();
                 let instruments = Instruments::new(workspaces.metrics().model_instance);
                 Ok(Qwen2Engine {
                     token_readback: GpuTokenReadback::new(
@@ -1314,7 +1333,7 @@ mod tests {
     ) -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = cuda_async::device_context::global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_layers: 1,
                 num_slots: 320,
@@ -1508,7 +1527,7 @@ mod tests {
         let mut config = model.kv_pool_config(16)?;
         config.max_rows = 5;
         config.num_slots *= 5;
-        let pool = NaiveKVPool::new(config, &policy).await?;
+        let pool = NaiveKVPool::<f32>::new(config, &policy).await?;
         let initial = pool.metrics();
         let mut contexts = (0..3)
             .map(|_| KVContext::new(pool.clone()))
@@ -1651,6 +1670,8 @@ mod tests {
                                     bias,
                                 )
                                 .generics(vec![
+                                    "f32".into(),
+                                    "f32".into(),
                                     width.to_string(),
                                     has_bias.to_string(),
                                     tile[0].to_string(),
@@ -1825,7 +1846,7 @@ mod tests {
         let mut config = model.kv_pool_config(32)?;
         config.max_rows = 3;
         config.num_slots *= 3;
-        let pool = NaiveKVPool::new(config, &policy).await?;
+        let pool = NaiveKVPool::<f32>::new(config, &policy).await?;
         let idle = pool.metrics();
         let prompts = [vec![1, 2, 3], vec![9], vec![17, 18]];
         let mut expected = Vec::new();
@@ -1972,7 +1993,7 @@ mod tests {
         let mut config = model.kv_pool_config(32)?;
         config.max_rows = 3;
         config.num_slots *= 3;
-        let pool = NaiveKVPool::new(config, &policy).await?;
+        let pool = NaiveKVPool::<f32>::new(config, &policy).await?;
         let initial = pool.metrics();
         let prompts = [vec![1, 2, 3], vec![9], vec![17, 18]];
         let mut expected = Vec::new();
@@ -2141,11 +2162,11 @@ mod tests {
             .collect();
         let device = Device::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
-        let model = Qwen2Engine::load(Path::new(&model_dir), &policy).await?;
+        let model = Qwen2Engine::<f32>::load(Path::new(&model_dir), &policy).await?;
         let mut runner_config = model.kv_pool_config(tokens.len() + expected_ids.len() + 1)?;
         runner_config.max_rows = 2;
         runner_config.num_slots *= 2;
-        let pool = NaiveKVPool::new(runner_config, &policy).await?;
+        let pool = NaiveKVPool::<f32>::new(runner_config, &policy).await?;
         let initial = pool.metrics();
         let mut full = KVContext::new(pool.clone())?;
         let invalid = model
@@ -2226,7 +2247,7 @@ mod tests {
         let mut concurrent_config = model.kv_pool_config(tokens.len())?;
         concurrent_config.max_rows = 2;
         concurrent_config.num_slots *= 2;
-        let concurrent_pool = NaiveKVPool::new(concurrent_config, &policy).await?;
+        let concurrent_pool = NaiveKVPool::<f32>::new(concurrent_config, &policy).await?;
         let idle = concurrent_pool.metrics();
         let other_policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let mut left = KVContext::new(concurrent_pool.clone())?;
@@ -2253,7 +2274,7 @@ mod tests {
         let mut packed_config = model.kv_pool_config(tokens.len() + 2)?;
         packed_config.max_rows = 3;
         packed_config.num_slots *= 3;
-        let packed_pool = NaiveKVPool::new(packed_config, &policy).await?;
+        let packed_pool = NaiveKVPool::<f32>::new(packed_config, &policy).await?;
         let packed_idle = packed_pool.metrics();
         let mut contexts = [
             KVContext::new(packed_pool.clone())?,
@@ -2435,6 +2456,77 @@ mod tests {
             assert!(stats.tokens_per_second().is_some_and(|tps| tps > 0.0));
         }
         assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bf16_ragged_cached_forward_matches_full_history_and_fp32() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let model = tiny_model_with_dtype::<bf16>(&policy).await?;
+        let reference = tiny_model(&policy).await?;
+        assert_eq!(
+            model.embedding.num_bytes() * 2,
+            reference.embedding.num_bytes()
+        );
+        let mut config = model.kv_pool_config(64)?;
+        config.max_rows = 6;
+        config.num_slots *= 6;
+        let pool = NaiveKVPool::<bf16>::new(config, &policy).await?;
+        let reference_pool = NaiveKVPool::<f32>::new(config, &policy).await?;
+        let initial = pool.metrics();
+        assert_eq!(
+            initial.layers.allocated_bytes * 2,
+            reference_pool.metrics().layers.allocated_bytes
+        );
+        let mut histories = [vec![1u32; 33], vec![4, 9, 7], vec![3, 5, 8, 13, 21]];
+        let mut contexts = (0..3)
+            .map(|_| KVContext::new(pool.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (history, kv) in histories.iter().zip(&mut contexts) {
+            model.step(&history[..2], kv, policy.clone(), false).await?;
+        }
+        for _ in 0..3 {
+            let mut inputs: Vec<_> = histories
+                .iter()
+                .zip(&mut contexts)
+                .map(|(ids, kv)| ModelInput {
+                    token_ids: ids.into(),
+                    kv,
+                })
+                .collect();
+            let output = model
+                .forward_batch(&mut inputs, policy.clone(), true)
+                .await?;
+            for (index, history) in histories.iter_mut().enumerate() {
+                let mut full = KVContext::new(pool.clone())?;
+                let expected = model.step(history, &mut full, policy.clone(), true).await?;
+                let mut full_fp32 = KVContext::new(reference_pool.clone())?;
+                let fp32 = reference
+                    .step(history, &mut full_fp32, policy.clone(), true)
+                    .await?;
+                let logits =
+                    &output.logits.as_ref().unwrap().as_slice()[index * 257..(index + 1) * 257];
+                let error = logits
+                    .iter()
+                    .zip(expected.logits.unwrap())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(error < 0.01, "BF16 cached/full error: {error}");
+                let error = logits
+                    .iter()
+                    .zip(fp32.logits.unwrap())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(error < 0.03, "BF16/FP32 error: {error}");
+                assert_eq!(output.token.as_slice()[index] as u32, expected.token);
+                history.push(output.token.as_slice()[index] as u32);
+            }
+        }
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
         Ok(())
     }
 }

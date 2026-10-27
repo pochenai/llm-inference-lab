@@ -10,8 +10,10 @@ use cuda_async::{
 };
 use cutile::{
     api,
+    core::ElementType,
     tensor::{Tensor, TensorView},
     tile_kernel::TileKernel,
+    DType,
 };
 
 use crate::runner::upload::UploadPool;
@@ -63,10 +65,10 @@ impl Default for NaiveKVPoolConfig {
 /// If all max_rows contexts must fit at max_seq_len simultaneously:
 /// max_rows <= num_slots / max_seq_len // Integer division.
 /// ```
-pub struct NaiveKVPool {
+pub struct NaiveKVPool<T: DType = f32> {
     /// 按 layer + slot 存储，逻辑 context 经 slot_table 寻址，后续可共享前缀。
     /// context 若独占连续 KV 区域，fork 就需要复制历史；间接映射解除了这一限制。
-    layers: Vec<(Arc<Tensor<f32>>, Arc<Tensor<f32>>)>,
+    layers: Vec<(Arc<Tensor<T>>, Arc<Tensor<T>>)>,
     /// token_position → slot mapping
     slot_table: Arc<Tensor<i32>>,
     config: NaiveKVPoolConfig,
@@ -137,7 +139,7 @@ impl NaiveMappingPlan {
     }
 }
 
-impl KVContext<NaiveKVPool> {
+impl<T: DType + ElementType> KVContext<NaiveKVPool<T>> {
     /// Naive-only deferred reservation for packing mapping and model uploads.
     /// Submit the plan before K/V access; commit only after successful GPU completion.
     pub(in crate::runner) fn reserve_append_batch(
@@ -177,16 +179,16 @@ pub struct NaiveContextState {
     lease: Arc<StateLease>,
 }
 
-struct LayerStorage<'a> {
-    k: &'a Arc<Tensor<f32>>,
-    v: &'a Arc<Tensor<f32>>,
+struct LayerStorage<'a, T: DType> {
+    k: &'a Arc<Tensor<T>>,
+    v: &'a Arc<Tensor<T>>,
     slot_table: &'a Arc<Tensor<i32>>,
     row: usize,
     positions: Range<usize>,
     lease: Arc<StateLease>,
 }
 
-impl LayerStorage<'_> {
+impl<T: DType> LayerStorage<'_, T> {
     fn retain(&self, exec: &ExecutionContext) -> Result<()> {
         exec.retain(self.lease.clone())?;
         exec.retain(self.k.clone())?;
@@ -197,23 +199,23 @@ impl LayerStorage<'_> {
 }
 
 /// Read-only addressing. Safe accessors expose const pointers, never writable buffers.
-pub struct NaiveReadView<'a> {
-    inner: LayerStorage<'a>,
+pub struct NaiveReadView<'a, T: DType = f32> {
+    inner: LayerStorage<'a, T>,
 }
 
 /// Writable addressing for reserved positions, borrowed exclusively from context state.
 /// Construction retains GPU resources on exec; this is not proof of GPU completion.
-pub struct NaiveWriteView<'a> {
-    inner: LayerStorage<'a>,
+pub struct NaiveWriteView<'a, T: DType = f32> {
+    inner: LayerStorage<'a, T>,
     exec: &'a ExecutionContext,
 }
 
-impl NaiveReadView<'_> {
-    pub fn k_ptr(&self) -> *const f32 {
-        self.inner.k.device_pointer().cu_deviceptr() as *const f32
+impl<T: DType> NaiveReadView<'_, T> {
+    pub fn k_ptr(&self) -> *const T {
+        self.inner.k.device_pointer().cu_deviceptr() as *const T
     }
-    pub fn v_ptr(&self) -> *const f32 {
-        self.inner.v.device_pointer().cu_deviceptr() as *const f32
+    pub fn v_ptr(&self) -> *const T {
+        self.inner.v.device_pointer().cu_deviceptr() as *const T
     }
     pub fn slot_table_ptr(&self) -> *const i32 {
         self.inner.slot_table.device_pointer().cu_deviceptr() as *const i32
@@ -239,18 +241,16 @@ impl NaiveReadView<'_> {
     /// # Safety
     /// Use these handles only for reads within positions and retain the view in exec
     /// before submission. Do not use Tensor's mutable device pointers to write storage.
-    pub(crate) unsafe fn tensors(
-        &self,
-    ) -> (&Arc<Tensor<f32>>, &Arc<Tensor<f32>>, &Arc<Tensor<i32>>) {
+    pub(crate) unsafe fn tensors(&self) -> (&Arc<Tensor<T>>, &Arc<Tensor<T>>, &Arc<Tensor<i32>>) {
         (self.inner.k, self.inner.v, self.inner.slot_table)
     }
 }
 
-impl NaiveWriteView<'_> {
-    pub fn k_mut_ptr(&self) -> DevicePointer<f32> {
+impl<T: DType> NaiveWriteView<'_, T> {
+    pub fn k_mut_ptr(&self) -> DevicePointer<T> {
         self.inner.k.device_pointer()
     }
-    pub fn v_mut_ptr(&self) -> DevicePointer<f32> {
+    pub fn v_mut_ptr(&self) -> DevicePointer<T> {
         self.inner.v.device_pointer()
     }
     pub fn slot_table_ptr(&self) -> *const i32 {
@@ -274,7 +274,7 @@ impl NaiveWriteView<'_> {
     }
 }
 
-impl NaiveKVPool {
+impl<T: DType + ElementType> NaiveKVPool<T> {
     /// Allocate backing buffers once; requests subsequently reserve rows and slots.
     pub async fn new(
         config: NaiveKVPoolConfig,
@@ -306,10 +306,10 @@ impl NaiveKVPool {
         }
         let mut layers = Vec::new();
         for _ in 0..config.num_layers {
-            let k = api::zeros::<f32>(&[config.num_slots, config.head_dim])
+            let k = api::zeros::<T>(&[config.num_slots, config.head_dim])
                 .schedule(policy)?
                 .await?;
-            let v = api::zeros::<f32>(&[config.num_slots, config.head_dim])
+            let v = api::zeros::<T>(&[config.num_slots, config.head_dim])
                 .schedule(policy)?
                 .await?;
             layers.push((Arc::new(k), Arc::new(v)));
@@ -343,7 +343,7 @@ impl NaiveKVPool {
         state: &'a NaiveContextState,
         layer: usize,
         positions: Range<usize>,
-    ) -> Result<LayerStorage<'a>> {
+    ) -> Result<LayerStorage<'a, T>> {
         self.validate_state(state)?;
         if positions.start > positions.end
             || positions.end > state.lease.slots.lock().unwrap().len()
@@ -437,10 +437,11 @@ impl NaiveKVPool {
     }
 }
 
-impl KVPool for NaiveKVPool {
+impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
+    type Element = T;
     type ContextState = NaiveContextState;
-    type ReadView<'a> = NaiveReadView<'a>;
-    type WriteView<'a> = NaiveWriteView<'a>;
+    type ReadView<'a> = NaiveReadView<'a, T>;
+    type WriteView<'a> = NaiveWriteView<'a, T>;
 
     fn max_seq_len(&self) -> usize {
         self.config.max_seq_len
@@ -570,8 +571,8 @@ impl KVPool for NaiveKVPool {
     fn store(
         &self,
         dst: Self::WriteView<'_>,
-        k: TensorView<'_, f32>,
-        v: TensorView<'_, f32>,
+        k: TensorView<'_, T>,
+        v: TensorView<'_, T>,
     ) -> Result<()> {
         let width = self.config.head_dim;
         if !Arc::ptr_eq(dst.inner.slot_table, &self.slot_table)
@@ -597,7 +598,11 @@ impl KVPool for NaiveKVPool {
                 dst.positions().start as i32,
                 dst.positions().len() as i32,
             )
-            .generics(vec![STORE_TOKENS_PER_TILE.to_string(), width.to_string()])
+            .generics(vec![
+                T::DTYPE.to_string(),
+                STORE_TOKENS_PER_TILE.to_string(),
+                width.to_string(),
+            ])
             .grid((
                 dst.positions().len().div_ceil(STORE_TOKENS_PER_TILE) as u32,
                 1,
@@ -616,7 +621,7 @@ impl KVPool for NaiveKVPool {
         let allocation = self.allocation.lock().unwrap();
         let c = self.config;
         let row_bytes = c.max_seq_len * size_of::<i32>();
-        let slot_bytes = c.num_layers * 2 * c.head_dim * size_of::<f32>();
+        let slot_bytes = c.num_layers * 2 * c.head_dim * size_of::<T>();
         let active_rows = c.max_rows - allocation.free_rows.len();
         KVPoolMetrics {
             index: BufferMetrics {
@@ -710,12 +715,12 @@ mod kernels {
     /// so each tile element writes through its computed pointer instead of a contiguous slice.
     /// Example: slots=[10,25,7] writes the three token vectors to K/V rows 10, 25, 7.
     #[cutile::entry()]
-    pub(super) unsafe fn store<const B: i32, const D: i32>(
-        cache_k_ptr: *mut f32,
-        cache_v_ptr: *mut f32,
+    pub(super) unsafe fn store<T: ElementType, const B: i32, const D: i32>(
+        cache_k_ptr: *mut T,
+        cache_v_ptr: *mut T,
         table: &Tensor<i32, { [-1, -1] }>,
-        k: &Tensor<f32, { [-1, D] }>,
-        v: &Tensor<f32, { [-1, D] }>,
+        k: &Tensor<T, { [-1, D] }>,
+        v: &Tensor<T, { [-1, D] }>,
         row: i32,
         start: i32,
         count: i32,
@@ -748,14 +753,14 @@ mod kernels {
         let columns: Tile<i32, { [B, D] }> = columns.reshape(shape![1, D]).broadcast(shape![B, D]);
         let offsets = slot_offsets + columns;
         let mask: Tile<bool, { [B, D] }> = valid.reshape(shape![B, 1]).broadcast(shape![B, D]);
-        let kp: PointerTile<*mut f32, { [] }> = pointer_to_tile(cache_k_ptr);
-        let kp: PointerTile<*mut f32, { [1, 1] }> = kp.reshape(shape![1, 1]);
-        let kp: PointerTile<*mut f32, { [B, D] }> = kp.broadcast(shape![B, D]);
-        let kp: PointerTile<*mut f32, { [B, D] }> = kp.offset_tile(offsets);
-        let vp: PointerTile<*mut f32, { [] }> = pointer_to_tile(cache_v_ptr);
-        let vp: PointerTile<*mut f32, { [1, 1] }> = vp.reshape(shape![1, 1]);
-        let vp: PointerTile<*mut f32, { [B, D] }> = vp.broadcast(shape![B, D]);
-        let vp: PointerTile<*mut f32, { [B, D] }> = vp.offset_tile(offsets);
+        let kp: PointerTile<*mut T, { [] }> = pointer_to_tile(cache_k_ptr);
+        let kp: PointerTile<*mut T, { [1, 1] }> = kp.reshape(shape![1, 1]);
+        let kp: PointerTile<*mut T, { [B, D] }> = kp.broadcast(shape![B, D]);
+        let kp: PointerTile<*mut T, { [B, D] }> = kp.offset_tile(offsets);
+        let vp: PointerTile<*mut T, { [] }> = pointer_to_tile(cache_v_ptr);
+        let vp: PointerTile<*mut T, { [1, 1] }> = vp.reshape(shape![1, 1]);
+        let vp: PointerTile<*mut T, { [B, D] }> = vp.broadcast(shape![B, D]);
+        let vp: PointerTile<*mut T, { [B, D] }> = vp.offset_tile(offsets);
         // Partition loads zero-pad source rows beyond the tensor; masked scatters
         // ensure those padding lanes never read table cells or overwrite slot zero.
         let keys = k.partition(shape![B, D]).load([pid, 0]);
@@ -803,7 +808,7 @@ mod tests {
     async fn deferred_mapping_binds_only_after_submit_from_packed_subrange() -> Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 512,
                 max_rows: 2,
@@ -869,7 +874,7 @@ mod tests {
     async fn unsubmitted_mapping_plan_failure_releases_pending_reservations() -> Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 4,
                 max_rows: 2,
@@ -907,7 +912,7 @@ mod tests {
     async fn batch_mapping_preserves_prefixes_and_masks_tails() -> Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 512,
                 max_rows: 3,
@@ -960,7 +965,7 @@ mod tests {
     async fn batch_mapping_failure_preserves_progress_and_releases_slots() -> Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 3,
                 max_rows: 2,
@@ -1013,7 +1018,7 @@ mod tests {
     async fn store_reads_back_through_slots_and_releases() -> Result<()> {
         let _guard = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 4,
                 max_rows: 1,
@@ -1087,7 +1092,7 @@ mod tests {
     async fn tiled_store_preserves_prefixes_and_masks_tail_tokens() -> Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_layers: 2,
                 num_slots: 512,
@@ -1204,7 +1209,7 @@ mod tests {
     async fn submission_lease_delays_release_and_oom_does_not_leak() -> Result<()> {
         let _guard = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
-        let pool = NaiveKVPool::new(
+        let pool = NaiveKVPool::<f32>::new(
             NaiveKVPoolConfig {
                 num_slots: 2,
                 max_rows: 2,

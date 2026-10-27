@@ -7,7 +7,7 @@
 Qwen2.5-0.5B-Instruct runs through Scheduler -> Runner -> CausalModel with packed
 ragged GPU batches, streaming greedy generation, session continuation, reusable
 scratch and metrics. Continuous batching and token-budgeted chunked prefill are
-implemented. Qwen still computes in FP32/eager mode.
+implemented. Qwen supports native BF16/mixed precision and FP32; execution remains eager.
 
 ### Immediate target: a comparable Qwen benchmark against SGLang
 
@@ -19,7 +19,7 @@ submission-first overlap, preserving per-token EOS and continuous scheduling.
 | Alignment item | Current state | Remaining acceptance |
 | --- | --- | --- |
 | GPU feedback and submission-first overlap | Implemented; Runner A/B matrix and all 12 Nsight captures validated | Extend to mixed arrivals and other dtypes; the current fixed-cohort speedup is workload-dependent |
-| Native BF16 storage and computation | Planned; loader dtype support exists, but Qwen explicitly loads/computes FP32 | Support BF16 tensors/kernels and document accumulation dtype, numerical error and memory/latency |
+| Native BF16 storage and computation | Implemented; BF16 weights, activations and KV with FP32 reductions/accumulation/logits | Numerical/memory smoke checks passed; broader quality/performance and quantization remain separate |
 | Qwen CUDA Graph option | Planned; replay currently supports SimpleMLP only | Qwen eager/replay agreement, stable buffers/metadata and controlled graph-on/off measurements |
 
 BF16 is a lower-precision floating-point execution path. It is separate from the
@@ -66,12 +66,12 @@ The completed Runner A/B is not a SGLang performance result.
 1. Completed: Runner serial/overlap release comparison and Nsight validation with
    fresh KV, exact full-batch assertions, stable output text/counts and scratch/KV
    release checks. See the benchmark header or run:
-   /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --profile.
+   /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --dtype f32 --profile.
    Native timing determines speedup; separate captures validate ordering and overlap.
    Retain the serial mode and evaluate mixed arrivals/chunk budgets separately.
 2. Implement the Qwen CUDA Graph option, retaining the serial/eager baseline and
    the same ownership/completion contracts. Measure graph off/on independently.
-3. Add native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
+3. Implemented: native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
    numerical reference; validate BF16 tolerances and accumulation rather than
    requiring every generated token to match FP32 bit-for-bit.
 4. Run the matched SGLang comparison with fixed versions, model revision, dtype,
@@ -229,7 +229,7 @@ prerequisite week.
 | W4 | CUDA Graph and reusable execution buffers (SimpleMLP implemented) | Pooled exact-shape replay, dynamic inputs, mapped output; Qwen replay pending |
 | W5 | Qwen2.5-0.5B-Instruct baseline — Done | Reference logits/tokens, sessions/streaming, scratch reuse, metrics and benchmark |
 | W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
-| W7 | Native BF16 Qwen, then a separate quantization path | BF16 alignment planned; true quantization acceptance remains separate |
+| W7 | Native BF16 Qwen, then a separate quantization path | BF16 implemented; true quantization acceptance remains separate |
 | W8 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
 | W9 | Speculative decoding | Original plan retained |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
@@ -242,8 +242,8 @@ Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
 Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
 Qwen uses eager execution with packed ragged GPU batches. Runner now interleaves
 chunked prefill with decode under a token budget and overlaps submission with prior
-CPU results; fixed-cohort overlap measurements are complete. Qwen replay, native
-BF16, mixed-arrival evaluation and prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
+CPU results; fixed-cohort overlap measurements are complete. Qwen replay,
+mixed-arrival evaluation and prefix sharing remain open; BF16 is implemented. See the [engine guide](rust/engine/README.md) for
 commands and metric contracts.
 
 多模态编码器、LoRA 服务、structured output、弹性伸缩在扩展表中了解位置；本轮主线覆盖文本自回归 LLM inference，不要求深入所有相邻工作负载。
@@ -290,7 +290,7 @@ model loader
   -> scratch reuse + metrics / benchmarks
   -> profile and optimize Qwen + packed batch execution
   -> continuous batching / chunked prefill / submission-first overlap (implemented)
-  -> Runner overlap measurement (validated) -> Qwen CUDA Graph -> native BF16
+  -> Runner overlap measurement (validated) -> native BF16 (implemented) -> Qwen CUDA Graph
   -> matched SGLang performance comparison
   -> radix prefix reuse + cache-aware routing; separate quantization follow-up
   -> W9 onward: revisit when these foundations are validated
@@ -481,14 +481,14 @@ API computes an unused LM head on intermediate chunks; measure before separating
 
 #### W7: native BF16 Qwen and a separate quantization path
 
-Status: Planned. Native BF16 is the immediate precision-alignment prerequisite for
-SGLang comparisons; its completion does not satisfy the quantization items below.
+Status: Native BF16/mixed precision implemented. Quantization remains planned;
+BF16 completion does not satisfy the quantization items below.
 
 **Focus**
 
 - Implement BF16 weight/activation/KV storage and cuTile computation where appropriate;
   document FP32 accumulation and operations kept in FP32. Existing loader dtype support
-  is reusable; Qwen's current Tensor<f32> kernels still require implementation work.
+  is reused; Qwen kernels and NaiveKVPool now support typed BF16/FP32 storage.
 - Select one small weight-only or KV quantization path. Understand scale granularity, packing, dequantization, and the kernel/layout contract before adding algorithms.
 - Keep quantization algorithm, checkpoint representation, and execution kernel separate; smaller storage does not establish faster inference.
 - Measure tensor/logit error and held-out generation quality against the working Qwen FP32 baseline.
@@ -501,8 +501,11 @@ SGLang comparisons; its completion does not satisfy the quantization items below
 
 **Acceptance**
 
-- [ ] Validate native BF16 prefill/decode against a documented numerical reference;
-  report error, output quality, storage/workspace and latency against FP32.
+- [x] Validate native BF16 prefill/decode against Transformers BF16/CUDA SDPA;
+  English/Chinese fixture text, ragged/cached/chunked KV and serial/overlap checks pass.
+  At batch 4 / 4096 input tokens, scratch is about 638 MiB vs 1274 MiB in FP32.
+  See the local [BF16 validation report](rust/profiling/qwen2/bf16/RESULTS.md) for
+  errors, memory and short latency samples; held-out generation quality remains unmeasured.
 - [ ] Compare matched BF16/eager and BF16/graph settings with SGLang before claiming parity.
 - [ ] Quantize/dequantize a small linear layer or KV tensor; compare at least two scale granularities with independently computed reference values.
 - [ ] Integrate one path into Qwen and compare quality, storage/traffic, workspace and steady-state latency for at least two shapes.

@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use cuda_async::device_operation::ExecutionContext;
-use cutile::tensor::TensorView;
+use cutile::{tensor::TensorView, DType};
 
 use super::{KVContextError, KVPoolError};
 
@@ -20,6 +20,8 @@ type ContextResult<T> = std::result::Result<T, KVContextError>;
 /// }
 /// ```
 pub trait KVPool: Sized + Send + Sync {
+    /// Storage dtype shared by K/V writes and the matching attention backend.
+    type Element: DType;
     type ContextState: Send + Sync;
     type ReadView<'a>
     where
@@ -88,8 +90,8 @@ pub trait KVPool: Sized + Send + Sync {
     fn store(
         &self,
         dst: Self::WriteView<'_>,
-        k: TensorView<'_, f32>,
-        v: TensorView<'_, f32>,
+        k: TensorView<'_, Self::Element>,
+        v: TensorView<'_, Self::Element>,
     ) -> Result<()>;
 
     /// Drop context ownership; in-flight submission leases delay actual row/slot reuse.
@@ -312,8 +314,8 @@ impl<P: KVPool> KVContext<P> {
     pub fn store(
         &mut self,
         layer: usize,
-        k: TensorView<'_, f32>,
-        v: TensorView<'_, f32>,
+        k: TensorView<'_, P::Element>,
+        v: TensorView<'_, P::Element>,
         exec: &ExecutionContext,
     ) -> ContextResult<()> {
         let positions = self

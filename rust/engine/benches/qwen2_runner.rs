@@ -1,4 +1,4 @@
-//! Fixed-cohort Scheduler -> Runner serial/overlap comparison (FP32, eager).
+//! Fixed-cohort Scheduler -> Runner serial/overlap comparison (BF16/FP32, eager).
 //! Run from the repository root, replacing MODEL_DIR with the local HF snapshot:
 //! ```bash
 //! cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner --no-run
@@ -30,7 +30,11 @@ use std::{
 use anyhow::{ensure, Result};
 use clap::{Parser, ValueEnum};
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
-use cutile::cuda_core::Device;
+use cutile::{
+    core::{bf16, ElementType},
+    cuda_core::Device,
+};
+use engine::runner::loader::WeightElement;
 use engine::{
     runner::{
         kv_pool::{KVPool, NaiveKVPool},
@@ -56,6 +60,9 @@ enum Mode {
 
 #[derive(Parser)]
 struct Args {
+    /// Weight, activation and KV storage; reductions and accumulation remain FP32.
+    #[arg(long, default_value = "bf16", value_parser = ["bf16", "f32"])]
+    dtype: String,
     #[arg(long)]
     model_dir: PathBuf,
     #[arg(long = "bench", hide = true)]
@@ -79,8 +86,8 @@ struct Args {
 }
 
 /// Bench-only fixed lengths and shape checks; forwards still execute the real model.
-struct FixedCohortModel {
-    inner: Arc<Qwen2Engine>,
+struct FixedCohortModel<T: WeightElement + ElementType> {
+    inner: Arc<Qwen2Engine<T>>,
     calls: Arc<AtomicUsize>,
     batch_size: usize,
     input_tokens: usize,
@@ -88,10 +95,10 @@ struct FixedCohortModel {
     mode: Mode,
 }
 
-impl FixedCohortModel {
+impl<T: WeightElement + ElementType> FixedCohortModel<T> {
     fn begin_forward(
         &self,
-        batch: &[ModelInput<'_, NaiveKVPool>],
+        batch: &[ModelInput<'_, NaiveKVPool<T>>],
         mode: Mode,
     ) -> nvtx_sys::RangeId {
         assert_eq!(self.mode, mode);
@@ -115,7 +122,7 @@ impl FixedCohortModel {
     }
 }
 
-impl CausalModel<NaiveKVPool> for FixedCohortModel {
+impl<T: WeightElement + ElementType> CausalModel<NaiveKVPool<T>> for FixedCohortModel<T> {
     fn tokenizer(&self) -> &tokenizers::Tokenizer {
         self.inner.tokenizer()
     }
@@ -131,7 +138,7 @@ impl CausalModel<NaiveKVPool> for FixedCohortModel {
 
     async fn forward(
         &self,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Vec<Result<NextToken, ModelError>> {
         let range = self.begin_forward(batch, Mode::Serial);
@@ -142,7 +149,7 @@ impl CausalModel<NaiveKVPool> for FixedCohortModel {
 
     async fn enqueue_forward_and_return_completion(
         self: Arc<Self>,
-        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         policy: Arc<dyn SchedulingPolicy>,
     ) -> SubmittedGpuWorkWithCompletion {
         let range = self.begin_forward(batch, Mode::Overlap);
@@ -159,6 +166,14 @@ impl CausalModel<NaiveKVPool> for FixedCohortModel {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    match args.dtype.as_str() {
+        "bf16" => run::<bf16>(args).await,
+        "f32" => run::<f32>(args).await,
+        _ => unreachable!(),
+    }
+}
+
+async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_writer(std::io::stderr)
@@ -171,7 +186,7 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let device = Device::new(0)?;
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
-    let model = Arc::new(Qwen2Engine::load(&args.model_dir, &policy).await?);
+    let model = Arc::new(Qwen2Engine::<T>::load(&args.model_dir, &policy).await?);
     let prefix = vec![9707u32; args.tokens.get()];
     let prompt = model
         .tokenizer()
@@ -196,7 +211,7 @@ async fn main() -> Result<()> {
         .num_slots
         .checked_mul(config.max_rows)
         .ok_or_else(|| anyhow::anyhow!("batch capacity overflow"))?;
-    let pool = NaiveKVPool::new(config, &policy).await?;
+    let pool = NaiveKVPool::<T>::new(config, &policy).await?;
     let initial_kv = pool.metrics();
     let cuda_pool = device.default_mem_pool()?;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -250,7 +265,7 @@ async fn main() -> Result<()> {
         let mut expected = None;
         let mut elapsed_total = 0.0;
         let mut first_text = Vec::new();
-        println!("{}", json!({"event":"configuration", "mode":args.mode, "dtype":"f32", "cuda_graph":false,
+        println!("{}", json!({"event":"configuration", "mode":args.mode, "dtype":T::DTYPE.to_string(), "cuda_graph":false,
             "input_tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "output_tokens":args.output_tokens.get(),
             "warmup":args.warmup.get(), "iterations":args.iterations.get(), "eos_stopping":false, "profile":args.profile}));
         for iteration in 0..args.warmup.get() + args.iterations.get() {

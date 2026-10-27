@@ -19,7 +19,11 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
 use anyhow::{ensure, Result};
 use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
-use cutile::cuda_core::Device;
+use cutile::{
+    core::{bf16, ElementType},
+    cuda_core::Device,
+};
+use engine::runner::loader::WeightElement;
 use engine::{
     runner::{
         kv_pool::{KVContext, KVPool, NaiveKVPool},
@@ -31,6 +35,9 @@ use serde_json::json;
 
 #[derive(Parser)]
 struct Args {
+    /// Weight, activation and KV storage; reductions and accumulation remain FP32.
+    #[arg(long, default_value = "bf16", value_parser = ["bf16", "f32"])]
+    dtype: String,
     #[arg(long)]
     model_dir: PathBuf,
     /// Cargo appends this flag even when the standard benchmark harness is disabled.
@@ -63,6 +70,14 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    match args.dtype.as_str() {
+        "bf16" => run::<bf16>(args).await,
+        "f32" => run::<f32>(args).await,
+        _ => unreachable!(),
+    }
+}
+
+async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_writer(std::io::stderr)
@@ -82,7 +97,7 @@ async fn main() -> Result<()> {
         unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStop\0")? };
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
-    let model = Qwen2Engine::load(&args.model_dir, &policy).await?;
+    let model = Qwen2Engine::<T>::load(&args.model_dir, &policy).await?;
     let mut config = model.kv_pool_config(
         args.tokens
             .get()
@@ -94,7 +109,7 @@ async fn main() -> Result<()> {
         .num_slots
         .checked_mul(config.max_rows)
         .ok_or_else(|| anyhow::anyhow!("batch capacity overflow"))?;
-    let pool = NaiveKVPool::new(config, &policy).await?;
+    let pool = NaiveKVPool::<T>::new(config, &policy).await?;
     let initial_kv = pool.metrics();
     let instance = model.workspace_metrics().model_instance.to_string();
     let used_peak =
@@ -105,7 +120,7 @@ async fn main() -> Result<()> {
     println!(
         "{}",
         json!({"event":"loaded", "seconds":load_start.elapsed().as_secs_f64(),
-        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":"f32"})
+        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string()})
     );
     // Deterministic valid vocabulary IDs; this tests capacity, not natural-language quality.
     let prefix = vec![9707u32; args.tokens.get()];
@@ -248,8 +263,10 @@ async fn main() -> Result<()> {
                     );
                     Ok::<_, anyhow::Error>(peak.max((a - b).abs()))
                 })?;
+        // BF16 matmul rounding can vary with the full/chunked row tile geometry.
+        let tolerance = if size_of::<T>() == 2 { 0.5 } else { 1e-3 };
         ensure!(
-            full_token == chunked_token && max_error < 1e-3,
+            full_token == chunked_token && max_error < tolerance,
             "full/chunked mismatch: {max_error}"
         );
         println!(

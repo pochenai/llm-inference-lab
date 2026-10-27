@@ -264,9 +264,9 @@ pub trait AttentionBackend<P: KVPool> {
     /// ```
     fn forward(
         &self,
-        q: Arc<Tensor<f32>>,
+        q: Arc<Tensor<P::Element>>,
         kv: &[P::ReadView<'_>],
         query_ranges: &[Range<usize>],
         exec: &ExecutionContext,
-    ) -> Result<Arc<Tensor<f32>>, ModelError>;
+    ) -> Result<Arc<Tensor<P::Element>>, ModelError>;
 }

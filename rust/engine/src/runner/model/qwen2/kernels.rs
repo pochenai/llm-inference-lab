@@ -33,10 +33,10 @@ pub(super) mod ops {
     pub(in crate::runner::model::qwen2) const EMBEDDING_SOURCE_WIDTH: i32 = 2;
 
     #[cutile::entry()]
-    pub(super) fn embedding(
-        out: &mut Tensor<f32, { [1, 256] }>,
+    pub(super) fn embedding<T: ElementType>(
+        out: &mut Tensor<T, { [1, 256] }>,
         ids: &Tensor<u32, { [-1] }>,
-        w: &Tensor<f32, { [-1, -1] }>,
+        w: &Tensor<T, { [-1, -1] }>,
     ) {
         let pid = get_tile_block_id();
         // Validated token IDs fit i32; reinterpret bits without a numeric conversion.
@@ -54,10 +54,10 @@ pub(super) mod ops {
     /// its attention metadata/KV contexts; it does not move previous hidden rows.
     /// Clamp invalid feedback so CPU error reporting cannot race an out-of-bounds load.
     #[cutile::entry()]
-    pub(super) unsafe fn embedding_at(
-        out: *mut f32,
+    pub(super) unsafe fn embedding_at<T: ElementType>(
+        out: *mut T,
         ids: &Tensor<i32, { [-1] }>,
-        w: &Tensor<f32, { [-1, -1] }>,
+        w: &Tensor<T, { [-1, -1] }>,
         source_start: i32,
         destination_start: i32,
         width: i32,
@@ -74,11 +74,11 @@ pub(super) mod ops {
             .reshape(shape![256]);
         let columns: Tile<i32, { [256] }> = iota(shape![256]);
         let columns = columns + (pid.1 * 256).broadcast(shape![256]);
-        let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(out);
+        let base: PointerTile<*mut T, { [] }> = pointer_to_tile(out);
         let base = base.offset((destination_start + pid.0) * width);
-        let base: PointerTile<*mut f32, { [1] }> = base.reshape(shape![1]);
-        let base: PointerTile<*mut f32, { [256] }> = base.broadcast(shape![256]);
-        let destination: PointerTile<*mut f32, { [256] }> = base.offset_tile(columns);
+        let base: PointerTile<*mut T, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut T, { [256] }> = base.broadcast(shape![256]);
+        let destination: PointerTile<*mut T, { [256] }> = base.offset_tile(columns);
         let valid = lt_tile(columns, width.broadcast(shape![256]));
         unsafe {
             store_ptr_tko(
@@ -100,10 +100,10 @@ pub(super) mod ops {
     /// Caller retains every addressed GPU allocation through completion. Output
     /// rows follow current query_ranges; no intermediate token-gather tensor is needed.
     #[cutile::entry()]
-    pub(super) unsafe fn embedding_gather(
-        out: &mut Tensor<f32, { [1, 256] }>,
+    pub(super) unsafe fn embedding_gather<T: ElementType>(
+        out: &mut Tensor<T, { [1, 256] }>,
         sources: &Tensor<u64, { [-1] }>,
-        w: &Tensor<f32, { [-1, -1] }>,
+        w: &Tensor<T, { [-1, -1] }>,
         vocab_size: i32,
     ) {
         let pid = get_tile_block_id();
@@ -138,15 +138,23 @@ pub(super) mod ops {
         out.store(w.partition(shape![1, 256]).load([id, pid.1]));
     }
 
+    /// Storage uses T; MMA accumulates in FP32 and casts once to output O.
     /// PyTorch checkpoint weights are [out,in]; transpose each tile in registers.
     /// Optional projection bias is fused into the epilogue before the single store.
     /// BM token rows reuse weights; BN covers output channels independently of heads.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
-    pub(super) fn linear<const K: i32, const HAS_BIAS: bool, const BM: i32, const BN: i32>(
-        out: &mut Tensor<f32, { [BM, BN] }>,
-        x: &Tensor<f32, { [-1, K] }>,
-        w: &Tensor<f32, { [-1, K] }>,
-        bias: &Tensor<f32, { [-1] }>,
+    pub(super) fn linear<
+        T: ElementType,
+        O: ElementType,
+        const K: i32,
+        const HAS_BIAS: bool,
+        const BM: i32,
+        const BN: i32,
+    >(
+        out: &mut Tensor<O, { [BM, BN] }>,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        bias: &Tensor<T, { [-1] }>,
     ) {
         let pid = get_tile_block_id();
         let px = x.partition(shape![BM, 32]);
@@ -156,10 +164,12 @@ pub(super) mod ops {
             acc = mma(px.load([pid.0, i]), pw.load([pid.1, i]).transpose(), acc);
         }
         if HAS_BIAS {
-            let bias_tile = bias.partition(shape![BN]).load([pid.1]);
+            let bias_tile: Tile<f32, { [BN] }> =
+                convert_tile(bias.partition(shape![BN]).load([pid.1]));
             acc = acc + bias_tile.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
         }
-        out.store(acc);
+        let result: Tile<O, { [BM, BN] }> = convert_tile(acc);
+        out.store(result);
     }
 
     /// Normalize every packed row, or gather each request's last row when GATHER=true.
@@ -175,10 +185,10 @@ pub(super) mod ops {
     /// ```
     /// With GATHER=false, normalize x[program_id(0)] and ignore last_rows_offset.
     #[cutile::entry()]
-    pub(super) fn rms_norm<const B: i32, const GATHER: bool>(
-        out: &mut Tensor<f32, { [1, B] }>,
-        x: &Tensor<f32, { [-1, -1] }>,
-        w: &Tensor<f32, { [-1] }>,
+    pub(super) fn rms_norm<T: ElementType, const B: i32, const GATHER: bool>(
+        out: &mut Tensor<T, { [1, B] }>,
+        x: &Tensor<T, { [-1, -1] }>,
+        w: &Tensor<T, { [-1] }>,
         metadata: &Tensor<i32, { [-1] }>,
         eps: f32,
         width: i32,
@@ -193,38 +203,32 @@ pub(super) mod ops {
                     .reshape(shape![]),
             );
         }
-        let value = x.partition(shape![1, B]).load([row, 0]);
+        let value: Tile<f32, { [1, B] }> = convert_tile(x.partition(shape![1, B]).load([row, 0]));
         let sum: Tile<f32, { [1] }> = reduce_sum(value * value, 1);
         let width_f: f32 = convert_scalar(width);
         let mean = sum.reshape(shape![1, 1]) / width_f.broadcast(shape![1, 1]);
         let inv = rsqrt(mean + eps.broadcast(shape![1, 1]), ftz::Disabled);
-        out.store(
-            value
-                * inv.broadcast(shape![1, B])
-                * w.partition(shape![B]).load([0]).reshape(shape![1, B]),
-        );
+        let normalized: Tile<T, { [1, B] }> = convert_tile(value * inv.broadcast(shape![1, B]));
+        let normalized: Tile<f32, { [1, B] }> = convert_tile(normalized);
+        let weight: Tile<f32, { [1, B] }> =
+            convert_tile(w.partition(shape![B]).load([0]).reshape(shape![1, B]));
+        let result: Tile<T, { [1, B] }> = convert_tile(normalized * weight);
+        out.store(result);
     }
 
-    /// Qwen2 uses split-half RoPE, applied after the Q/K projection bias.
+    /// Split-half RoPE; FP32 trigonometry with activation-dtype products.
+    /// Q/K projections already include their bias.
+    /// Frequencies remain FP32 even when activation storage uses BF16.
     #[cutile::entry()]
-    pub(super) fn rope(
-        out: &mut Tensor<f32, { [1, 64] }>,
-        x: &Tensor<f32, { [-1, -1] }>,
-        bias: &Tensor<f32, { [-1] }>,
+    pub(super) fn rope<T: ElementType>(
+        out: &mut Tensor<T, { [1, 64] }>,
+        x: &Tensor<T, { [-1, -1] }>,
         freq: &Tensor<f32, { [32] }>,
         metadata: &Tensor<i32, { [-1] }>,
     ) {
         let pid = get_tile_block_id();
-        let lo = x.partition(shape![1, 32]).load([pid.0, pid.1 * 2])
-            + bias
-                .partition(shape![32])
-                .load([pid.1 * 2])
-                .reshape(shape![1, 32]);
-        let hi = x.partition(shape![1, 32]).load([pid.0, pid.1 * 2 + 1])
-            + bias
-                .partition(shape![32])
-                .load([pid.1 * 2 + 1])
-                .reshape(shape![1, 32]);
+        let lo = x.partition(shape![1, 32]).load([pid.0, pid.1 * 2]);
+        let hi = x.partition(shape![1, 32]).load([pid.0, pid.1 * 2 + 1]);
         let position: i32 = tile_to_scalar(
             metadata
                 .partition(shape![1])
@@ -234,11 +238,12 @@ pub(super) mod ops {
         let position: f32 = convert_scalar(position);
         let angles = freq.partition(shape![32]).load([0]).reshape(shape![1, 32])
             * position.broadcast(shape![1, 32]);
-        let c = cos(angles);
-        let s = sin(angles);
+        // Trig uses FP32; operands/products follow the activation dtype, as in Qwen.
+        let c: Tile<T, { [1, 32] }> = convert_tile(cos(angles));
+        let s: Tile<T, { [1, 32] }> = convert_tile(sin(angles));
         let a = lo * c - hi * s;
         let b = hi * c + lo * s;
-        let result: Tile<f32, { [1, 64] }> = cat(a, b, 1);
+        let result: Tile<T, { [1, 64] }> = cat(a, b, 1);
         out.store(result);
     }
 
@@ -246,11 +251,11 @@ pub(super) mod ops {
     /// Mask the final block at each query's causal boundary; slots need not be contiguous.
     /// Target four resident CTAs per SM on SM120 to reduce register pressure.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 4,),))]
-    pub(super) unsafe fn attention<const BK: i32>(
-        out: &mut Tensor<f32, { [1, 64] }>,
-        q: &Tensor<f32, { [-1, -1] }>,
-        k: &Tensor<f32, { [-1, -1] }>,
-        v: &Tensor<f32, { [-1, -1] }>,
+    pub(super) unsafe fn attention<T: ElementType, const BK: i32>(
+        out: &mut Tensor<T, { [1, 64] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
         table: &Tensor<i32, { [-1, -1] }>,
         metadata: &Tensor<i32, { [-1] }>,
         qheads: i32,
@@ -276,7 +281,8 @@ pub(super) mod ops {
                 .reshape(shape![]),
         );
         let head = pid.1 / (qheads / kvheads);
-        let query = q.partition(shape![1, 64]).load([pid.0, pid.1]);
+        let query: Tile<f32, { [1, 64] }> =
+            convert_tile(q.partition(shape![1, 64]).load([pid.0, pid.1]));
         let query: Tile<f32, { [BK, 64] }> = query.broadcast(shape![BK, 64]);
         let mut maximum: Tile<f32, { [1, 1] }> = constant(f32::NEG_INFINITY, shape![1, 1]);
         let mut denominator: Tile<f32, { [1, 1] }> = constant(0.0f32, shape![1, 1]);
@@ -292,12 +298,12 @@ pub(super) mod ops {
         let table_base: PointerTile<*const i32, { [] }> = table_base.offset(row * table.shape()[1]);
         let table_base: PointerTile<*const i32, { [1] }> = table_base.reshape(shape![1]);
         let table_base: PointerTile<*const i32, { [BK] }> = table_base.broadcast(shape![BK]);
-        let kp: PointerTile<*const f32, { [] }> = pointer_to_tile(k.as_ptr());
-        let kp: PointerTile<*const f32, { [1, 1] }> = kp.reshape(shape![1, 1]);
-        let kp: PointerTile<*const f32, { [BK, 64] }> = kp.broadcast(shape![BK, 64]);
-        let vp: PointerTile<*const f32, { [] }> = pointer_to_tile(v.as_ptr());
-        let vp: PointerTile<*const f32, { [1, 1] }> = vp.reshape(shape![1, 1]);
-        let vp: PointerTile<*const f32, { [BK, 64] }> = vp.broadcast(shape![BK, 64]);
+        let kp: PointerTile<*const T, { [] }> = pointer_to_tile(k.as_ptr());
+        let kp: PointerTile<*const T, { [1, 1] }> = kp.reshape(shape![1, 1]);
+        let kp: PointerTile<*const T, { [BK, 64] }> = kp.broadcast(shape![BK, 64]);
+        let vp: PointerTile<*const T, { [] }> = pointer_to_tile(v.as_ptr());
+        let vp: PointerTile<*const T, { [1, 1] }> = vp.reshape(shape![1, 1]);
+        let vp: PointerTile<*const T, { [BK, 64] }> = vp.broadcast(shape![BK, 64]);
         for block in 0i32..((position - history_start + BK) / BK) {
             let positions = local + (history_start + block * BK).broadcast(shape![BK]);
             let valid = lt_tile(positions, (position + 1).broadcast(shape![BK]));
@@ -319,17 +325,18 @@ pub(super) mod ops {
             let offsets = offsets + columns;
             let mask: Tile<bool, { [BK, 1] }> = valid.reshape(shape![BK, 1]);
             let mask: Tile<bool, { [BK, 64] }> = mask.broadcast(shape![BK, 64]);
-            let key_ptrs: PointerTile<*const f32, { [BK, 64] }> = kp.offset_tile(offsets);
-            let (keys, _token): (Tile<f32, { [BK, 64] }>, Token) = load_ptr_tko(
+            let key_ptrs: PointerTile<*const T, { [BK, 64] }> = kp.offset_tile(offsets);
+            let (keys, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
                 key_ptrs,
                 ordering::Weak,
                 None::<scope::TileBlock>,
                 Some(mask),
-                None::<f32>,
+                None::<T>,
                 None,
                 Latency::<1>,
             );
             // cuTile 0.4 scalar padding cannot broadcast to a 2D pointer-load result.
+            let keys: Tile<f32, { [BK, 64] }> = convert_tile(keys);
             let keys = select(mask, keys, zero_values);
             let dots: Tile<f32, { [BK] }> = reduce_sum(keys * query, 1);
             // Preserve the symbolic BK shape after reduction in cuTile 0.4's type checker.
@@ -341,16 +348,17 @@ pub(super) mod ops {
             let next_vector: Tile<f32, { [1] }> = next.reshape(shape![1]);
             let next_vector: Tile<f32, { [BK] }> = next_vector.broadcast(shape![BK]);
             let probabilities = exp(scores - next_vector);
-            let value_ptrs: PointerTile<*const f32, { [BK, 64] }> = vp.offset_tile(offsets);
-            let (values, _token): (Tile<f32, { [BK, 64] }>, Token) = load_ptr_tko(
+            let value_ptrs: PointerTile<*const T, { [BK, 64] }> = vp.offset_tile(offsets);
+            let (values, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
                 value_ptrs,
                 ordering::Weak,
                 None::<scope::TileBlock>,
                 Some(mask),
-                None::<f32>,
+                None::<T>,
                 None,
                 Latency::<1>,
             );
+            let values: Tile<f32, { [BK, 64] }> = convert_tile(values);
             let values = select(mask, values, zero_values);
             let weights: Tile<f32, { [BK, 1] }> = probabilities.reshape(shape![BK, 1]);
             let weights: Tile<f32, { [BK, 64] }> = weights.broadcast(shape![BK, 64]);
@@ -361,35 +369,43 @@ pub(super) mod ops {
             denominator = denominator * alpha + block_sum.reshape(shape![1, 1]);
             maximum = next;
         }
-        out.store(true_div(acc, denominator.broadcast(shape![1, 64])));
+        let result: Tile<T, { [1, 64] }> =
+            convert_tile(true_div(acc, denominator.broadcast(shape![1, 64])));
+        out.store(result);
     }
 
     #[cutile::entry()]
-    pub(super) fn add(
-        out: &mut Tensor<f32, { [1, 256] }>,
-        x: &Tensor<f32, { [-1, -1] }>,
-        y: &Tensor<f32, { [-1, -1] }>,
+    pub(super) fn add<T: ElementType>(
+        out: &mut Tensor<T, { [1, 256] }>,
+        x: &Tensor<T, { [-1, -1] }>,
+        y: &Tensor<T, { [-1, -1] }>,
     ) {
         let pid = get_tile_block_id();
-        out.store(
-            x.partition(shape![1, 256]).load([pid.0, pid.1])
-                + y.partition(shape![1, 256]).load([pid.0, pid.1]),
-        );
+        let x: Tile<f32, { [1, 256] }> =
+            convert_tile(x.partition(shape![1, 256]).load([pid.0, pid.1]));
+        let y: Tile<f32, { [1, 256] }> =
+            convert_tile(y.partition(shape![1, 256]).load([pid.0, pid.1]));
+        let result: Tile<T, { [1, 256] }> = convert_tile(x + y);
+        out.store(result);
     }
 
     #[cutile::entry()]
-    pub(super) fn swiglu(
-        out: &mut Tensor<f32, { [1, 256] }>,
-        gate: &Tensor<f32, { [-1, -1] }>,
-        up: &Tensor<f32, { [-1, -1] }>,
+    pub(super) fn swiglu<T: ElementType>(
+        out: &mut Tensor<T, { [1, 256] }>,
+        gate: &Tensor<T, { [-1, -1] }>,
+        up: &Tensor<T, { [-1, -1] }>,
     ) {
         let pid = get_tile_block_id();
-        let g = gate.partition(shape![1, 256]).load([pid.0, pid.1]);
+        let g: Tile<f32, { [1, 256] }> =
+            convert_tile(gate.partition(shape![1, 256]).load([pid.0, pid.1]));
         let one: Tile<f32, { [1, 256] }> = constant(1.0f32, shape![1, 256]);
         let zero: Tile<f32, { [1, 256] }> = constant(0.0f32, shape![1, 256]);
-        out.store(
-            true_div(g, one + exp(zero - g)) * up.partition(shape![1, 256]).load([pid.0, pid.1]),
-        );
+        let activated: Tile<T, { [1, 256] }> = convert_tile(true_div(g, one + exp(zero - g)));
+        let activated: Tile<f32, { [1, 256] }> = convert_tile(activated);
+        let up: Tile<f32, { [1, 256] }> =
+            convert_tile(up.partition(shape![1, 256]).load([pid.0, pid.1]));
+        let result: Tile<T, { [1, 256] }> = convert_tile(activated * up);
+        out.store(result);
     }
 
     #[cutile::entry()]

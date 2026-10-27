@@ -3,7 +3,7 @@
 From the repository root:
   /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --profile
 
-Defaults: FP32/eager, batch 1/2/4, input 32/4096, 64 outputs, two warmups,
+Defaults: BF16/eager, batch 1/2/4, input 32/4096, 64 outputs, two warmups,
 three measured cohorts per process and three independent processes per mode/case.
 Each experiment gets a new directory; raw JSONL, commands, binary and traces remain
 under rust/profiling/qwen2/runner-overlap. Profiler timings never determine speedup.
@@ -117,6 +117,7 @@ def analyze_trace(path: Path, mode: str, steps: int, batch_size: int) -> dict[st
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=Path)
+    parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
     parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--tokens", type=int, nargs="+", default=[32, 4096])
@@ -157,7 +158,7 @@ def main() -> None:
     (root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     samples: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
     expected: dict[tuple[int, int], list[str]] = {}
-    base = [str(frozen_binary), "--model-dir", str(args.model_dir.resolve()), "--output-tokens", str(args.output_tokens), "--warmup", str(args.warmup)]
+    base = [str(frozen_binary), "--dtype", args.dtype, "--model-dir", str(args.model_dir.resolve()), "--output-tokens", str(args.output_tokens), "--warmup", str(args.warmup)]
     for repetition in range(args.repetitions):
         for tokens in args.tokens:
             for batch in args.batch_size:

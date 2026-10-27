@@ -2,12 +2,17 @@
 //! From the repository root (MODEL_DIR is the existing HF snapshot directory):
 //! cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir MODEL_DIR
 //! Match --max-new-tokens to the reference run; e.g. --max-new-tokens 32
-//! --reference-dir rust/engine/artifacts/qwen2 validates CPU reference logits and generated text.
+//! --dtype f32 --reference-dir rust/engine/artifacts/qwen2 validates the CPU/FP32 reference.
+//! Use qwen2_reference.py --dtype bf16 --device cuda --attention sdpa for BF16 fixtures.
 
 use anyhow::{ensure, Result};
 use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
-use cutile::cuda_core::Device;
+use cutile::{
+    core::{bf16, ElementType},
+    cuda_core::Device,
+};
+use engine::runner::loader::WeightElement;
 use engine::runner::{
     kv_pool::{KVContext, KVPool, NaiveKVPool},
     model::Qwen2Engine,
@@ -30,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 /// Run offline Qwen2.5-0.5B-Instruct inference with cuTile kernels.
 #[derive(Parser)]
 struct Args {
+    /// Weight, activation and KV storage; reductions and accumulation remain FP32.
+    #[arg(long, default_value = "bf16", value_parser = ["bf16", "f32"])]
+    dtype: String,
     /// Local Hugging Face checkpoint directory.
     #[arg(long)]
     model_dir: PathBuf,
@@ -55,7 +63,17 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    match args.dtype.as_str() {
+        "bf16" => run::<bf16>(args).await,
+        "f32" => run::<f32>(args).await,
+        _ => unreachable!(),
+    }
+}
+
+async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     let Args {
+        dtype: _,
         model_dir,
         prompt,
         max_new_tokens,
@@ -63,7 +81,7 @@ async fn main() -> Result<()> {
         disable_overlap,
         reference_dir,
         trace_steps,
-    } = Args::parse();
+    } = args;
     tracing_subscriber::fmt()
         .json()
         .with_writer(std::io::stderr)
@@ -78,7 +96,7 @@ async fn main() -> Result<()> {
     let device = Device::new(0)?;
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
-    let model = Qwen2Engine::load(&model_dir, &policy).await?;
+    let model = Qwen2Engine::<T>::load(&model_dir, &policy).await?;
     tracing::info!(target: "engine::qwen2", event = "model_loaded",
         seconds = load_start.elapsed().as_secs_f64());
     // Explicit two-message Qwen2 template; raw prompt text alone is not an instruct input.
@@ -90,7 +108,8 @@ async fn main() -> Result<()> {
         .encode(formatted.as_str(), false)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let input_ids = encoded.get_ids();
-    let pool = NaiveKVPool::new(model.kv_pool_config(input_ids.len() + max_new)?, &policy).await?;
+    let pool =
+        NaiveKVPool::<T>::new(model.kv_pool_config(input_ids.len() + max_new)?, &policy).await?;
     let initial = pool.metrics();
     let mut comparison = serde_json::Value::Null;
     if let Some(dir) = &reference_dir {
@@ -127,7 +146,11 @@ async fn main() -> Result<()> {
             .sum::<f32>()
             / actual.len() as f32)
             .sqrt();
-        ensure!(max_error < 0.001, "logit max error too large: {max_error}");
+        tracing::info!(target: "engine::qwen2", event = "reference_error", max_error, rms);
+        ensure!(
+            max_error < if size_of::<T>() == 2 { 0.5 } else { 0.001 },
+            "logit max error too large: {max_error}"
+        );
         ensure!(
             next == reference["generated_ids"][0].as_u64().unwrap() as u32,
             "first token differs"
@@ -193,7 +216,7 @@ async fn main() -> Result<()> {
     ensure!(pool.metrics() == initial, "generation KV was not released");
     println!(
         "{}",
-        serde_json::json!({"model":"Qwen2.5-0.5B-Instruct","compute_dtype":"f32","input_ids":input_ids,
+        serde_json::json!({"model":"Qwen2.5-0.5B-Instruct","compute_dtype":T::DTYPE.to_string(),"input_ids":input_ids,
         "request_id":response.request_id,"text":response.output,"elapsed_seconds":stats.elapsed.as_secs_f64(),
         "time_to_first_text_seconds":stats.time_to_first_text.map(|elapsed| elapsed.as_secs_f64()),
         "generated_tokens":stats.generated_tokens,"tokens_per_second":stats.tokens_per_second(),"validation":comparison,"kv_released":true})

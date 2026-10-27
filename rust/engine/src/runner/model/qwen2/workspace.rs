@@ -18,47 +18,56 @@ use crate::ModelError;
 // Keep the usual prefill/decode pair; never cache a checkout still in flight.
 const MAX_IDLE_WORKSPACES: usize = 2;
 
-pub(super) struct Buffers {
-    pub(super) x: Tensor<f32>,
-    pub(super) residual: Tensor<f32>,
-    pub(super) norm: Tensor<f32>,
-    pub(super) q: Tensor<f32>,
-    pub(super) rotated_q: Tensor<f32>,
-    pub(super) attention: Tensor<f32>,
-    pub(super) k: Tensor<f32>,
-    pub(super) rotated_k: Tensor<f32>,
-    pub(super) v: Tensor<f32>,
-    pub(super) gate: Tensor<f32>,
-    pub(super) up: Tensor<f32>,
-    pub(super) activated: Tensor<f32>,
-    pub(super) final_norm: Tensor<f32>,
+pub(super) struct Buffers<T: DType> {
+    pub(super) x: Tensor<T>,
+    pub(super) residual: Tensor<T>,
+    pub(super) norm: Tensor<T>,
+    pub(super) q: Tensor<T>,
+    pub(super) rotated_q: Tensor<T>,
+    pub(super) attention: Tensor<T>,
+    pub(super) k: Tensor<T>,
+    pub(super) rotated_k: Tensor<T>,
+    pub(super) v: Tensor<T>,
+    pub(super) gate: Tensor<T>,
+    pub(super) up: Tensor<T>,
+    pub(super) activated: Tensor<T>,
+    pub(super) final_norm: Tensor<T>,
     pub(super) logits: Tensor<f32>,
     pub(super) maxima: Tensor<f32>,
     pub(super) indices: Tensor<i32>,
     pub(super) winner: Tensor<i32>,
 }
 
-struct Workspace {
+struct Workspace<T: DType = f32> {
     rows: usize,
     batch_size: usize,
+    /// Activation storage follows the model dtype; logits/maxima stay FP32.
+    activations: Arc<Tensor<T>>,
     floats: Arc<Tensor<f32>>,
     integers: Arc<Tensor<i32>>,
 }
 
 /// Stores only idle workspaces; checked-out storage is owned by a lease and
 /// returns here when its last GPU/handle owner releases it, without an in-use list.
-#[derive(Default)]
-pub(super) struct WorkspacePool {
-    state: Mutex<PoolState>,
+pub(super) struct WorkspacePool<T: DType = f32> {
+    state: Mutex<PoolState<T>>,
 }
 
-struct PoolState {
-    idle: Vec<Workspace>,
+impl<T: DType> Default for WorkspacePool<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(PoolState::default()),
+        }
+    }
+}
+
+struct PoolState<T: DType = f32> {
+    idle: Vec<Workspace<T>>,
     metrics: WorkspaceMetrics,
     instruments: WorkspaceInstruments,
 }
 
-impl Default for PoolState {
+impl<T: DType> Default for PoolState<T> {
     fn default() -> Self {
         let model_instance = next_instance();
         Self {
@@ -72,13 +81,13 @@ impl Default for PoolState {
     }
 }
 
-impl Drop for PoolState {
+impl<T: DType> Drop for PoolState<T> {
     fn drop(&mut self) {
         self.instruments.close();
     }
 }
 
-impl PoolState {
+impl<T: DType> PoolState<T> {
     fn checkout(&mut self, bytes: usize) {
         self.metrics.checkout(bytes);
         self.instruments.checkout(bytes);
@@ -104,13 +113,13 @@ impl PoolState {
     }
 }
 
-impl Workspace {
+impl<T: DType> Workspace<T> {
     fn bytes(&self) -> usize {
-        self.floats.num_bytes() + self.integers.num_bytes()
+        self.activations.num_bytes() + self.floats.num_bytes() + self.integers.num_bytes()
     }
 }
 
-impl WorkspacePool {
+impl<T: DType> WorkspacePool<T> {
     pub(super) fn metrics(&self) -> WorkspaceMetrics {
         self.state.lock().unwrap().metrics
     }
@@ -123,14 +132,16 @@ impl WorkspacePool {
         batch_size: usize,
         config: &Qwen2Config,
         exec: &ExecutionContext,
-    ) -> Result<Buffers, ModelError> {
+    ) -> Result<Buffers<T>, ModelError> {
         let h = config.hidden_size;
         let k = config.num_key_value_heads * 64;
         let i = config.intermediate_size;
         let vocab = config.vocab_size;
         let blocks = vocab.div_ceil(256);
-        let (floats, integers) = element_counts(rows, batch_size, config)?;
-        let required = (floats + integers) * 4;
+        let (all_floats, integers) = element_counts(rows, batch_size, config)?;
+        let floats = batch_size * (vocab + blocks);
+        let activations = all_floats - floats;
+        let required = activations * size_of::<T>() + (floats + integers) * 4;
         let cached = {
             let mut state = self.state.lock().unwrap();
             let index = state.idle.iter().position(|w| {
@@ -162,7 +173,7 @@ impl WorkspacePool {
         let workspace = match cached {
             Some(workspace) => workspace,
             None => {
-                let allocated = (|| -> Result<Workspace, ModelError> {
+                let allocated = (|| -> Result<Workspace<T>, ModelError> {
                     if check_available(required, exec).is_err() {
                         {
                             let mut state = self.state.lock().unwrap();
@@ -171,10 +182,15 @@ impl WorkspacePool {
                         }
                         check_available(required, exec)?;
                     }
-                    // SAFETY: producers overwrite every valid f32/i32 element before use.
+                    // SAFETY: producers overwrite every valid element before use.
                     Ok(Workspace {
                         rows,
                         batch_size,
+                        activations: Arc::new(
+                            Tensor::<T>::uninitialized(activations)
+                                .execute(exec)?
+                                .assume_init(),
+                        ),
                         floats: Arc::new(
                             Tensor::<f32>::uninitialized(floats)
                                 .execute(exec)?
@@ -214,25 +230,36 @@ impl WorkspacePool {
         let workspace = lease.workspace.as_ref().unwrap();
         let mut offset = 0;
         let mut integer_offset = 0;
+        let mut float_offset = 0;
         let buffers = Buffers {
-            x: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            residual: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            norm: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            q: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            rotated_q: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            attention: handle(&lease, &workspace.floats, &mut offset, &[rows, h]),
-            k: handle(&lease, &workspace.floats, &mut offset, &[rows, k]),
-            rotated_k: handle(&lease, &workspace.floats, &mut offset, &[rows, k]),
-            v: handle(&lease, &workspace.floats, &mut offset, &[rows, k]),
-            gate: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
-            up: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
-            activated: handle(&lease, &workspace.floats, &mut offset, &[rows, i]),
-            final_norm: handle(&lease, &workspace.floats, &mut offset, &[batch_size, h]),
-            logits: handle(&lease, &workspace.floats, &mut offset, &[batch_size, vocab]),
+            x: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            residual: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            norm: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            q: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            rotated_q: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            attention: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
+            k: handle(&lease, &workspace.activations, &mut offset, &[rows, k]),
+            rotated_k: handle(&lease, &workspace.activations, &mut offset, &[rows, k]),
+            v: handle(&lease, &workspace.activations, &mut offset, &[rows, k]),
+            gate: handle(&lease, &workspace.activations, &mut offset, &[rows, i]),
+            up: handle(&lease, &workspace.activations, &mut offset, &[rows, i]),
+            activated: handle(&lease, &workspace.activations, &mut offset, &[rows, i]),
+            final_norm: handle(
+                &lease,
+                &workspace.activations,
+                &mut offset,
+                &[batch_size, h],
+            ),
+            logits: handle(
+                &lease,
+                &workspace.floats,
+                &mut float_offset,
+                &[batch_size, vocab],
+            ),
             maxima: handle(
                 &lease,
                 &workspace.floats,
-                &mut offset,
+                &mut float_offset,
                 &[batch_size, blocks],
             ),
             indices: handle(
@@ -248,7 +275,8 @@ impl WorkspacePool {
                 &[batch_size],
             ),
         };
-        debug_assert_eq!(offset, floats);
+        debug_assert_eq!(offset, activations);
+        debug_assert_eq!(float_offset, floats);
         debug_assert_eq!(integer_offset, integers);
         Ok(buffers)
     }
@@ -309,12 +337,12 @@ unsafe fn check_available(required: usize, exec: &ExecutionContext) -> Result<()
     Ok(())
 }
 
-struct WorkspaceLease {
-    workspace: Option<Workspace>,
-    pool: Arc<WorkspacePool>,
+struct WorkspaceLease<T: DType = f32> {
+    workspace: Option<Workspace<T>>,
+    pool: Arc<WorkspacePool<T>>,
 }
 
-impl Drop for WorkspaceLease {
+impl<T: DType> Drop for WorkspaceLease<T> {
     fn drop(&mut self) {
         let workspace = self.workspace.take().unwrap();
         let bytes = workspace.bytes();
@@ -338,16 +366,16 @@ impl Drop for WorkspaceLease {
     }
 }
 
-struct BufferOwner<T: DType> {
+struct BufferOwner<T: DType, E: DType> {
     tensor: Arc<Tensor<T>>,
     offset: usize,
     len: usize,
-    _lease: Arc<WorkspaceLease>,
+    _lease: Arc<WorkspaceLease<E>>,
 }
 
 // SAFETY: each owner describes a disjoint, bounded region of a stable allocation.
 // The lease prevents reuse until every handle and GPU access has been released.
-unsafe impl<T: DType> DeviceAllocation for BufferOwner<T> {
+unsafe impl<T: DType, E: DType> DeviceAllocation for BufferOwner<T, E> {
     fn device_ptr(&self) -> u64 {
         self.tensor.device_pointer().cu_deviceptr() + (self.offset * size_of::<T>()) as u64
     }
@@ -361,8 +389,8 @@ unsafe impl<T: DType> DeviceAllocation for BufferOwner<T> {
 
 /// Called once per disjoint region in an exclusive checkout. Backing tensors only
 /// own storage; all GPU accesses use these handles on the checkout's single stream.
-unsafe fn handle<T: DType>(
-    lease: &Arc<WorkspaceLease>,
+unsafe fn handle<T: DType, E: DType>(
+    lease: &Arc<WorkspaceLease<E>>,
     tensor: &Arc<Tensor<T>>,
     offset: &mut usize,
     shape: &[usize],
@@ -467,7 +495,8 @@ mod tests {
         let policy = global_policy(0)?;
         let config = config();
         let recorder = ResidentRecorder::default();
-        let pool = metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::default()));
+        let pool =
+            metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::<f32>::default()));
         let mut buffers = with_context(|exec| {
             // SAFETY: exclusive checkouts survive outer completion through their handles.
             value(
@@ -531,7 +560,7 @@ mod tests {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = global_policy(0)?;
         let config = config();
-        let pool = Arc::new(WorkspacePool::default());
+        let pool = Arc::new(WorkspacePool::<f32>::default());
         let mut pointers = Vec::new();
         for batch_size in [1, 3, 1, 3] {
             let buffers = with_context(|exec| {
@@ -561,7 +590,8 @@ mod tests {
         let policy = global_policy(0)?;
         let config = config();
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let pool = metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::default()));
+        let pool =
+            metrics::with_local_recorder(&recorder, || Arc::new(WorkspacePool::<f32>::default()));
         let a = with_context(|exec| {
             value((|| -> Result<_, ModelError> {
                 // Oversized scratch is rejected without attempting an allocation.
@@ -668,6 +698,35 @@ mod tests {
             {
                 assert_eq!(value, DebugValue::Gauge(0.0.into()));
             }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bf16_workspace_accounts_for_mixed_storage_and_reuses_idle() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let config = config();
+        let pool = Arc::new(WorkspacePool::<bf16>::default());
+        let (all_floats, integers) = element_counts(33, 2, &config)?;
+        let fp32 = 2 * (config.vocab_size + config.vocab_size.div_ceil(256));
+        let bytes = (all_floats - fp32) * 2 + (fp32 + integers) * 4;
+        let mut pointer = None;
+        for _ in 0..2 {
+            let buffers = with_context(|exec| {
+                // SAFETY: no GPU consumer reads these uninitialized diagnostic handles.
+                value(unsafe { pool.acquire(33, 2, &config, exec) })
+            })
+            .schedule(&policy)?
+            .await??;
+            let current = buffers.x.device_pointer().cu_deviceptr();
+            assert_eq!(*pointer.get_or_insert(current), current);
+            assert_eq!(buffers.x.num_bytes(), 33 * config.hidden_size * 2);
+            assert_eq!(buffers.logits.num_bytes(), 2 * config.vocab_size * 4);
+            assert_eq!(pool.metrics().in_use_bytes, bytes);
+            drop(buffers);
+            assert_eq!(pool.metrics().idle_bytes, bytes);
+            assert_eq!(pool.metrics().in_use_bytes, 0);
         }
         Ok(())
     }

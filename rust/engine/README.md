@@ -232,12 +232,55 @@ only as a dev dependency to resolve CUDA profiler APIs without a WSL linker path
 ## Qwen2.5-0.5B-Instruct: single-request correctness baseline
 
 `Qwen2Engine` loads a local Hugging Face checkpoint using the existing WeightLoader.
-The initial backend converts checkpoint weights to FP32 once and implements all
-numerical operators in cuTile: embedding, checkpoint-layout linear projections,
+`Qwen2Engine<T>` and `NaiveKVPool<T>` use matching storage types. The Qwen CLI
+and benchmarks default to `--dtype bf16`; `--dtype f32` retains the reference path.
+BF16 checkpoint weights load directly as BF16, preserving their bits without
+expanding the model to FP32. All numerical operators use cuTile: embedding, checkpoint-layout linear projections,
 RMSNorm, Q/K bias and split-half RoPE, causal GQA over mapped KV slots, residual,
 SwiGLU, the tied/untied LM head, and two-stage GPU greedy argmax. It does not invoke
 PyTorch, cuBLAS, or a Python model for inference. The optional Python script is an
-independent CPU/FP32 reference only.
+independent Transformers reference (CPU/FP32 by default, or BF16/CUDA with SDPA).
+
+| Storage / calculation | Precision in BF16 mode |
+| --- | --- |
+| Weights, activation workspace, K/V and read/write views | BF16 |
+| Linear MMA operands / accumulator | BF16 / FP32 |
+| RMSNorm reduction, SiLU, attention scores and online softmax | FP32 calculation |
+| RoPE frequencies and trigonometry | FP32; products use activation dtype |
+| LM-head logits and argmax maxima | FP32 |
+| Token IDs, mapping table, Scheduler/Runner APIs | Unchanged integer types |
+
+`KVPool::Element` ties `store` and `AttentionBackend` tensor types to the pool at
+compile time. FP32 scalar constants (including negative infinity) stay inside
+FP32 reductions; no generic infinity trait or block scaling is needed. Activations
+are rounded back to T at operator boundaries; norms and SiLU preserve Qwen's
+intermediate activation rounding. Attention currently widens gathered K/V tiles
+inside the kernel for FP32 scores/weighted reductions; this is not a full-cache
+conversion or an optimized BF16 attention MMA implementation. Scratch admission
+and ownership metrics count T storage plus the separate FP32 logits/maxima and
+integer buffers. BF16 does not mean INT8/INT4/FP8 quantization.
+
+Use matching reference precision and backend for numerical checks:
+
+```bash
+HF_HUB_OFFLINE=1 ~/.venvs/py3.12/bin/python rust/engine/examples/qwen2_reference.py "$QWEN2_MODEL_DIR" --dtype bf16 --device cuda --attention sdpa --max-new-tokens 8 --output-dir rust/engine/artifacts/qwen2-bf16
+cargo run --manifest-path rust/Cargo.toml --offline --locked --release -p engine --example qwen2 -- --model-dir "$QWEN2_MODEL_DIR" --dtype bf16 --max-new-tokens 8 --reference-dir rust/engine/artifacts/qwen2-bf16
+```
+
+The example checks finite logits, a dtype-dependent logit tolerance and exact
+first-token/text agreement for the supplied fixture. Arbitrary BF16 greedy output
+need not match FP32 token-for-token. It logs max and RMS logit error before asserting;
+these are correctness checks, not a generation-quality evaluation.
+
+Release validation passed 84 engine tests and 3 compile-fail doc tests; the opt-in
+checkpoint test stayed ignored, with real weights checked separately via the CLI.
+English/Chinese BF16 SDPA fixtures, cached/ragged/chunked steps and Runner serial/
+overlap checks passed. At batch 4 with 4096 input tokens per request, per-forward
+scratch peaked at 638 MiB (BF16) vs 1274 MiB (FP32). See the local
+[BF16 report](../profiling/qwen2/bf16/RESULTS.md) for raw timings, pool accounting
+and reference errors. BF16 eager has different rounding boundaries and fails the
+same 0.5 max-error fixture threshold; it is not claimed numerically equivalent.
+
 
 A single `CausalModel<P>` trait exposes `next_tokens(&mut [ModelInput], policy)`.
 Models own one numerical step and EOS recognition; all generation loops live in Runner.
@@ -544,7 +587,7 @@ cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --exampl
 
 # Independent reference: use an interpreter with installed CPU-capable torch/Transformers.
 env -u LD_LIBRARY_PATH PYENV_VERSION=3.14.3 python rust/engine/examples/qwen2_reference.py "$QWEN2_MODEL_DIR" --max-new-tokens 32 --output-dir rust/engine/artifacts/qwen2
-cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir "$QWEN2_MODEL_DIR" --max-new-tokens 32 --reference-dir rust/engine/artifacts/qwen2
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --dtype f32 --model-dir "$QWEN2_MODEL_DIR" --max-new-tokens 32 --reference-dir rust/engine/artifacts/qwen2
 
 # Optional real-checkpoint regression: full/chunked prefill logits, decode and release.
 QWEN2_MODEL_DIR="$QWEN2_MODEL_DIR" QWEN2_REFERENCE_DIR="$PWD/rust/engine/artifacts/qwen2" cargo test --manifest-path rust/Cargo.toml --offline --release -p engine real_checkpoint_matches_reference_and_chunked_kv -- --ignored --nocapture
@@ -572,8 +615,8 @@ The token budget fits the entire prefill, so this experiment excludes chunking a
 continuous arrivals. Each warmup and measured cohort starts with fresh KV.
 
 ```bash
-cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --mode serial --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
-cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --mode overlap --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --dtype f32 --mode serial --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --dtype f32 --mode overlap --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
 /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir "$QWEN2_MODEL_DIR" --profile
 ```
 
