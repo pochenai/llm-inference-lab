@@ -2,6 +2,7 @@ mod api;
 mod error;
 mod output;
 mod qwen2;
+mod readback;
 mod simple_mlp;
 mod submission;
 

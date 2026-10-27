@@ -15,6 +15,13 @@ pub struct ModelInput<'a, P: KVPool> {
     pub kv: &'a mut KVContext<P>,
 }
 
+/// Private handoff used by the default enqueue method to restore KV owners before returning.
+struct ModelInputsAfterGpuSubmission<P: KVPool, T> {
+    inputs: Vec<(usize, ModelTokens<'static>, KVContext<P>)>,
+    output: T,
+    compute_stream_id: usize,
+}
+
 impl<P: KVPool> ModelInput<'_, P> {
     /// Logical history end after this input is computed, independent of CPU readback.
     pub fn sequence_len(&self) -> usize {
@@ -95,6 +102,99 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
                 input.kv.commit_append()?;
             }
             Ok(output)
+        }
+    }
+
+    /// Enqueue selected inputs, restoring KV ownership before returning output/completion.
+    /// Verify feedback stream order and reserve KV; Runner commits after GPU success.
+    /// Indices must be unique/valid; callback errors restore owners, outer failures invalidate them.
+    /// An inner error may follow partial submission: its GPU completion still needs draining.
+    fn enqueue_append_batch<T: Send + 'static>(
+        batch: &mut [ModelInput<'_, P>],
+        selected: impl Iterator<Item = usize> + Send,
+        policy: &Arc<dyn SchedulingPolicy>,
+        submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> Result<T, ModelError>
+            + Send
+            + 'static,
+    ) -> impl Future<
+        Output = Result<SubmittedGpuWorkWithCompletion<Result<T, ModelError>>, ModelError>,
+    > + Send
+    where
+        P: 'static,
+    {
+        async move {
+            // Own tokens and KV contexts for the 'static submission closure;
+            // retain original batch indices so each context returns to its request.
+            let mut owned: Vec<_> = selected
+                .map(|index| {
+                    let input = &mut batch[index];
+                    let tokens = match &input.token_ids {
+                        ModelTokens::BorrowedHost(tokens) => ModelTokens::SharedHost {
+                            tokens: Arc::new(tokens.to_vec()),
+                            end: tokens.len(),
+                        },
+                        ModelTokens::SharedHost { tokens, end } => ModelTokens::SharedHost {
+                            tokens: tokens.clone(),
+                            end: *end,
+                        },
+                        ModelTokens::Device(token) => ModelTokens::Device(token.clone()),
+                    };
+                    (index, tokens, input.kv.take_context_for_gpu_submission())
+                })
+                .collect();
+            // This await returns owned CPU state and a GPU completion handle;
+            // GPU work may still be running when the handoff becomes available.
+            let submitted = SubmittedGpuWorkWithCompletion::submit(policy, move |exec| {
+                let mut inputs: Vec<_> = owned
+                    .iter_mut()
+                    .map(|(_, tokens, kv)| ModelInput {
+                        token_ids: tokens.clone(),
+                        kv,
+                    })
+                    .collect();
+                let compute_stream_id = exec.get_cuda_stream().cu_stream() as usize;
+                let output = (|| {
+                    for input in &inputs {
+                        if let ModelTokens::Device(token) = &input.token_ids {
+                            if token
+                                .producer_stream_id
+                                .is_some_and(|stream| stream != compute_stream_id)
+                            {
+                                return Err(ModelError::InvalidInput(
+                                    "queued feedback requires the same compute stream".into(),
+                                ));
+                            }
+                        }
+                    }
+                    let mut appends: Vec<_> = inputs
+                        .iter_mut()
+                        .map(|input| {
+                            let count = input.uncached_len();
+                            (&mut *input.kv, count)
+                        })
+                        .collect();
+                    KVContext::prepare_queued_append_batch(&mut appends, exec)?;
+                    submit(&mut inputs, exec)
+                })();
+                // End temporary borrows before handing the owned contexts back.
+                drop(inputs);
+                ModelInputsAfterGpuSubmission {
+                    inputs: owned,
+                    output,
+                    compute_stream_id,
+                }
+            })
+            .await?;
+            // restore kv context
+            // Ownership returns now; gpu_completion still retains in-flight GPU resources.
+            for (index, _, kv) in submitted.output.inputs {
+                *batch[index].kv = kv;
+            }
+            Ok(SubmittedGpuWorkWithCompletion {
+                output: submitted.output.output,
+                gpu_completion: submitted.gpu_completion,
+                compute_stream_id: Some(submitted.output.compute_stream_id),
+            })
         }
     }
 

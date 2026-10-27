@@ -41,13 +41,10 @@
 //! Greedy argmax -> next token ID
 //! ```
 
-use super::super::submission::{
-    submit_model_batch_and_restore_kv_contexts, GpuWorkCompletionFuture,
-};
+use super::super::readback::{GpuTokenReadback, Readback, ReadbackCache};
 use super::{
     kernels,
     metrics::{Instruments, WorkspaceMetrics},
-    readback::{enqueue_readback, Readback, ReadbackCache},
     workspace::WorkspacePool,
 };
 use crate::runner::{
@@ -56,13 +53,10 @@ use crate::runner::{
     upload::UploadPool,
 };
 use crate::{
-    AttentionBackend, CausalModel, GpuTokenPredictionHandle, ModelError, ModelInput, ModelTokens,
-    NextToken, SubmittedGpuWorkWithCompletion,
+    AttentionBackend, CausalModel, ModelError, ModelInput, ModelTokens, NextToken,
+    SubmittedGpuWorkWithCompletion,
 };
-use cuda_async::{
-    device_operation::*,
-    scheduling_policies::{SchedulingPolicy, SingleStream},
-};
+use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
     tensor::{PartitionMut, Reshape, Tensor},
@@ -138,16 +132,8 @@ pub struct Qwen2Engine {
     instruments: Instruments,
     input_uploads: Arc<UploadPool<u32>>,
     embedding_sources: Arc<UploadPool<u64>>,
-    token_readbacks: Arc<ReadbackCache<i32>>,
-    readback_policy: Arc<dyn SchedulingPolicy>,
+    token_readback: GpuTokenReadback,
     logit_readbacks: ReadbackCache<f32>,
-}
-
-/// GPU output and its producing stream; context restoration belongs to the submission helper.
-struct QwenForwardStateAfterSubmission {
-    gpu_output: Result<StepOutput<Tensor<i32>, Tensor<f32>>, ModelError>,
-    /// Raw CUDA stream handle used as the identity for ordered GPU feedback.
-    compute_stream_id: usize,
 }
 
 impl Qwen2Engine {
@@ -312,12 +298,14 @@ impl Qwen2Engine {
         let workspaces: Arc<WorkspacePool> = Arc::default();
         let instruments = Instruments::new(workspaces.metrics().model_instance);
         Ok(Self {
-            readback_policy: Arc::new(SingleStream::new(policy.next_stream()?.device())?),
+            token_readback: GpuTokenReadback::new(
+                policy.next_stream()?.device(),
+                instruments.readback_duration.clone(),
+            )?,
             instruments,
             workspaces,
             input_uploads: Arc::default(),
             embedding_sources: Arc::default(),
-            token_readbacks: Default::default(),
             logit_readbacks: Default::default(),
             attention,
             tokenizer: loader.tokenizer()?,
@@ -468,13 +456,9 @@ impl Qwen2Engine {
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
         let output = self.submit_forward_kernels(batch, exec)?;
-        let token = enqueue_readback(output.token, &self.token_readbacks, exec)?;
+        let token = self.token_readback.enqueue(output.token, exec)?;
         let logits = if read_logits {
-            Some(enqueue_readback(
-                output.logits.unwrap(),
-                &self.logit_readbacks,
-                exec,
-            )?)
+            Some(self.logit_readbacks.enqueue(output.logits.unwrap(), exec)?)
         } else {
             None
         };
@@ -741,46 +725,6 @@ impl Qwen2Engine {
             logits: Some(scratch.logits),
             host_submit_seconds: submit_started.elapsed().as_secs_f64(),
         })
-    }
-
-    /// Wrap sampled GPU storage; one shared D2H future waits for producer completion.
-    /// GPU feedback can be consumed earlier on the same ordered compute stream.
-    fn build_gpu_token_handles_with_deferred_readback(
-        &self,
-        values: Tensor<i32>,
-        positions: Vec<usize>,
-        completion: GpuWorkCompletionFuture,
-        producer_stream_id: Option<usize>,
-    ) -> impl Iterator<Item = GpuTokenPredictionHandle> + 'static {
-        let values = Arc::new(values);
-        let source = values.clone();
-        let cache = self.token_readbacks.clone();
-        let policy = self.readback_policy.clone();
-        let duration = self.instruments.readback_duration.clone();
-        let host = async move {
-            completion.await?;
-            let started = Instant::now();
-            let result: Result<Readback<i32>, ModelError> = async {
-                let output = with_context(|exec| {
-                    // SAFETY: producer completed; the D2H submission retains both owners.
-                    value(unsafe { enqueue_readback(source, &cache, exec) })
-                })
-                .schedule(&policy)?
-                .await??;
-                Ok(output)
-            }
-            .await;
-            let readback_wall_seconds = started.elapsed().as_secs_f64();
-            duration.record(readback_wall_seconds);
-            tracing::debug!(target: "engine::qwen2", event = "readback_completed",
-                readback_wall_seconds, success = result.is_ok());
-            result
-        };
-        GpuTokenPredictionHandle::batch(values, host, self.config.vocab_size, positions.into_iter())
-            .map(move |mut token| {
-                token.producer_stream_id = producer_stream_id;
-                token
-            })
     }
 
     unsafe fn linear(
@@ -1068,9 +1012,10 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
                     .filter(|(_, output)| output.is_ok())
                     .map(|(input, _)| input.kv.ready_len())
                     .collect();
-                let tokens = self.build_gpu_token_handles_with_deferred_readback(
+                let tokens = self.token_readback.predictions(
                     result.token,
                     positions,
+                    self.config.vocab_size,
                     futures::future::ready(Ok(())).boxed().shared(),
                     None,
                 );
@@ -1157,45 +1102,17 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             .filter_map(|(index, result)| result.is_ok().then_some(index));
         let model = self.clone();
         let started = Instant::now();
-        // The helper restores KV ownership before returning; GPU completion is awaited later.
-        let submitted = submit_model_batch_and_restore_kv_contexts(
-            batch,
-            selected,
-            &policy,
-            move |inputs, exec| {
-                let result = (|| {
-                    for input in inputs.iter() {
-                        if let ModelTokens::Device(token) = &input.token_ids {
-                            if token.producer_stream_id.is_some_and(|stream| {
-                                stream != exec.get_cuda_stream().cu_stream() as usize
-                            }) {
-                                return Err(ModelError::InvalidInput(
-                                    "queued feedback requires the same compute stream".into(),
-                                ));
-                            }
-                        }
-                    }
-                    let mut appends: Vec<_> = inputs
-                        .iter_mut()
-                        .map(|input| {
-                            let count = input.uncached_len();
-                            (&mut *input.kv, count)
-                        })
-                        .collect();
-                    KVContext::prepare_queued_append_batch(&mut appends, exec)?;
-                    // SAFETY: the normal DeviceFuture retains every submitted resource.
-                    unsafe { model.submit_forward_kernels(inputs, exec) }
-                })();
-                QwenForwardStateAfterSubmission {
-                    gpu_output: result,
-                    compute_stream_id: exec.get_cuda_stream().cu_stream() as usize,
-                }
-            },
-        )
-        .await;
+        // The default trait method restores KV ownership; GPU completion is awaited later.
+        let submitted =
+            Self::enqueue_append_batch(batch, selected, &policy, move |inputs, exec| {
+                // SAFETY: the common helper prepares KV and retains submission resources.
+                unsafe { model.submit_forward_kernels(inputs, exec) }
+            })
+            .await;
         let SubmittedGpuWorkWithCompletion {
-            output: qwen_state,
+            output: result,
             gpu_completion,
+            compute_stream_id,
         } = match submitted {
             Ok(submitted) => submitted,
             Err(error) => {
@@ -1205,7 +1122,6 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
                 return SubmittedGpuWorkWithCompletion::from_completed_output(outputs);
             }
         };
-        let result = qwen_state.gpu_output;
         let batch_size = batch.len();
         let host_submit_seconds = result
             .as_ref()
@@ -1239,11 +1155,12 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         match result {
             Ok(result) => {
                 for (output, token) in outputs.iter_mut().filter(|result| result.is_ok()).zip(
-                    self.build_gpu_token_handles_with_deferred_readback(
+                    self.token_readback.predictions(
                         result.token,
                         positions,
+                        self.config.vocab_size,
                         gpu_completion.clone(),
-                        Some(qwen_state.compute_stream_id),
+                        compute_stream_id,
                     ),
                 ) {
                     *output = Ok(NextToken::Device(token));
@@ -1258,6 +1175,7 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         SubmittedGpuWorkWithCompletion {
             output: outputs,
             gpu_completion,
+            compute_stream_id,
         }
     }
 
@@ -1358,9 +1276,13 @@ mod tests {
                     .map(|i| config.rope_theta.powf(-(i as f32) / 32.0))
                     .collect();
                 let workspaces: Arc<WorkspacePool> = Arc::default();
+                let instruments = Instruments::new(workspaces.metrics().model_instance);
                 Ok(Qwen2Engine {
-                    readback_policy: Arc::new(SingleStream::new(exec.get_cuda_stream().device())?),
-                    instruments: Instruments::new(workspaces.metrics().model_instance),
+                    token_readback: GpuTokenReadback::new(
+                        exec.get_cuda_stream().device(),
+                        instruments.readback_duration.clone(),
+                    )?,
+                    instruments,
                     workspaces,
                     attention: GqaAttention {
                         q_heads: 2,
@@ -1379,7 +1301,6 @@ mod tests {
                     eos: vec![256],
                     input_uploads: Arc::default(),
                     embedding_sources: Arc::default(),
-                    token_readbacks: Default::default(),
                     logit_readbacks: Default::default(),
                 })
             })())
@@ -1499,7 +1420,7 @@ mod tests {
                                 .reshape(&[5, 256])?,
                         );
                         let out = attention.forward(q, &views, &query_ranges, exec)?;
-                        Ok(enqueue_readback(out, &readbacks, exec)?)
+                        Ok(readbacks.enqueue(out, exec)?)
                     }
                 })())
             })
@@ -1738,7 +1659,7 @@ mod tests {
                                 .map(|(out, ..)| out)
                                 .unpartition()
                                 .execute(exec)?;
-                                Ok(enqueue_readback(out, &cache, exec)?)
+                                Ok(cache.enqueue(out, exec)?)
                             }
                         })())
                     })
@@ -1792,10 +1713,7 @@ mod tests {
                     .execute(exec)?;
                     let winner =
                         api::copy_host_vec_to_device(&Arc::new(vec![151645i32])).execute(exec)?;
-                    Ok((
-                        enqueue_readback(out, &outputs, exec)?,
-                        enqueue_readback(winner, &tokens, exec)?,
-                    ))
+                    Ok((outputs.enqueue(out, exec)?, tokens.enqueue(winner, exec)?))
                 }
             })())
         })
@@ -1878,7 +1796,7 @@ mod tests {
                             10,
                         )
                         .execute(exec)?;
-                        Ok(enqueue_readback(out, &readbacks, exec)?)
+                        Ok(readbacks.enqueue(out, exec)?)
                     }
                 })())
             })
@@ -2106,6 +2024,26 @@ mod tests {
                 _ => panic!("expected GPU feedback"),
             })
             .collect();
+        assert_eq!((a.ready_len(), a.allocated_len()), (0, 3));
+        assert_eq!(a.pending_range(), Some(0..3));
+        // Common submission rejects cross-stream feedback before reserving another append.
+        let other_policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
+        let rejected = model
+            .clone()
+            .enqueue_forward_and_return_completion(
+                &mut [ModelInput {
+                    token_ids: ModelTokens::Device(tokens[0].clone()),
+                    kv: &mut a,
+                }],
+                other_policy,
+            )
+            .await;
+        assert!(
+            matches!(&rejected.output[0], Err(ModelError::InvalidInput(message))
+            if message == "queued feedback requires the same compute stream")
+        );
+        rejected.gpu_completion.await?;
+        assert!(a.has_owned_pool_state());
         assert_eq!((a.ready_len(), a.allocated_len()), (0, 3));
         assert_eq!(a.pending_range(), Some(0..3));
         let second = model

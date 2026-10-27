@@ -384,6 +384,8 @@ while Qwen returns after enqueueing. Request IDs remain outside the model API.
 pub struct SubmittedGpuWorkWithCompletion<T = Vec<Result<NextToken, ModelError>>> {
     output: T,
     gpu_completion: GpuWorkCompletionFuture,
+    /// Producing stream supplied by queued model submission.
+    compute_stream_id: Option<usize>,
 }
 
 struct GpuTokenPredictionHandle {
@@ -403,20 +405,32 @@ history and exclusive end position for owned submissions. Runner uses SharedHost
 without copying history. These input variants do not select the output location:
 Qwen returns NextToken::Device for both CPU and GPU input paths.
 
+Execution operations follow their owning contract:
+
+| Owner | Method / responsibility |
+| --- | --- |
+| SubmittedGpuWorkWithCompletion<T> | submit: construct an owned submission handle without awaiting GPU completion |
+| CausalModel<P> | execute_append_batch: prepare, await completion, then commit KV |
+| CausalModel<P> | enqueue_append_batch: prepare queued work and restore owners; Runner later awaits and commits |
+| ReadbackCache<T> | enqueue: retain copy resources and reuse only buffers without GPU/CPU users |
+| GpuTokenReadback | enqueue/predictions: use its pinned cache, copy stream and deferred CPU reads |
+
 The submission-related records have these roles:
 
 | Record | Boundary / responsibility |
 | --- | --- |
 | SubmittedGpuWorkWithCompletion<T> | Helper/model returns owned output and one shared GPU completion; replaces Submission<T> and SubmittedForward |
-| ModelInputsAfterGpuSubmission<P,T> | Private helper handoff: moved inputs plus owned output; model code cannot extract contexts or results from it |
-| QwenForwardStateAfterSubmission | Qwen-only gpu_output and compute_stream_id; no KV ownership or restoration |
+| ModelInputsAfterGpuSubmission<P,T> | Private default-method handoff: moved inputs plus owned output; model implementations cannot extract contexts or results from it |
+| GpuTokenReadback | Shared-model component: pinned cache, independent D2H stream, readback metrics and deferred token handles |
 | RequestForwardAwaitingGpuCompletion | Runner-only identity, KV append end and prediction; replaces BatchMember plus PendingBatch |
 
-submit_and_return_gpu_handle drives the first DeviceFuture poll and returns
-SubmittedGpuWorkWithCompletion<T>. The internal submit_model_batch_and_restore_kv_contexts
-helper owns selected inputs and restores every KVContext before exposing model output.
-Its callback receives borrowed ModelInput values and returns owned T: no input borrow
-can escape. Model implementations no longer extract or restore KV owners manually.
+SubmittedGpuWorkWithCompletion::submit drives the first DeviceFuture poll and returns
+the output/completion handle. CausalModel::enqueue_append_batch is the default model
+execution method: it owns selected inputs, checks feedback stream order, reserves
+queued KV appends and restores every KVContext before exposing model output. Its callback only submits
+model kernels using borrowed ModelInput values and returns an owned Result<T,ModelError>:
+no input borrow can escape. The common submission handle carries compute_stream_id;
+no model-specific handoff struct is required. Model implementations no longer extract or restore KV owners manually.
 Callback-level errors restore contexts too; outer submission errors or cancellation
 invalidate moved contexts and retain the existing safe release behavior. Qwen then
 returns the same generic container with token predictions as its output. Runner consumes
@@ -424,9 +438,8 @@ that vector into its per-request records;
 wait_commit_kv_and_forward awaits shared GPU completion, commits KV,
 and accepts/emits tokens. Request IDs stay entirely in Runner.
 
-The common submission helper moves selected KVContext owners into an owned DeviceOp,
-shares Host histories
-through Arc (borrowed direct callers are copied), and creates temporary ModelInput
+The default enqueue_append_batch method moves selected KVContext owners into an owned
+DeviceOp and shares Host histories through Arc (borrowed direct callers are copied), and creates temporary ModelInput
 borrows only inside execute. After mapping/layer submissions, it hands contexts and
 GPU predictions back through an internal oneshot. The engine polls the normal
 DeviceFuture once before consuming that handoff, so its completion marker is already
@@ -460,9 +473,13 @@ have already committed and are not committed twice. The overlap setting alone
 selects the execution path: overlap submits current before processing pending, then
 retains current for the next iteration. Serial execution calls next_tokens, waits
 for CPU token IDs and accepts them immediately, without pending completion records.
-Host-only SimpleMLP callers explicitly disable overlap. Qwen D2H waits for the producer completion,
-runs on a separate SingleStream with reusable pinned buffers, and is shared across
-all tokens of the output batch. GPU consumers do not wait for D2H or CPU decoding.
+Host-only SimpleMLP callers explicitly disable overlap. GpuTokenReadback lives under
+model/readback.rs and owns reusable pinned buffers, an independent SingleStream and
+an injected duration histogram. predictions() returns GPU handles sharing one lazy
+producer-completion-then-D2H future. Qwen uses this component for direct and queued
+forwards; new models reuse it without owning CUDA copy/cache logic. GPU consumers
+do not wait for D2H or CPU decoding. Common readback logs use engine::model; histogram
+names and model-instance labels remain supplied by the model.
 
 KV ready_len records completed progress; allocated_len() derives the reservation
 cursor from pending_ends.back(), or ready_len when idle. Only append ends are stored:

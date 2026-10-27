@@ -1186,6 +1186,7 @@ mod tests {
                 SubmittedGpuWorkWithCompletion {
                     output: outputs,
                     gpu_completion: completion,
+                    compute_stream_id: None,
                 }
             }
         }

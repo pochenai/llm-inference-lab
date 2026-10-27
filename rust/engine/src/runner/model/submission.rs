@@ -10,9 +10,7 @@ use futures::{
 };
 use tokio::sync::oneshot;
 
-use crate::runner::kv_pool::{KVContext, KVPool};
-
-use super::{ModelError, ModelInput, ModelTokens, NextToken};
+use super::{ModelError, NextToken};
 
 /// One GPU submission's shared completion; awaiting it does not commit KV or copy tokens.
 pub(crate) type GpuWorkCompletionFuture = Shared<BoxFuture<'static, Result<(), ModelError>>>;
@@ -22,6 +20,8 @@ pub(crate) type GpuWorkCompletionFuture = Shared<BoxFuture<'static, Result<(), M
 pub struct SubmittedGpuWorkWithCompletion<T = Vec<Result<NextToken, ModelError>>> {
     pub(crate) output: T,
     pub(crate) gpu_completion: GpuWorkCompletionFuture,
+    /// Producing stream identity supplied by CausalModel::enqueue_append_batch.
+    pub(crate) compute_stream_id: Option<usize>,
 }
 
 impl<T> SubmittedGpuWorkWithCompletion<T> {
@@ -30,111 +30,53 @@ impl<T> SubmittedGpuWorkWithCompletion<T> {
         Self {
             output,
             gpu_completion: futures::future::ready(Ok(())).boxed().shared(),
+            compute_stream_id: None,
         }
     }
-}
 
-/// Submit owned GPU work and return a handle containing output and completion.
-/// The first poll registers completion before CPU state is handed back to the caller.
-async fn submit_and_return_gpu_handle<T: Send + 'static>(
-    policy: &Arc<dyn SchedulingPolicy>,
-    submit: impl FnOnce(&ExecutionContext) -> T + Send + 'static,
-) -> Result<SubmittedGpuWorkWithCompletion<T>, ModelError> {
-    let (tx, mut rx) = oneshot::channel();
-    let op = with_context(move |exec| {
-        let _ = tx.send(submit(exec));
-        value(())
-    });
-    let mut future = op
-        .schedule(policy)?
-        .map(|result| result.map_err(ModelError::from))
-        .boxed();
-    let first = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
-    let completion = match first {
-        Poll::Pending => future.shared(),
-        Poll::Ready(Ok(())) => futures::future::ready(Ok(())).boxed().shared(),
-        // Never publish feedback from a submission already known to have failed.
-        Poll::Ready(Err(error)) => return Err(error),
-    };
-    let output = rx
-        .try_recv()
-        .map_err(|_| ModelError::Execution("GPU submission did not execute".into()))?;
-    Ok(SubmittedGpuWorkWithCompletion {
-        output,
-        gpu_completion: completion,
-    })
-}
-
-/// Private handoff; only the batch helper can extract output and restore its KV owners.
-struct ModelInputsAfterGpuSubmission<P: KVPool, T> {
-    inputs: Vec<(usize, ModelTokens<'static>, KVContext<P>)>,
-    output: T,
-}
-
-/// Submit selected inputs and restore their KV owners before exposing output to the model.
-/// The callback only borrows inputs; T must be owned. Selected indices must be unique and valid.
-/// Outer errors/cancellation invalidate moved contexts; callback errors still restore ownership.
-pub(super) async fn submit_model_batch_and_restore_kv_contexts<
-    P: KVPool + 'static,
-    T: Send + 'static,
->(
-    batch: &mut [ModelInput<'_, P>],
-    selected: impl Iterator<Item = usize> + Send,
-    policy: &Arc<dyn SchedulingPolicy>,
-    submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> T + Send + 'static,
-) -> Result<SubmittedGpuWorkWithCompletion<T>, ModelError> {
-    // Own tokens and KV contexts for the 'static submission closure;
-    // retain original batch indices so each context returns to its request.
-    let mut owned: Vec<_> = selected
-        .map(|index| {
-            let input = &mut batch[index];
-            let tokens = match &input.token_ids {
-                ModelTokens::BorrowedHost(tokens) => ModelTokens::SharedHost {
-                    tokens: Arc::new(tokens.to_vec()),
-                    end: tokens.len(),
-                },
-                ModelTokens::SharedHost { tokens, end } => ModelTokens::SharedHost {
-                    tokens: tokens.clone(),
-                    end: *end,
-                },
-                ModelTokens::Device(token) => ModelTokens::Device(token.clone()),
-            };
-            (index, tokens, input.kv.take_context_for_gpu_submission())
-        })
-        .collect();
-    // This await returns owned CPU state and a GPU completion handle;
-    // GPU work may still be running when the handoff becomes available.
-    let submitted = submit_and_return_gpu_handle(policy, move |exec| {
-        let mut inputs: Vec<_> = owned
-            .iter_mut()
-            .map(|(_, tokens, kv)| ModelInput {
-                token_ids: tokens.clone(),
-                kv,
-            })
-            .collect();
-        let output = submit(&mut inputs, exec);
-        // End temporary borrows before handing the owned contexts back.
-        drop(inputs);
-        ModelInputsAfterGpuSubmission {
-            inputs: owned,
+    /// Submit owned GPU work and return a handle containing output and completion.
+    /// The first poll registers completion before CPU state is handed back to the caller.
+    pub(super) async fn submit(
+        policy: &Arc<dyn SchedulingPolicy>,
+        submit: impl FnOnce(&ExecutionContext) -> T + Send + 'static,
+    ) -> Result<Self, ModelError>
+    where
+        T: Send + 'static,
+    {
+        let (tx, mut rx) = oneshot::channel();
+        let op = with_context(move |exec| {
+            let _ = tx.send(submit(exec));
+            value(())
+        });
+        let mut future = op
+            .schedule(policy)?
+            .map(|result| result.map_err(ModelError::from))
+            .boxed();
+        let first = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+        let completion = match first {
+            Poll::Pending => future.shared(),
+            Poll::Ready(Ok(())) => futures::future::ready(Ok(())).boxed().shared(),
+            // Never publish feedback from a submission already known to have failed.
+            Poll::Ready(Err(error)) => return Err(error),
+        };
+        let output = rx
+            .try_recv()
+            .map_err(|_| ModelError::Execution("GPU submission did not execute".into()))?;
+        Ok(Self {
             output,
-        }
-    })
-    .await?;
-    // restore kv context
-    // Ownership returns now; gpu_completion still retains in-flight GPU resources.
-    for (index, _, kv) in submitted.output.inputs {
-        *batch[index].kv = kv;
+            gpu_completion: completion,
+            compute_stream_id: None,
+        })
     }
-    Ok(SubmittedGpuWorkWithCompletion {
-        output: submitted.output.output,
-        gpu_completion: submitted.gpu_completion,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::{
+        kv_pool::{KVContext, KVPool},
+        model::{CausalModel, ModelInput, SimpleMLPEngine},
+    };
     use cuda_async::scheduling_policies::SingleStream;
     use cutile::cuda_core::{Device, Stream};
     use std::{
@@ -225,7 +167,7 @@ mod tests {
         .await?;
         let initial = pool.metrics();
         // Initialize completion machinery before deliberately blocking the stream.
-        submit_and_return_gpu_handle(&policy, |_| ())
+        SubmittedGpuWorkWithCompletion::submit(&policy, |_| ())
             .await?
             .gpu_completion
             .await?;
@@ -235,7 +177,7 @@ mod tests {
             let submitted;
             let gate = Gate::arm(&policy.next_stream()?)?;
             let expired = gate.expired.clone();
-            submitted = submit_model_batch_and_restore_kv_contexts(
+            submitted = SimpleMLPEngine::enqueue_append_batch(
                 &mut [
                     ModelInput {
                         token_ids: (&[3u32]).into(),
@@ -248,10 +190,10 @@ mod tests {
                 ],
                 std::iter::once(1),
                 &policy,
-                move |inputs, exec| -> Result<(), ModelError> {
+                move |inputs, _exec| -> Result<(), ModelError> {
                     assert_eq!(inputs.len(), 1);
                     assert_eq!(inputs[0].token_ids.host()?, &[9]);
-                    KVContext::prepare_queued_append_batch(&mut [(&mut *inputs[0].kv, 1)], exec)?;
+                    assert_eq!(inputs[0].kv.pending_range(), Some(0..1));
                     if fail {
                         return Err(ModelError::Execution("injected callback failure".into()));
                     }
@@ -282,7 +224,7 @@ mod tests {
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let stream = policy.next_stream()?;
         // Initialize the library's completion machinery before blocking the stream.
-        submit_and_return_gpu_handle(&policy, |_| ())
+        SubmittedGpuWorkWithCompletion::submit(&policy, |_| ())
             .await?
             .gpu_completion
             .await?;
@@ -296,7 +238,8 @@ mod tests {
         let SubmittedGpuWorkWithCompletion {
             output: state,
             gpu_completion: completion,
-        } = submit_and_return_gpu_handle(&policy, move |exec| {
+            ..
+        } = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
             exec.retain(owner).unwrap();
             vec![42u32]
         })
@@ -309,8 +252,10 @@ mod tests {
         let second_gate = Gate::arm(&stream)?;
         let second_expired = second_gate.expired.clone();
         let owner = second_owner.clone();
-        let submitted =
-            submit_and_return_gpu_handle(&policy, move |exec| exec.retain(owner).unwrap()).await?;
+        let submitted = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
+            exec.retain(owner).unwrap()
+        })
+        .await?;
         completions.push(submitted.gpu_completion);
         second_gate.assert_held();
         drop(first_gate);
@@ -335,7 +280,7 @@ mod tests {
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let owner = Arc::new(());
         let retained = owner.clone();
-        let submitted = submit_and_return_gpu_handle(&policy, move |exec| {
+        let submitted = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
             exec.retain(retained).unwrap();
             Err::<(), _>(ModelError::Execution(
                 "failure after resource registration".into(),
@@ -354,7 +299,7 @@ mod tests {
         let checked_owner = Arc::new(AssertGpuCompletedBeforeOwnerDrop(gpu_done.clone()));
         let weak_owner = Arc::downgrade(&checked_owner);
         let done = gpu_done.clone();
-        cancelled = submit_and_return_gpu_handle(&policy, move |exec| {
+        cancelled = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
             exec.retain(checked_owner).unwrap();
             // This queued callback models work that still uses the retained owner.
             unsafe {

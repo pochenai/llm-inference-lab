@@ -397,6 +397,13 @@ setting selects the path without inspecting prediction variants. Host-only
 SimpleMLP examples disable overlap explicitly. Cancellation uses cuda-async's existing drain-on-drop safety, which can
 block the host while in-flight GPU work finishes.
 
+The shared model/readback module provides GpuTokenReadback: an independent D2H
+stream, reusable pinned cache and deferred GPU token handles. The common submission
+method CausalModel::enqueue_append_batch validates feedback stream order, prepares
+KV and restores context ownership; models supply their own kernels and instrumentation.
+SubmittedGpuWorkWithCompletion::submit constructs the underlying submission handle.
+The matching execute_append_batch method instead awaits completion and commits KV.
+
 Token/logit readbacks enqueue asynchronous D2H into reusable pinned buffers and become
 readable only after outer completion. Dropping an in-flight model step may require
 context release; retained GPU leases prevent premature storage reuse.
