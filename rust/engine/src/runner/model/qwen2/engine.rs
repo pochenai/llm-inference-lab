@@ -76,7 +76,7 @@ const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
 
-/// Finite shape buckets keep JIT specializations bounded and preserve small/FP32 tiles.
+/// Finite M/N buckets retain parallelism for skinny, small and FP32 matrices.
 #[derive(Clone, Copy, Debug)]
 struct LinearTile {
     rows: usize,
@@ -85,8 +85,14 @@ struct LinearTile {
 }
 
 impl LinearTile {
-    fn for_shape<T: DType>(rows: usize) -> Self {
-        if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 128 {
+    fn for_shape<T: DType>(rows: usize, columns: usize) -> Self {
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 2048 && columns >= 512 {
+            Self {
+                rows: 128,
+                columns: 128,
+                reduction: 64,
+            }
+        } else if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 128 {
             Self {
                 rows: 32,
                 columns: 128,
@@ -825,7 +831,10 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         // Bias-free specializations never read this existing rank-one weight.
         let bias = bias.unwrap_or_else(|| self.norm.clone());
         // Independent packed rows can share a tile even across request boundaries.
-        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize);
+        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        tracing::debug!(target: "engine::qwen2", event = "linear_dispatch", rows = x.shape()[0], columns = out.shape()[1],
+            reduction = k, tile_rows = tile.rows, tile_columns = tile.columns, tile_reduction = tile.reduction,
+            layout = "checkpoint");
         kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
             .generics(vec![
                 T::DTYPE.to_string(),
@@ -1792,11 +1801,7 @@ mod tests {
                     columns: 64,
                     reduction: 32,
                 },
-                LinearTile {
-                    rows: 32,
-                    columns: 128,
-                    reduction: 64,
-                },
+                LinearTile::for_shape::<cutile::core::bf16>(4096, 4864),
             ] {
                 for has_bias in [false, true] {
                     let actual = with_context(|exec| {
@@ -1811,10 +1816,8 @@ mod tests {
                                     .reshape(&[96, width])?;
                                 let bias = api::copy_host_vec_to_device(&biases).execute(exec)?;
                                 let out = kernels::linear(
-                                    Tensor::<f32>::uninitialized(rows * 96)
+                                    api::full(f32::NAN, &[rows, 96])
                                         .execute(exec)?
-                                        .assume_init()
-                                        .reshape(&[rows, 96])?
                                         .partition([tile.rows, tile.columns]),
                                     x,
                                     w,
