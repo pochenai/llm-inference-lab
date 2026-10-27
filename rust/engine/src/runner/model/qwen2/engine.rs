@@ -2760,4 +2760,120 @@ mod tests {
         assert_eq!(model.workspace_metrics().in_use_bytes, 0);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn bf16_prefill_writes_every_query_and_matches_independent_attention(
+    ) -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let pool = NaiveKVPool::<bf16>::new(
+            NaiveKVPoolConfig {
+                num_layers: 1,
+                num_slots: 512,
+                max_rows: 1,
+                max_seq_len: 512,
+                head_dim: 128,
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let mut context = KVContext::new(pool.clone())?;
+        let queries = 3..260;
+        let q: Arc<Vec<bf16>> = Arc::new(
+            (0..263 * 256)
+                .map(|i| bf16::from_f32(((i * 17 % 97) as f32 - 48.0) / 64.0))
+                .collect(),
+        );
+        let k: Arc<Vec<bf16>> = Arc::new(
+            (0..262 * 128)
+                .map(|i| bf16::from_f32(((i * 7 % 61) as f32 - 30.0) / 64.0))
+                .collect(),
+        );
+        let v: Arc<Vec<bf16>> = Arc::new(
+            (0..262 * 128)
+                .map(|i| bf16::from_f32(((i * 13 % 63) as f32 - 31.0) / 32.0))
+                .collect(),
+        );
+        let attention = GqaAttention {
+            q_heads: 4,
+            kv_heads: 2,
+            metadata_uploads: Arc::default(),
+        };
+        let cache = ReadbackCache::default();
+        let actual = with_context(|exec| {
+            value((|| -> Result<_, ModelError> {
+                // SAFETY: all producers and reads use this exec; host observation follows completion.
+                unsafe {
+                    context.prepare_append(262, exec)?;
+                    let keys = api::copy_host_vec_to_device(&k)
+                        .execute(exec)?
+                        .reshape(&[262, 128])?;
+                    let values = api::copy_host_vec_to_device(&v)
+                        .execute(exec)?
+                        .reshape(&[262, 128])?;
+                    context.store(0, keys.slice(&[])?, values.slice(&[])?, exec)?;
+                    let q_gpu = api::copy_host_vec_to_device(&q)
+                        .execute(exec)?
+                        .reshape(&[263, 256])?;
+                    let sentinel = Arc::new(vec![bf16::from_f32(4.0); 263 * 256]);
+                    let mut out = api::copy_host_vec_to_device(&sentinel)
+                        .execute(exec)?
+                        .reshape(&[263, 256])?;
+                    exec.retain(out.into_shared_alias())?;
+                    // A nonzero history lower bound and an odd output offset exercise both masks.
+                    let view = pool.read_view(context.state(), 0, 3..262)?;
+                    attention.submit_prefill(&mut out, &q_gpu, &view, &queries, exec)?;
+                    Ok(cache.enqueue(out, exec)?)
+                }
+            })())
+        })
+        .schedule(&policy)?
+        .await??;
+        for (index, value) in actual.as_slice()[..3 * 256].iter().enumerate() {
+            assert_eq!(value.to_f32(), 4.0, "guard overwritten at {index}");
+        }
+        for value in &actual.as_slice()[260 * 256..] {
+            assert_eq!(value.to_f32(), 4.0, "trailing output guard overwritten");
+        }
+        for local in 0..queries.len() {
+            let visible = 3..=5 + local;
+            for head in 0..4 {
+                let scores: Vec<f64> = visible
+                    .clone()
+                    .map(|pos| {
+                        (0..64)
+                            .map(|d| {
+                                q[(queries.start + local) * 256 + head * 64 + d].to_f32() as f64
+                                    * k[pos * 128 + (head / 2) * 64 + d].to_f32() as f64
+                            })
+                            .sum::<f64>()
+                            * 0.125
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
+                let denominator = weights.iter().sum::<f64>();
+                for d in 0..64 {
+                    let expected = visible
+                        .clone()
+                        .zip(&weights)
+                        .map(|(pos, w)| w * v[pos * 128 + (head / 2) * 64 + d].to_f32() as f64)
+                        .sum::<f64>()
+                        / denominator;
+                    let value =
+                        actual.as_slice()[(queries.start + local) * 256 + head * 64 + d].to_f32();
+                    assert!(
+                        (value as f64 - expected).abs() < 0.004,
+                        "query {local}, head {head}, dim {d}: {value} vs {expected}"
+                    );
+                }
+            }
+        }
+        context.commit_append()?;
+        context.release();
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
 }
