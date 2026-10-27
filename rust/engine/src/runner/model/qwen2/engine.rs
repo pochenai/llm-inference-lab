@@ -52,8 +52,13 @@ use crate::runner::{
     loader::{EosTokenId, WeightLoader},
     upload::UploadPool,
 };
-use crate::{AttentionBackend, CausalModel, ModelError, ModelInput};
-use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
+use crate::{
+    AttentionBackend, CausalModel, DeviceToken, ModelError, ModelInput, ModelTokens, NextToken,
+};
+use cuda_async::{
+    device_operation::*,
+    scheduling_policies::{SchedulingPolicy, SingleStream},
+};
 use cutile::{
     api,
     tensor::{PartitionMut, Reshape, Tensor},
@@ -127,7 +132,9 @@ pub struct Qwen2Engine {
     workspaces: Arc<WorkspacePool>,
     instruments: Instruments,
     input_uploads: Arc<UploadPool<u32>>,
-    token_readbacks: ReadbackCache<i32>,
+    embedding_sources: Arc<UploadPool<u64>>,
+    token_readbacks: Arc<ReadbackCache<i32>>,
+    readback_policy: Arc<dyn SchedulingPolicy>,
     logit_readbacks: ReadbackCache<f32>,
 }
 
@@ -293,9 +300,11 @@ impl Qwen2Engine {
         let workspaces: Arc<WorkspacePool> = Arc::default();
         let instruments = Instruments::new(workspaces.metrics().model_instance);
         Ok(Self {
+            readback_policy: Arc::new(SingleStream::new(policy.next_stream()?.device())?),
             instruments,
             workspaces,
             input_uploads: Arc::default(),
+            embedding_sources: Arc::default(),
             token_readbacks: Default::default(),
             logit_readbacks: Default::default(),
             attention,
@@ -355,7 +364,7 @@ impl Qwen2Engine {
         read_logits: bool,
     ) -> Result<StepOutput<u32, Vec<f32>>, ModelError> {
         let mut batch = [ModelInput {
-            token_ids: tokens,
+            token_ids: (tokens).into(),
             kv,
         }];
         self.validate_step_input(&batch[0])?;
@@ -368,18 +377,29 @@ impl Qwen2Engine {
     }
 
     fn validate_step_input(&self, input: &ModelInput<'_, NaiveKVPool>) -> Result<(), ModelError> {
-        let tokens = input.token_ids;
+        let length = input.sequence_len();
         let kv = &input.kv;
         if kv.is_pending()
-            || tokens.len() <= kv.ready_len()
-            || tokens.len() > kv.max_seq_len()
-            || tokens.len() > self.config.max_position_embeddings
+            || length <= kv.ready_len()
+            || length > kv.max_seq_len()
+            || length > self.config.max_position_embeddings
         {
             return Err(ModelError::InvalidInput(
                 "expected valid tokens with an uncached suffix and idle context".into(),
             ));
         }
-        self.validate_input(&tokens[kv.ready_len()..])
+        match &input.token_ids {
+            ModelTokens::Host(tokens) => self.validate_input(&tokens[kv.ready_len()..]),
+            ModelTokens::Device(token)
+                if token.values.device_id() == self.embedding.device_id()
+                    && token.vocab_size == self.config.vocab_size =>
+            {
+                Ok(())
+            }
+            ModelTokens::Device(_) => Err(ModelError::InvalidInput(
+                "token feedback has incompatible device or vocabulary".into(),
+            )),
+        }
     }
 
     fn checked_token(&self, token: i32) -> Result<u32, ModelError> {
@@ -399,13 +419,10 @@ impl Qwen2Engine {
         policy: Arc<dyn SchedulingPolicy>,
         read_logits: bool,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
-        let rows = batch
+        let rows = batch.iter().map(|input| input.uncached_len()).sum();
+        let prefill = batch
             .iter()
-            .map(|input| input.token_ids.len() - input.kv.ready_len())
-            .sum();
-        let prefill = batch.iter().any(|input| {
-            input.kv.ready_len() == 0 || input.token_ids.len() - input.kv.ready_len() > 1
-        });
+            .any(|input| input.kv.ready_len() == 0 || input.uncached_len() > 1);
         let start = Instant::now();
         let result = Self::execute_append_batch(batch, &policy, |batch, exec| {
             // SAFETY: every GPU access, including D2H, belongs to this submission.
@@ -432,12 +449,36 @@ impl Qwen2Engine {
         read_logits: bool,
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
+        let output = self.submit_device(batch, exec)?;
+        let token = enqueue_readback(output.token, &self.token_readbacks, exec)?;
+        let logits = if read_logits {
+            Some(enqueue_readback(
+                output.logits.unwrap(),
+                &self.logit_readbacks,
+                exec,
+            )?)
+        } else {
+            None
+        };
+        Ok(StepOutput {
+            token,
+            logits,
+            host_submit_seconds: output.host_submit_seconds,
+        })
+    }
+
+    unsafe fn submit_device(
+        &self,
+        batch: &mut [ModelInput<'_, NaiveKVPool>],
+        exec: &ExecutionContext,
+    ) -> Result<StepOutput<Tensor<i32>, Tensor<f32>>, ModelError> {
         let submit_started = Instant::now();
         // Thread-local NVTX range covers synchronous submission only, never the await.
         let _range = crate::profiling::ScopedRange::new(
-            if batch.iter().any(|input| {
-                input.kv.ready_len() == 0 || input.token_ids.len() - input.kv.ready_len() > 1
-            }) {
+            if batch
+                .iter()
+                .any(|input| input.kv.ready_len() == 0 || input.uncached_len() > 1)
+            {
                 c"qwen2.prefill.submit"
             } else {
                 c"qwen2.decode.submit"
@@ -448,7 +489,7 @@ impl Qwen2Engine {
             .iter()
             .map(|input| {
                 let start = rows;
-                rows += input.token_ids.len() - input.kv.ready_len();
+                rows += input.uncached_len();
                 start..rows
             })
             .collect();
@@ -464,19 +505,89 @@ impl Qwen2Engine {
             self.attention
                 .prepare_metadata(rows, &views, &query_ranges, exec)?
         };
-        // Pack directly into cached staging; retain u32 IDs without an intermediate Vec.
-        let ids = self.input_uploads.upload_iter(
-            batch
-                .iter()
-                .flat_map(|input| input.token_ids[input.kv.ready_len()..].iter().copied()),
-            exec,
-        )?;
-        kernels::embedding(
-            (&mut scratch.x).partition([1, 256]),
-            ids,
-            self.embedding.clone(),
-        )
-        .execute(exec)?;
+        // Keep host-only batches packed into one upload/embedding launch. Pure
+        // decode can likewise reuse a contiguous previous GPU batch without packing.
+        let contiguous_feedback = match &batch[0].token_ids {
+            ModelTokens::Device(first) if batch.iter().enumerate().all(|(index, input)| {
+                matches!(&input.token_ids, ModelTokens::Device(token)
+                    if Arc::ptr_eq(&token.values, &first.values) && token.index == first.index + index)
+            }) => Some(first),
+            _ => None,
+        };
+        if batch
+            .iter()
+            .all(|input| matches!(input.token_ids, ModelTokens::Host(_)))
+        {
+            let ids = self.input_uploads.upload_iter(
+                batch.iter().flat_map(|input| {
+                    input.token_ids.host().unwrap()[input.kv.ready_len()..]
+                        .iter()
+                        .copied()
+                }),
+                exec,
+            )?;
+            kernels::embedding(
+                (&mut scratch.x).partition([1, 256]),
+                ids,
+                self.embedding.clone(),
+            )
+            .execute(exec)?;
+        } else if let Some(first) = contiguous_feedback {
+            // acquire retains the workspace lease on exec; this raw write covers
+            // exactly the rows subsequently read by the first layer on the same stream.
+            kernels::embedding_at(
+                scratch.x.device_pointer(),
+                first.values.clone(),
+                self.embedding.clone(),
+                first.index as i32,
+                0,
+                self.config.hidden_size as i32,
+                self.config.vocab_size as i32,
+            )
+            .grid((
+                batch.len() as u32,
+                self.config.hidden_size.div_ceil(256) as u32,
+                1,
+            ))
+            .execute(exec)?;
+        } else {
+            // Source addresses bypass typed kernel arguments, so retain their owners
+            // explicitly. Adjacent feedback usually shares one previous batch buffer.
+            let mut retained_source = None;
+            for input in batch.iter() {
+                if let ModelTokens::Device(token) = &input.token_ids {
+                    if retained_source.is_none_or(|previous| !Arc::ptr_eq(previous, &token.values))
+                    {
+                        exec.retain(token.values.clone())?;
+                        retained_source = Some(&token.values);
+                    }
+                }
+            }
+            // Upload one addressing table, including inline host IDs. No per-request
+            // uploads/launches and no extra GPU token-packing pass are required.
+            let sources = self.embedding_sources.upload_iter(
+                batch.iter().flat_map(|input| {
+                    (0..input.uncached_len()).flat_map(move |local| match &input.token_ids {
+                        ModelTokens::Host(tokens) => {
+                            [0, tokens[input.kv.ready_len() + local] as u64]
+                        }
+                        ModelTokens::Device(token) => [
+                            token.values.device_pointer().cu_deviceptr()
+                                + (token.index * std::mem::size_of::<i32>()) as u64,
+                            0,
+                        ],
+                    })
+                }),
+                exec,
+            )?;
+            kernels::embedding_gather(
+                (&mut scratch.x).partition([1, 256]),
+                sources,
+                self.embedding.clone(),
+                self.config.vocab_size as i32,
+            )
+            .execute(exec)?;
+        }
         // All layer accesses share exec's stream. A buffer is overwritten only after
         // its last consumer; no scratch allocation grows with the number of layers.
         for (index, layer) in self.layers.iter().enumerate() {
@@ -598,20 +709,10 @@ impl Qwen2Engine {
             blocks as i32,
         )
         .execute(exec)?;
-        let token = enqueue_readback(scratch.winner, &self.token_readbacks, exec)?;
-        let values = if read_logits {
-            Some(enqueue_readback(
-                scratch.logits,
-                &self.logit_readbacks,
-                exec,
-            )?)
-        } else {
-            None
-        };
-        // All work is enqueued; the caller still awaits GPU/D2H completion.
+        // These tensors are handed out only after the compute submission completes.
         Ok(StepOutput {
-            token,
-            logits: values,
+            token: scratch.winner,
+            logits: Some(scratch.logits),
             host_submit_seconds: submit_started.elapsed().as_secs_f64(),
         })
     }
@@ -834,28 +935,35 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
         Ok(())
     }
 
-    async fn next_tokens(
+    async fn forward(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> Vec<Result<u32, ModelError>> {
+    ) -> Vec<Result<NextToken, ModelError>> {
         let start = Instant::now();
-        let batch_size = batch.len();
         if batch.is_empty() {
             return Vec::new();
         }
         let mut outputs: Vec<_> = batch
             .iter()
-            .map(|input| self.validate_step_input(input).map(|()| 0))
+            .map(|input| self.validate_step_input(input).map(|()| NextToken::Host(0)))
             .collect();
+        let rows = batch
+            .iter()
+            .zip(&outputs)
+            .filter(|(_, output)| output.is_ok())
+            .map(|(input, _)| input.uncached_len())
+            .sum();
+        let prefill = batch.iter().zip(&outputs).any(|(input, output)| {
+            output.is_ok() && (input.kv.ready_len() == 0 || input.uncached_len() > 1)
+        });
         let result = if outputs.iter().any(Result::is_err) {
-            // Keep valid peers packed together, preserving their original output slots.
             let mut valid: Vec<_> = batch
                 .iter_mut()
                 .zip(&outputs)
                 .filter_map(|(input, result)| {
                     result.is_ok().then(|| ModelInput {
-                        token_ids: input.token_ids,
+                        token_ids: input.token_ids.clone(),
                         kv: &mut *input.kv,
                     })
                 })
@@ -863,18 +971,64 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             if valid.is_empty() {
                 return outputs;
             }
-            self.forward_batch(&mut valid, policy, false).await
+            Self::execute_append_batch(&mut valid, &policy, |batch, exec| {
+                // SAFETY: all layers and their resources belong to this submission.
+                unsafe { self.submit_device(batch, exec) }
+            })
+            .await
         } else {
-            self.forward_batch(batch, policy, false).await
+            Self::execute_append_batch(batch, &policy, |batch, exec| {
+                // SAFETY: all layers and their resources belong to this submission.
+                unsafe { self.submit_device(batch, exec) }
+            })
+            .await
         };
+        let host_submit_seconds = result
+            .as_ref()
+            .ok()
+            .map(|output| output.host_submit_seconds);
+        self.instruments.step(
+            prefill,
+            rows,
+            start.elapsed().as_secs_f64(),
+            host_submit_seconds,
+        );
+        tracing::debug!(target: "engine::qwen2", event = "step_completed",
+            phase = if prefill { "prefill" } else { "decode" }, input_tokens = rows,
+            batch_size = batch.len(), step_wall_seconds = start.elapsed().as_secs_f64(),
+            host_submit_seconds, success = result.is_ok());
         match result {
             Ok(result) => {
-                for (output, &token) in outputs
+                let device = Arc::new(result.token);
+                let source = device.clone();
+                let cache = self.token_readbacks.clone();
+                let copy_policy = self.readback_policy.clone();
+                let readback_duration = self.instruments.readback_duration.clone();
+                let host = async move {
+                    let start = Instant::now();
+                    let result: Result<Readback<i32>, ModelError> = async {
+                        let values = with_context(|exec| {
+                            // SAFETY: producer completed; exec retains both DMA owners.
+                            value(unsafe { enqueue_readback(source, &cache, exec) })
+                        })
+                        .schedule(&copy_policy)?
+                        .await??;
+                        Ok(values)
+                    }
+                    .await;
+                    let readback_wall_seconds = start.elapsed().as_secs_f64();
+                    readback_duration.record(readback_wall_seconds);
+                    tracing::debug!(target: "engine::qwen2", event = "readback_completed",
+                        readback_wall_seconds, success = result.is_ok());
+                    result
+                };
+                let tokens = DeviceToken::batch(device, host, self.config.vocab_size);
+                for (output, token) in outputs
                     .iter_mut()
                     .filter(|output| output.is_ok())
-                    .zip(result.token.as_slice())
+                    .zip(tokens)
                 {
-                    *output = self.checked_token(token);
+                    *output = Ok(NextToken::Device(token));
                 }
             }
             Err(error) => {
@@ -884,9 +1038,10 @@ impl CausalModel<NaiveKVPool> for Qwen2Engine {
             }
         }
         self.instruments
-            .batch(batch_size, start.elapsed().as_secs_f64());
-        tracing::debug!(target: "engine::qwen2", event = "batch_completed", batch_size,
-            batch_wall_seconds = start.elapsed().as_secs_f64(), failed = outputs.iter().filter(|v| v.is_err()).count());
+            .batch(batch.len(), start.elapsed().as_secs_f64());
+        tracing::debug!(target: "engine::qwen2", event = "batch_completed", batch_size = batch.len(),
+            batch_wall_seconds = start.elapsed().as_secs_f64(),
+            failed = outputs.iter().filter(|output| output.is_err()).count());
         outputs
     }
 
@@ -988,6 +1143,7 @@ mod tests {
                     .collect();
                 let workspaces: Arc<WorkspacePool> = Arc::default();
                 Ok(Qwen2Engine {
+                    readback_policy: Arc::new(SingleStream::new(exec.get_cuda_stream().device())?),
                     instruments: Instruments::new(workspaces.metrics().model_instance),
                     workspaces,
                     attention: GqaAttention {
@@ -1006,6 +1162,7 @@ mod tests {
                     config,
                     eos: vec![256],
                     input_uploads: Arc::default(),
+                    embedding_sources: Arc::default(),
                     token_readbacks: Default::default(),
                     logit_readbacks: Default::default(),
                 })
@@ -1232,7 +1389,10 @@ mod tests {
             let mut inputs: Vec<_> = histories
                 .iter()
                 .zip(&mut contexts)
-                .map(|(token_ids, kv)| ModelInput { token_ids, kv })
+                .map(|(token_ids, kv)| ModelInput {
+                    token_ids: token_ids.into(),
+                    kv,
+                })
                 .collect();
             // DebuggingRecorder snapshots drain counters; discard earlier forwards.
             let _ = step_count();
@@ -1274,15 +1434,15 @@ mod tests {
             .next_tokens(
                 &mut [
                     ModelInput {
-                        token_ids: &histories[0],
+                        token_ids: (&histories[0]).into(),
                         kv: &mut left[0],
                     },
                     ModelInput {
-                        token_ids: &[257],
+                        token_ids: (&[257]).into(),
                         kv: &mut invalid,
                     },
                     ModelInput {
-                        token_ids: &histories[2],
+                        token_ids: (&histories[2]).into(),
                         kv: &mut right[1],
                     },
                 ],
@@ -1437,6 +1597,223 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn embedding_gather_handles_multiple_buffers_inline_ids_and_masked_columns(
+    ) -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let uploads = Arc::new(UploadPool::<u64>::default());
+        let readbacks = ReadbackCache::default();
+        for width in [128, 896] {
+            let actual = with_context(|exec| {
+                value((|| -> Result<Readback<f32>, ModelError> {
+                    // SAFETY: uploads precede gather on exec, addressed sources
+                    // are retained, and the outer await completes the final D2H.
+                    unsafe {
+                        let a = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(vec![7i32, 9, -1, i32::MAX]))
+                                .execute(exec)?,
+                        );
+                        let b = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(vec![2i32, 4, 5]))
+                                .execute(exec)?,
+                        );
+                        let pa = a.device_pointer().cu_deviceptr();
+                        let pb = b.device_pointer().cu_deviceptr();
+                        let word = std::mem::size_of::<i32>() as u64;
+                        exec.retain(a)?;
+                        exec.retain(b)?;
+                        let sources = uploads.upload_iter(
+                            [
+                                pa + word,
+                                0,
+                                0,
+                                3,
+                                pb,
+                                0,
+                                pa,
+                                0,
+                                0,
+                                6,
+                                pb + 2 * word,
+                                0,
+                                pa + 2 * word,
+                                0,
+                                pa + 3 * word,
+                                0,
+                            ],
+                            exec,
+                        )?;
+                        let weights = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(
+                                (0..10 * width).map(|value| value as f32).collect(),
+                            ))
+                            .execute(exec)?
+                            .reshape(&[10, width])?,
+                        );
+                        let mut out = Tensor::<f32>::uninitialized(8 * width)
+                            .execute(exec)?
+                            .assume_init()
+                            .reshape(&[8, width])?;
+                        kernels::embedding_gather(
+                            (&mut out).partition([1, 256]),
+                            sources,
+                            weights,
+                            10,
+                        )
+                        .execute(exec)?;
+                        Ok(enqueue_readback(out, &readbacks, exec)?)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            // Negative/invalid feedback clamps only to prevent an unsafe GPU
+            // load; DeviceToken::read still reports invalid sampled IDs separately.
+            for (row, id) in [9, 3, 2, 7, 6, 5, 0, 9].into_iter().enumerate() {
+                for column in 0..width {
+                    assert_eq!(
+                        actual.as_slice()[row * width + column],
+                        (id * width + column) as f32
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gpu_feedback_matches_serial_with_reordering_and_new_prefill() -> Result<(), ModelError>
+    {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let model = tiny_model(&policy).await?;
+        let mut config = model.kv_pool_config(32)?;
+        config.max_rows = 3;
+        config.num_slots *= 3;
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let idle = pool.metrics();
+        let prompts = [vec![1, 2, 3], vec![9], vec![17, 18]];
+        let mut expected = Vec::new();
+        for prompt in &prompts {
+            let mut history = prompt.clone();
+            let mut kv = KVContext::new(pool.clone())?;
+            let mut tokens = Vec::new();
+            for _ in 0..3 {
+                let token = model
+                    .next_tokens(
+                        &mut [ModelInput {
+                            token_ids: (&history).into(),
+                            kv: &mut kv,
+                        }],
+                        policy.clone(),
+                    )
+                    .await
+                    .pop()
+                    .unwrap()?;
+                history.push(token);
+                tokens.push(token);
+            }
+            expected.push(tokens);
+        }
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let mut c = KVContext::new(pool.clone())?;
+        let first = model
+            .forward(
+                &mut [
+                    ModelInput {
+                        token_ids: (&prompts[0]).into(),
+                        kv: &mut a,
+                    },
+                    ModelInput {
+                        token_ids: (&prompts[1]).into(),
+                        kv: &mut b,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        let first: Vec<_> = first
+            .into_iter()
+            .map(|output| match output.unwrap() {
+                NextToken::Device(token) => token,
+                NextToken::Host(_) => panic!("Qwen must return GPU feedback"),
+            })
+            .collect();
+        let mut incompatible = first[0].clone();
+        incompatible.vocab_size += 1;
+        let rejected = model
+            .forward(
+                &mut [ModelInput {
+                    token_ids: ModelTokens::Device(incompatible),
+                    kv: &mut c,
+                }],
+                policy.clone(),
+            )
+            .await;
+        assert!(matches!(&rejected[0], Err(ModelError::InvalidInput(_))));
+        assert_eq!(c.ready_len(), 0);
+        // Launch without reading first's tokens on CPU. Reverse A/B and admit C.
+        let second = model
+            .forward(
+                &mut [
+                    ModelInput {
+                        token_ids: ModelTokens::Device(first[1].clone()),
+                        kv: &mut b,
+                    },
+                    ModelInput {
+                        token_ids: ModelTokens::Device(first[0].clone()),
+                        kv: &mut a,
+                    },
+                    ModelInput {
+                        token_ids: (&prompts[2]).into(),
+                        kv: &mut c,
+                    },
+                ],
+                policy.clone(),
+            )
+            .await;
+        assert_eq!(first[0].read().await?, expected[0][0]);
+        assert_eq!(first[1].read().await?, expected[1][0]);
+        let second: Vec<_> = second
+            .into_iter()
+            .map(|output| match output.unwrap() {
+                NextToken::Device(token) => token,
+                NextToken::Host(_) => panic!("Qwen must return GPU feedback"),
+            })
+            .collect();
+        let third = model
+            .forward(
+                &mut [
+                    ModelInput {
+                        token_ids: ModelTokens::Device(second[2].clone()),
+                        kv: &mut c,
+                    },
+                    ModelInput {
+                        token_ids: ModelTokens::Device(second[1].clone()),
+                        kv: &mut a,
+                    },
+                ],
+                policy,
+            )
+            .await;
+        for (token, expected) in second
+            .iter()
+            .zip([expected[1][1], expected[0][1], expected[2][0]])
+        {
+            assert_eq!(token.read().await?, expected);
+        }
+        for (token, expected) in third.into_iter().zip([expected[2][1], expected[0][2]]) {
+            assert_eq!(token?.read().await?, expected);
+        }
+        assert_eq!([a.ready_len(), b.ready_len(), c.ready_len()], [5, 2, 3]);
+        drop((a, b, c, first, second));
+        assert_eq!(pool.metrics(), idle);
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
+        Ok(())
+    }
+
     /// Real-checkpoint regression, explicitly enabled with local reference artifacts.
     #[tokio::test]
     #[ignore = "requires QWEN2_MODEL_DIR and QWEN2_REFERENCE_DIR; see engine README"]
@@ -1467,7 +1844,7 @@ mod tests {
         let invalid = model
             .next_tokens(
                 &mut [ModelInput {
-                    token_ids: &[],
+                    token_ids: (&[]).into(),
                     kv: &mut full,
                 }],
                 policy.clone(),
@@ -1499,7 +1876,7 @@ mod tests {
         let prefix_next = model
             .next_tokens(
                 &mut [ModelInput {
-                    token_ids: &tokens[..split],
+                    token_ids: (&tokens[..split]).into(),
                     kv: &mut chunked,
                 }],
                 policy.clone(),
@@ -1521,7 +1898,7 @@ mod tests {
             let token = model
                 .next_tokens(
                     &mut [ModelInput {
-                        token_ids: &history,
+                        token_ids: (&history).into(),
                         kv: &mut chunked,
                     }],
                     policy.clone(),
@@ -1548,11 +1925,11 @@ mod tests {
         let mut left = KVContext::new(concurrent_pool.clone())?;
         let mut right = KVContext::new(concurrent_pool.clone())?;
         let mut left_input = [ModelInput {
-            token_ids: &tokens,
+            token_ids: (&tokens).into(),
             kv: &mut left,
         }];
         let mut right_input = [ModelInput {
-            token_ids: &tokens[..split],
+            token_ids: (&tokens[..split]).into(),
             kv: &mut right,
         }];
         let (a, b) = tokio::join!(
@@ -1583,7 +1960,10 @@ mod tests {
             let mut inputs: Vec<_> = histories
                 .iter()
                 .zip(&mut contexts)
-                .map(|(token_ids, kv)| ModelInput { token_ids, kv })
+                .map(|(token_ids, kv)| ModelInput {
+                    token_ids: token_ids.into(),
+                    kv,
+                })
                 .collect();
             let output = model
                 .forward_batch(&mut inputs, policy.clone(), true)
@@ -1651,7 +2031,7 @@ mod tests {
         let expected_next = model
             .next_tokens(
                 &mut [ModelInput {
-                    token_ids: &continued,
+                    token_ids: (&continued).into(),
                     kv: &mut fresh,
                 }],
                 policy.clone(),

@@ -6,13 +6,28 @@ use tokenizers::Tokenizer;
 
 use crate::runner::kv_pool::{KVContext, KVPool};
 
-use super::ModelError;
+use super::{ModelError, ModelTokens, NextToken};
 
 pub struct ModelInput<'a, P: KVPool> {
-    /// History through this step's end; only token_ids[kv.ready_len()..] is computed.
-    /// Runner may pass a prefix ending inside an accepted prompt for chunked prefill.
-    pub token_ids: &'a [u32],
+    /// A host history prefix through this step's end, or one GPU-resident decode
+    /// token. Host inputs compute only [kv.ready_len()..]; device inputs append one.
+    pub token_ids: ModelTokens<'a>,
     pub kv: &'a mut KVContext<P>,
+}
+
+impl<P: KVPool> ModelInput<'_, P> {
+    /// Logical history end after this input is computed, independent of CPU readback.
+    pub fn sequence_len(&self) -> usize {
+        match &self.token_ids {
+            ModelTokens::Host(tokens) => tokens.len(),
+            ModelTokens::Device(_) => self.kv.ready_len() + 1,
+        }
+    }
+
+    /// Invalid host histories return zero; model validation reports the input error.
+    pub fn uncached_len(&self) -> usize {
+        self.sequence_len().saturating_sub(self.kv.ready_len())
+    }
 }
 
 pub trait CausalModel<P: KVPool>: Send + Sync {
@@ -34,7 +49,8 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
         let mut query_ranges = Vec::new();
         for input in batch {
             let start = packed_token_ids.len();
-            let suffix = &input.token_ids[input.kv.ready_len()..];
+            let suffix =
+                &input.token_ids.host().expect("validated host input")[input.kv.ready_len()..];
             packed_token_ids.extend(suffix.iter().map(|&id| id as i32));
             query_ranges.push(start..packed_token_ids.len());
         }
@@ -57,7 +73,7 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
                     let mut appends: Vec<_> = batch
                         .iter_mut()
                         .map(|input| {
-                            let count = input.token_ids.len() - input.kv.ready_len();
+                            let count = input.uncached_len();
                             (&mut *input.kv, count)
                         })
                         .collect();
@@ -74,15 +90,33 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
         }
     }
 
-    /// Compute one next token per input in order, including per-input validation/GPU errors.
-    /// Valid inputs in a packed forward must use one compatible KV pool.
-    /// Reject pending contexts, empty suffixes, invalid IDs, and exceeded capacity.
-    /// Success commits KV for the full input history before returning its next token.
+    /// Return one ordered token result after computation and successful KV commit.
+    /// Device results defer CPU reads; ready CPU results use NextToken::Host.
+    /// Validate pending contexts, input bounds/IDs, and compatible pool layout.
+    fn forward(
+        &self,
+        batch: &mut [ModelInput<'_, P>],
+        policy: Arc<dyn SchedulingPolicy>,
+    ) -> impl Future<Output = Vec<Result<NextToken, ModelError>>> + Send;
+
+    /// Convenience API: run forward, then await each token's CPU value.
     fn next_tokens(
         &self,
         batch: &mut [ModelInput<'_, P>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> impl Future<Output = Vec<Result<u32, ModelError>>> + Send;
+    ) -> impl Future<Output = Vec<Result<u32, ModelError>>> + Send {
+        async move {
+            let outputs = self.forward(batch, policy).await;
+            let mut values = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                values.push(match output {
+                    Ok(token) => token.read().await,
+                    Err(error) => Err(error),
+                });
+            }
+            values
+        }
+    }
 
     fn is_eos(&self, _token: u32) -> bool {
         false

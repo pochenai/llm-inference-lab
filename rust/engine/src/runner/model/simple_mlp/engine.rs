@@ -33,7 +33,7 @@ use super::{
 use crate::runner::kv_pool::{KVContext, NaiveKVPool, NaiveMappingPlan, NaiveReadView};
 use crate::runner::loader::{GenerationConfig, WeightLoader};
 use crate::runner::upload::UploadPool;
-use crate::{AttentionBackend, CausalModel, ModelError, ModelInput};
+use crate::{AttentionBackend, CausalModel, ModelError, ModelInput, NextToken};
 
 pub const INPUT_DIM: usize = 16;
 const TILE: usize = 4;
@@ -345,7 +345,13 @@ impl SimpleMLPEngine {
         policy: Arc<dyn SchedulingPolicy>,
     ) -> Result<f32, ModelError> {
         Ok(self
-            .forward_batch(&mut [ModelInput { token_ids, kv }], policy)
+            .forward_batch(
+                &mut [ModelInput {
+                    token_ids: token_ids.into(),
+                    kv,
+                }],
+                policy,
+            )
             .await?[0])
     }
 
@@ -439,7 +445,7 @@ impl SimpleMLPEngine {
                 let mut appends: Vec<_> = batch
                     .iter_mut()
                     .map(|input| {
-                        let count = input.token_ids.len() - input.kv.ready_len();
+                        let count = input.uncached_len();
                         (&mut *input.kv, count)
                     })
                     .collect();
@@ -640,7 +646,7 @@ impl SimpleMLPEngine {
         let mut appends: Vec<_> = batch
             .iter_mut()
             .map(|input| {
-                let count = input.token_ids.len() - input.kv.ready_len();
+                let count = input.uncached_len();
                 (&mut *input.kv, count)
             })
             .collect();
@@ -739,25 +745,25 @@ impl CausalModel<NaiveKVPool> for SimpleMLPEngine {
         Ok(())
     }
 
-    async fn next_tokens(
+    async fn forward(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> Vec<Result<u32, ModelError>> {
+    ) -> Vec<Result<NextToken, ModelError>> {
         let mut outputs: Vec<_> = batch
             .iter()
             .map(|input| {
                 let kv = &input.kv;
+                let tokens = input.token_ids.host()?;
                 if kv.is_pending()
-                    || input.token_ids.len() <= kv.ready_len()
-                    || input.token_ids.len() > kv.max_seq_len()
+                    || input.sequence_len() <= kv.ready_len()
+                    || input.sequence_len() > kv.max_seq_len()
                 {
                     return Err(ModelError::InvalidInput(
                         "expected an idle context with a nonempty suffix within capacity".into(),
                     ));
                 }
-                self.validate_input(&input.token_ids[kv.ready_len()..])
-                    .map(|()| 0)
+                self.validate_input(&tokens[kv.ready_len()..]).map(|()| 0)
             })
             .collect();
         let values = if outputs.iter().any(Result::is_err) {
@@ -767,7 +773,7 @@ impl CausalModel<NaiveKVPool> for SimpleMLPEngine {
                 .zip(&outputs)
                 .filter_map(|(input, result)| {
                     result.is_ok().then(|| ModelInput {
-                        token_ids: input.token_ids,
+                        token_ids: input.token_ids.clone(),
                         kv: &mut *input.kv,
                     })
                 })
@@ -793,6 +799,9 @@ impl CausalModel<NaiveKVPool> for SimpleMLPEngine {
             }
         }
         outputs
+            .into_iter()
+            .map(|output| output.map(NextToken::Host))
+            .collect()
     }
 }
 
@@ -955,11 +964,11 @@ mod tests {
             .next_tokens(
                 &mut [
                     ModelInput {
-                        token_ids: &[],
+                        token_ids: (&[]).into(),
                         kv: &mut empty,
                     },
                     ModelInput {
-                        token_ids: &[256],
+                        token_ids: (&[256]).into(),
                         kv: &mut invalid,
                     },
                 ],
@@ -972,19 +981,19 @@ mod tests {
             .next_tokens(
                 &mut [
                     ModelInput {
-                        token_ids: &[],
+                        token_ids: (&[]).into(),
                         kv: &mut empty,
                     },
                     ModelInput {
-                        token_ids: &[1, 2],
+                        token_ids: (&[1, 2]).into(),
                         kv: &mut first,
                     },
                     ModelInput {
-                        token_ids: &[256],
+                        token_ids: (&[256]).into(),
                         kv: &mut invalid,
                     },
                     ModelInput {
-                        token_ids: &[3, 4, 5],
+                        token_ids: (&[3, 4, 5]).into(),
                         kv: &mut second,
                     },
                 ],
@@ -1077,7 +1086,7 @@ mod tests {
                         .zip(&histories)
                         .map(|(kv, tokens)| ModelInput {
                             kv,
-                            token_ids: tokens,
+                            token_ids: (tokens).into(),
                         })
                         .collect::<Vec<_>>(),
                     policy.clone(),
@@ -1136,7 +1145,7 @@ mod tests {
                         .zip(&histories)
                         .map(|(kv, tokens)| ModelInput {
                             kv,
-                            token_ids: tokens,
+                            token_ids: (tokens).into(),
                         })
                         .collect::<Vec<_>>(),
                     policy.clone(),
@@ -1181,7 +1190,7 @@ mod tests {
                 .zip(&histories)
                 .map(|(kv, tokens)| ModelInput {
                     kv,
-                    token_ids: tokens,
+                    token_ids: (tokens).into(),
                 })
                 .collect();
             let outputs = model.forward_batch(&mut inputs, policy.clone()).await?;
@@ -1440,7 +1449,10 @@ mod tests {
         let mut inputs: Vec<_> = contexts
             .iter_mut()
             .zip(histories)
-            .map(|(kv, token_ids)| ModelInput { token_ids, kv })
+            .map(|(kv, token_ids)| ModelInput {
+                token_ids: token_ids.into(),
+                kv,
+            })
             .collect();
         let outputs = model.forward_batch(&mut inputs, policy.clone()).await?;
         let mut used_slots = std::collections::HashSet::new();
@@ -1560,17 +1572,17 @@ mod tests {
             let mut b = KVContext::new(pool.clone())?;
             let mut invalid = KVContext::new(pool.clone())?;
             let mut batch = vec![ModelInput {
-                token_ids: &[1, 2],
+                token_ids: (&[1, 2]).into(),
                 kv: &mut a,
             }];
             if include_invalid {
                 batch.push(ModelInput {
-                    token_ids: &[256],
+                    token_ids: (&[256]).into(),
                     kv: &mut invalid,
                 });
             }
             batch.push(ModelInput {
-                token_ids: &[8],
+                token_ids: (&[8]).into(),
                 kv: &mut b,
             });
             let outputs = model.next_tokens(&mut batch, policy.clone()).await;
@@ -1631,7 +1643,10 @@ mod tests {
         let mut batch: Vec<_> = contexts
             .iter_mut()
             .zip(histories)
-            .map(|(kv, token_ids)| ModelInput { token_ids, kv })
+            .map(|(kv, token_ids)| ModelInput {
+                token_ids: token_ids.into(),
+                kv,
+            })
             .collect();
         let outputs = model.next_tokens(&mut batch, policy).await;
         for (i, output) in outputs.into_iter().enumerate() {

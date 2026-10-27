@@ -136,7 +136,10 @@ async fn main() -> Result<()> {
             let mut inputs: Vec<_> = histories
                 .iter()
                 .zip(&mut contexts)
-                .map(|(ids, kv)| ModelInput { token_ids: ids, kv })
+                .map(|(ids, kv)| ModelInput {
+                    token_ids: ids.into(),
+                    kv,
+                })
                 .collect();
             let start = Instant::now();
             let outputs = model.next_tokens(&mut inputs, policy.clone()).await;
@@ -216,7 +219,7 @@ async fn main() -> Result<()> {
             model
                 .next_tokens(
                     &mut [ModelInput {
-                        token_ids: &prefix[..end],
+                        token_ids: (&prefix[..end]).into(),
                         kv: &mut context,
                     }],
                     policy.clone(),

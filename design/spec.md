@@ -290,13 +290,10 @@ token count and the tokenizer library's streaming decoder. No sequence handle or
 model/backend trait is added.
 
 ActiveRequest layout is compiler-selected (`repr(Rust)`), not a 64-byte ABI.
-An x86_64 release probe with Rust 1.97.1 measured 432 bytes/alignment 8; the decoder
-alone occupies 72 bytes, excluding its heap buffers. These are diagnostic values,
-not portable size assertions. Per-step fields are session token/KV state, counters,
-sampling/EOS and decoder; guard, rollback progress and errors are mainly cleanup
-state. One Runner owns these records, so padding them to prevent cross-thread false
-sharing is not currently justified. Keep the compact layout; consider a hot/cold
-split only if CPU profiling identifies this state as a cache-locality bottleneck.
+CPU generation state is grouped separately from KV so output processing can
+borrow token history/decoder while the next forward borrows the context. No
+portable byte-size assertion or fixed alignment is imposed. One Runner owns these
+records; consider a hot/cold split only if CPU profiling identifies a bottleneck.
 
 Session locks are acquired with try_lock_owned. Busy requests and close calls fail
 immediately when processed; there is no per-session waiting queue or lock-wakeup
@@ -355,8 +352,8 @@ output token; subsequent decode steps compute the last generated token's KV.
 Session continuation uses the same rule, including any previously generated
 uncached final token. No separate prefill cursor is needed: ready_len is the cursor.
 
-The existing next_tokens API also computes an unused LM head/readback on intermediate
-chunks. This is an initial implementation shortcut; split prefill/sampling execution
+The existing forward API still computes an unused LM head on intermediate chunks;
+Qwen's deferred token readback is never polled for those discarded predictions. This is an initial implementation shortcut; split prefill/sampling execution
 only if profiling justifies that extra contract. Chunk size bounds input rows, not
 attention latency: long cached histories can still make a chunk expensive. This
 does not implement preemption or adaptive fairness/SLO policy.
@@ -375,11 +372,218 @@ errors affect their own request. Shared kernel/stream/submission failures are
 copied into each participating request's result; no batch-error field or outer
 model-wide error result is added. Earlier completed execution groups stay saved.
 
+## GPU feedback and CPU result overlap
+
+`CausalModel::forward` returns after GPU computation and KV commit. Qwen returns
+`NextToken::Device(DeviceToken)`; models with ready CPU token results return
+`NextToken::Host`. Every model implements forward. The default next_tokens calls
+forward and reads its results; implementations do not call back into next_tokens. No request IDs enter the model API.
+
+A DeviceToken holds the GPU batch tensor/index plus a shared CPU readback future.
+Qwen uses a separate SingleStream for D2H, reuses pinned buffers, and retains both
+DMA owners on ExecutionContext. `DeviceToken::read()` starts/awaits the copy; one
+batch shares one copy even when individual requests read its tokens. Completion of
+the compute submission proves GPU feedback is usable; pinned memory is readable
+only after completion of its own D2H submission. CPU decoding never reads a pending
+buffer. Workspace leases survive both GPU-feedback consumers and the copy.
+
+For mixed or reordered embedding inputs, one cached u64 table describes each packed
+row as [GPU token address, inline host ID]. A zero address selects the inline ID;
+otherwise embedding_gather reads the selected device ID and directly writes that
+row's embedding. The whole batch uses one upload and one embedding launch, with
+all addressed owners retained on exec. Host-only and contiguous GPU-feedback
+batches retain their table-free single-launch paths. This is implemented separately
+from the submission-first proposal below.
+
+```text
+GPU step N -> await compute completion -> commit KV -> DeviceToken
+                                                      |       |
+                                          step N+1 GPU       D2H on copy stream
+                                                      |       |
+                                                      |   CPU history / EOS / text
+                                                      +-------+
+                                                        settle / next plan
+```
+
+Runner polls the next GPU forward before the previous CPU readback/processing,
+using disjoint KV and GenerationState borrows. It queues no second unfinished GPU
+forward: KV always commits after that forward completes. CPU may lag by one sampled
+token per request; ModelTokens::Device supplies that token without a dummy CPU ID
+or H2D round trip. Thus CPU history length can equal ready_len while GPU feedback
+is pending. Policy/admission account for this pending input separately from output
+budgets; only observed CPU tokens increment generated_tokens.
+
+EOS/readback/decode errors can be discovered while one extra forward is already
+submitted. Drain it before cleanup, discard its prediction, and never emit/count it.
+On successful EOS the extra KV corresponds to the accepted EOS token, so saved
+history may have ready_len == tokens.len(); session continuation remains valid.
+GPU failures invalidate changed/pending context state. Before the final output
+budget is consumed, await its CPU result without lookahead: no unreserved KV is
+allocated for a final sampled token. Cancellation releases active ownership while
+existing submission leases protect any resources still in flight.
+
+`RunnerBuilder::with_overlap(false)` selects the serial CPU-token path; Qwen's
+example exposes `--disable-overlap` for comparison. Default overlap is enabled for
+models that supply device feedback. This does not batch text output into 64/128-token
+chunks, add CUDA Graph replay, or enable BF16/quantization.
+
+## Proposed: submission-first overlap (not implemented)
+
+This proposal replaces the current join of GPU N and CPU N-1. CPU speed affects
+utilization, not correctness: the bounded pipeline applies backpressure when CPU
+processing is slower. No implementation or dependency migration is included here.
+
+### Submission boundary
+
+Add one cuda-async capability, reusing its existing shared DeviceOp and completion
+machinery. The following signatures are pseudocode, not available APIs:
+
+```rust
+trait DeviceOp {
+    /// Enqueue now; the operation may borrow host state only during this call.
+    /// Output and retained submission owners must outlive that borrow.
+    fn submit(self, policy: &Arc<dyn SchedulingPolicy>)
+        -> Result<Submitted<Self::Output>, DeviceError>
+        where Self::Output: Send + Sync + 'static;
+}
+
+impl<T: Send + Sync + 'static> Submitted<T> {
+    /// GPU dependency, not a CPU-readable T; consumer execution orders its stream.
+    fn dependency(&self) -> SharedDeviceOp<T>;
+    /// Observe successful completion of this submission's marker, then expose T.
+    async fn complete(self) -> Result<Arc<T>, DeviceError>;
+}
+```
+
+The completion marker is recorded immediately after this submission's commands,
+before any following forward is submitted. Waiting on it must not accidentally
+wait for later commands through a whole-stream synchronize. SharedDeviceOp already
+provides execute-once output ownership and cross-stream event ordering; reuse it
+rather than exposing an unfinished generic T or implementing an engine-side waiter.
+Retained owners/access leases remain attached to the submission through completion,
+including partial submission failures and cancellation. No early KV commit is used
+to work around a missing submission API.
+
+### Model contract
+
+Keep one implementation direction: forward is required; next_tokens is the default
+CPU convenience method. Proposed forward completion means **submission complete**,
+whereas the currently implemented forward means **GPU complete and KV committed**.
+
+```rust
+type Completion = Shared<BoxFuture<'static, Result<(), ModelError>>>;
+
+struct SubmittedForward {
+    outputs: Vec<Result<NextToken, ModelError>>,
+    completion: Completion,
+}
+
+struct DeviceToken {
+    values: SharedDeviceOp<Tensor<i32>>, // Ordered GPU dependency, not ready storage.
+    index: usize,                     // Row in the sampled GPU batch.
+    position: usize,                  // Absolute position of this sampled token.
+    host: HostTokens,                 // Shared event-ordered D2H future.
+    vocab_size: usize,
+}
+```
+
+The GPU-feedback forward path returns SubmittedForward after enqueueing work and
+releasing its temporary ModelInput/KV borrows, without waiting for GPU or D2H.
+A Host-result implementation may return already completed work; it must still use
+the framework's single completion/commit path rather than committing twice. DeviceToken::read
+still waits for its own D2H; the copy stream first waits for the producing GPU
+dependency. Position is CPU-known metadata, so scheduling never infers an unknown
+token's position from ready_len or reads its value prematurely. A device input's
+compute_end is position + 1; position must equal the reservation cursor before
+preparing that append, rejecting stale feedback.
+
+The default next_tokens performs forward -> framework completion/KV commit ->
+CPU token reads. Submission/compute failures remain per-request output errors; no
+public response error field is added. Request IDs remain outside the model API.
+
+### KV state
+
+Reuse allocated_len as the reservation cursor; do not introduce another sequence
+handle or submitted_len. At scheduling boundaries, successfully submitted work has
+already reserved its complete append. A failed submission invalidates its context.
+
+```rust
+struct KVContext<P: KVPool> {
+    // Existing pool/state ownership stays unchanged.
+    ready_len: usize,                    // Confirmed successful GPU progress.
+    allocated_len: usize,                // Physical positions already reserved.
+    pending: VecDeque<Range<usize>>,     // Ordered in-flight appends; at most two.
+    // Valid pending ranges partition [ready_len, allocated_len) without gaps.
+}
+
+impl<P: KVPool> KVContext<P> {
+    /// Internal ordered-submission path: reserve [allocated_len, allocated_len+n).
+    /// Caller must establish the previous append's GPU dependency before KV access.
+    fn prepare_queued_append(&mut self, n: usize, exec: &ExecutionContext);
+    /// Framework-only, after that batch's completion succeeded; pop the front.
+    /// Require front.end == compute_end, then advance ready_len to compute_end.
+    fn commit_append(&mut self, compute_end: usize);
+}
+```
+
+Keep the existing ordinary prepare_append API strict about an idle context. The
+queued path is internal to the ordered execution framework. Write views address
+only the newest reserved append; read views capture history through that append's
+end. GPU dependencies, rather than ready_len advancement, make earlier in-flight
+KV readable by later GPU work. CPU consumers/prefix publication use ready_len only.
+Capacity admission counts already allocated positions once and protects remaining
+future output growth. It must not treat pending physical slots as free capacity.
+
+Example for prompt [A,B], followed by sampled C and D:
+
+| Boundary | ready_len | allocated_len | pending | CPU history |
+| --- | ---: | ---: | --- | --- |
+| Submit F0([A,B]), get C dependency | 0 | 2 | [0..2] | [A,B] |
+| Submit F1(C), before settling F0 | 0 | 3 | [0..2, 2..3] | [A,B] |
+| Complete F0 and read C; F1 may still run | 2 | 3 | [2..3] | [A,B,C] |
+| Submit F2(D), before settling F1 | 2 | 4 | [2..3, 3..4] | [A,B,C] |
+
+Thus neither CPU history length nor allocated_len proves GPU completion.
+
+### Runner lifecycle
+
+```text
+ingest / admit -> plan from reserved progress and pending GPU-token positions
+    -> submit current forward, save its feedback and completion
+    -> complete previous forward, commit its KV, read/process its CPU output
+    -> next iteration; do not await current forward at this boundary
+```
+
+ScheduledRequest borrows last only through submission. An internal pending-batch
+record retains member identity/compute_end and submission ownership, not mutable
+ActiveRequest references. This allows the next plan to borrow the same requests.
+There is one retained previous batch; transiently current and previous are both
+unsettled. Always settle previous before submitting another batch, so slow CPU
+processing cannot grow an unbounded queue. Drain previous when no current work exists.
+
+The first implementation should use one ordered compute stream per Runner. Copy
+streams wait on producer markers; multiple compute streams would additionally need
+whole-forward dependencies, including prefill KV writes, not just token dependencies.
+GPU forwards remain sequential even though several are submitted ahead of execution.
+
+On EOS or CPU decode error, stop selecting that request. Drain its already submitted
+extra step, discard its prediction, then save/release state and emit Finished.
+Do not block unrelated requests while a finished member awaits draining. Pending
+predictions count against the output limit when deciding whether to submit another
+step; the final allowed token must not cause an unreserved KV append. Failed GPU
+work never advances ready_len and invalidates affected pending state; submission
+leases continue protecting physical rows/slots until safe reclamation.
+
+Implementation acceptance: gate GPU N completion on submission of N+1 to detect a
+hidden completion wait; verify FIFO commits and early read rejection; repeat
+cross-stream dependency, EOS/limit, failure, cancellation, dynamic-membership and
+serial-numerical-equivalence checks. These checks have not run for this proposal.
+
 # CausalModel batch state and APIs
 
 ```rust
 pub struct ModelInput<'a, P: KVPool> {
-    pub token_ids: &'a [u32], // History through compute_end; compute [kv.ready_len()..].
+    pub token_ids: ModelTokens<'a>, // Host history prefix or one GPU feedback token.
     pub kv: &'a mut KVContext<P>,
 }
 
@@ -398,7 +602,12 @@ pub trait CausalModel<P: KVPool>: Send + Sync {
         policy: &Arc<dyn SchedulingPolicy>,
         submit: impl FnOnce(&mut [ModelInput<'_, P>], &ExecutionContext) -> Result<T, ModelError> + Send)
         -> impl Future<Output = Result<T, ModelError>> + Send;
-    /// One ordered next-token result per validated input; no request/session IDs.
+    /// Complete computation and KV commit; CPU readback may remain pending.
+    /// Required implementation; return ready Host or deferred Device results.
+    fn forward(&self, batch: &mut [ModelInput<'_, P>],
+        policy: Arc<dyn SchedulingPolicy>)
+        -> impl Future<Output = Vec<Result<NextToken, ModelError>>> + Send;
+    /// Default convenience API: forward, then await CPU values in input order.
     fn next_tokens(&self, batch: &mut [ModelInput<'_, P>],
         policy: Arc<dyn SchedulingPolicy>)
         -> impl Future<Output = Vec<Result<u32, ModelError>>> + Send;
@@ -479,7 +688,7 @@ projection/cache-write/attention/FFN stage per attention layer inside the same e
 RunnerBuilder's model factory returns only the model. CausalModel owns and exposes
 its matching tokenizer through a borrowed accessor; Runner controls encoding and decoding. Runner owns
 request IDs, session history, sampling, and output-token budgets. It repeatedly calls
-CausalModel::next_tokens on unfinished inputs, appends each selected token, and removes
+CausalModel::forward on unfinished inputs, appends CPU-observed tokens, and removes
 EOS/length-limited/error items from later steps. Default max_new_tokens is 1.
 Runner uses tokenizer.decode_stream(true) directly. After each step it forwards
 Some(text) as Delta and continues on None. The tokenizer library owns buffering,

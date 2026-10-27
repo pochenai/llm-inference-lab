@@ -28,7 +28,7 @@ use engine::{
     },
     scheduler::Scheduler,
     types::SessionRequest,
-    CausalModel, ModelError, ModelInput,
+    CausalModel, ModelError, ModelInput, NextToken,
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -74,14 +74,14 @@ impl CausalModel<NaiveKVPool> for TimedModel {
         self.inner.validate_input(ids)
     }
 
-    async fn next_tokens(
+    async fn forward(
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool>],
         policy: Arc<dyn SchedulingPolicy>,
-    ) -> Vec<Result<u32, ModelError>> {
+    ) -> Vec<Result<NextToken, ModelError>> {
         let size = batch.len();
         let start = Instant::now();
-        let output = self.inner.next_tokens(batch, policy).await;
+        let output = CausalModel::forward(&self.inner, batch, policy).await;
         self.samples
             .lock()
             .unwrap()

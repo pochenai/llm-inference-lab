@@ -319,7 +319,8 @@ A turn enters decode after its first generated token; a one-token prompt remains
 prefill. Admission and result/KV settlement stay in Runner. Requests that do not fit wait
 until a later forward. Each prefill chunk completes all model layers and commits
 KV; only the final chunk appends/emits a generated token and consumes max_new_tokens.
-Intermediate chunks currently compute and discard next_tokens' LM-head prediction.
+Intermediate chunks compute and discard the LM-head prediction without starting
+Qwen's deferred D2H readback.
 Accepted CPU history stays intact; ModelInput borrows a prefix ending at the chunk
 boundary. Session continuation also computes any uncached last output token first.
 The token budget bounds packed scratch rows, not cached-history attention latency;
@@ -343,7 +344,33 @@ RMSNorm gathers each request's last packed row, then LM-head/argmax produce one
 token per request in a single D2H readback. Invalid inputs are filtered before
 submission; valid peers stay in one batch and results retain the original order.
 Append batches require one KV pool. SimpleMLP retains CUDA Graph replay; Qwen is
-eager. Shared model/KV interfaces are unchanged.
+eager. ModelInput now accepts ModelTokens::Host(history_prefix) or one
+ModelTokens::Device(token). `CausalModel::forward` commits GPU work/KV and returns
+NextToken::Device for Qwen; its shared readback future is independent of the GPU
+feedback handle. `next_tokens` still returns CPU u32 values for direct callers.
+
+Mixed/reordered inputs use one embedding_gather launch for the packed batch. Its
+cached u64 source table stores [GPU token address, inline host token ID] per row;
+address=0 selects the inline ID. Host suffixes need no separate ID upload on this
+path, and device IDs are read directly without an intermediate token gather.
+ExecutionContext retains every addressed source allocation through completion.
+This trades per-request launches for one 16-byte-per-row metadata upload. Host-only
+and contiguous device-only batches keep their existing single-launch fast paths
+without that table. The local [launch-count comparison](../profiling/qwen2/embedding-batch/RESULTS.md)
+records the measured scope and limits.
+
+Runner uses the GPU handle for the next decode and processes the previous CPU
+result concurrently. Readback uses a separate stream; text processing can overlap
+GPU execution without uploading the sampled ID again. EOS may cause one already
+submitted extra step: it drains, its prediction is discarded, and its KV covers
+only the accepted EOS input. Request EOF follows cleanup. The final max_new_tokens
+output is read without lookahead, preserving the original KV-capacity budget.
+No dummy token is appended to CPU history. Every model implements forward:
+SimpleMLP returns ready Host tokens, while Qwen returns deferred Device tokens.
+The trait's default next_tokens calls forward and waits for CPU values; models
+never implement forward by calling next_tokens. `RunnerBuilder::with_overlap(false)` or the
+Qwen example's `--disable-overlap` provides a serial baseline.
+
 Token/logit readbacks enqueue asynchronous D2H into reusable pinned buffers and become
 readable only after outer completion. Dropping an in-flight model step may require
 context release; retained GPU leases prevent premature storage reuse.
@@ -372,6 +399,7 @@ Qwen emits standard `metrics` instruments without extending `CausalModel`:
 | `qwen2_failed_steps_total` | Counter |
 | `qwen2_step_wall_duration_seconds`, `qwen2_host_submit_duration_seconds` | Histogram, labelled by phase |
 | `qwen2_batch_duration_seconds`, `qwen2_batch_size` | Histogram |
+| `qwen2_readback_wall_duration_seconds` | Histogram; independent token D2H submission through completion |
 | `qwen2_workspace_forward_bytes` | Histogram |
 | `qwen2_workspace_{cache_hits,cache_misses,allocations,checkout_failures,evictions}_total` | Counter |
 | `qwen2_workspace_*_bytes`, `qwen2_workspace_*_workspaces` | Gauge for current/peak ownership |
@@ -397,8 +425,12 @@ as elapsed wall time for an individual batch. Each completed packed forward adds
 one step and one duration observation, with input-token counts summed across its
 requests. Decode means every input adds one token to existing KV; a mixed batch
 is labelled prefill if any input has empty KV or a multi-token suffix.
-`step_wall_seconds` spans CPU preparation/submission, GPU/D2H completion and KV
-commit, excluding Scheduler work and the caller's later CPU output access.
+For Qwen's forward path, `step_wall_seconds` spans CPU preparation/submission,
+GPU compute completion and KV commit; D2H is measured separately by
+`qwen2_readback_wall_duration_seconds` and the `readback_completed` tracing event.
+The direct diagnostic logits path still includes its same-submission D2H.
+Scheduler request timing includes CPU observation/decoding and lookahead draining;
+overlapping phase durations must not be added to infer request wall time.
 `host_submit_seconds` is returned in the private
 `StepOutput` for that invocation: host wall time inside submit, including scratch,
 input uploads, JIT and CUDA calls, without awaiting GPU completion. It excludes

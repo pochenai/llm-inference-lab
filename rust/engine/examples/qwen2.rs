@@ -42,6 +42,9 @@ struct Args {
     /// Maximum uncached input tokens per Runner forward, shared by decode and prefill.
     #[arg(long, default_value = "512")]
     max_batch_tokens: NonZeroUsize,
+    /// Wait for CPU token processing before the next forward (serial baseline).
+    #[arg(long)]
+    disable_overlap: bool,
     /// Directory containing reference.json and logits.f32 for validation.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
         prompt,
         max_new_tokens,
         max_batch_tokens,
+        disable_overlap,
         reference_dir,
         trace_steps,
     } = Args::parse();
@@ -156,6 +160,7 @@ async fn main() -> Result<()> {
     let owned_pool = pool.clone();
     let runner = RunnerBuilder::default()
         .with_max_batch_tokens(max_batch_tokens)
+        .with_overlap(!disable_overlap)
         .with_model_factory(move || async move { Ok(model) })
         .with_pool_factory(move |_| async move { Ok(owned_pool) })
         .with_policy_factory(move || Ok(policy))

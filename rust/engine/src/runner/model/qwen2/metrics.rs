@@ -44,6 +44,7 @@ pub(super) struct Instruments {
     failed_steps: Counter,
     batch_duration: Histogram,
     batch_size: Histogram,
+    pub(super) readback_duration: Histogram,
 }
 
 struct PhaseInstruments {
@@ -72,7 +73,8 @@ impl Instruments {
             decode: PhaseInstruments::new(&instance, "decode"),
             failed_steps: metrics::counter!("qwen2_failed_steps_total", "model_instance" => instance.clone()),
             batch_duration: metrics::histogram!("qwen2_batch_duration_seconds", "model_instance" => instance.clone()),
-            batch_size: metrics::histogram!("qwen2_batch_size", "model_instance" => instance),
+            batch_size: metrics::histogram!("qwen2_batch_size", "model_instance" => instance.clone()),
+            readback_duration: metrics::histogram!("qwen2_readback_wall_duration_seconds", "model_instance" => instance),
         }
     }
 

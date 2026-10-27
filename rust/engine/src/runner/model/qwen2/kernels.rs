@@ -1,6 +1,6 @@
 pub(super) use ops::*;
 
-/// Shared metadata is a flat i32 tensor: three integers per packed token, followed
+/// Shared attention/position metadata is a flat i32 tensor: three integers per packed token, followed
 /// by one final packed-row index per request (not a position in its token history).
 /// Token records are [context_row, absolute_position, history_start]. RoPE uses the
 /// position; attention reads history_start..=absolute_position through
@@ -22,12 +22,15 @@ pub(super) use ops::*;
 /// for final RMSNorm and the LM head to predict A's and B's next tokens. All three
 /// input tokens undergo the full Transformer computation and populate per-layer KV;
 /// h_a is simply not needed by the LM head for this next-token generation step.
+/// The separate u64 embedding-source table is documented on embedding_gather.
 #[cutile::module]
 pub(super) mod ops {
     use cutile::core::*;
 
     /// Integers per packed token: context row, absolute position, history start.
     pub(in crate::runner::model::qwen2) const TOKEN_METADATA_WIDTH: i32 = 3;
+    /// Words per packed embedding row: GPU token address, inline host token ID.
+    pub(in crate::runner::model::qwen2) const EMBEDDING_SOURCE_WIDTH: i32 = 2;
 
     #[cutile::entry()]
     pub(super) fn embedding(
@@ -39,6 +42,99 @@ pub(super) mod ops {
         // Validated token IDs fit i32; reinterpret bits without a numeric conversion.
         let id: Tile<i32, { [1] }> = bitcast(ids.partition(shape![1]).load([pid.0]));
         let id: i32 = tile_to_scalar(id.reshape(shape![]));
+        out.store(w.partition(shape![1, 256]).load([id, pid.1]));
+    }
+
+    /// Embed a host suffix or selected GPU feedback row into its packed row range.
+    /// Continuous batching can change request order: previous [A, B] produced GPU
+    /// ids=[101, 202], but the current batch is [B, A]. For one token per request,
+    /// use (source_start=1, destination_start=0) and (0, 1), respectively:
+    /// out[0,:]=w[202,:] belongs to B; out[1,:]=w[101,:] belongs to A.
+    /// This writes embeddings directly into the current packed layout, matching
+    /// its attention metadata/KV contexts; it does not move previous hidden rows.
+    /// Clamp invalid feedback so CPU error reporting cannot race an out-of-bounds load.
+    #[cutile::entry()]
+    pub(super) unsafe fn embedding_at(
+        out: *mut f32,
+        ids: &Tensor<i32, { [-1] }>,
+        w: &Tensor<f32, { [-1, -1] }>,
+        source_start: i32,
+        destination_start: i32,
+        width: i32,
+        vocab_size: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let raw = ids.partition(shape![1]).load([source_start + pid.0]);
+        let zero: Tile<i32, { [1] }> = constant(0i32, shape![1]);
+        let last: Tile<i32, { [1] }> = (vocab_size - 1).broadcast(shape![1]);
+        let id: i32 = tile_to_scalar(min_tile(max_tile(raw, zero), last).reshape(shape![]));
+        let value = w
+            .partition(shape![1, 256])
+            .load([id, pid.1])
+            .reshape(shape![256]);
+        let columns: Tile<i32, { [256] }> = iota(shape![256]);
+        let columns = columns + (pid.1 * 256).broadcast(shape![256]);
+        let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(out);
+        let base = base.offset((destination_start + pid.0) * width);
+        let base: PointerTile<*mut f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut f32, { [256] }> = base.broadcast(shape![256]);
+        let destination: PointerTile<*mut f32, { [256] }> = base.offset_tile(columns);
+        let valid = lt_tile(columns, width.broadcast(shape![256]));
+        unsafe {
+            store_ptr_tko(
+                destination,
+                value,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid),
+                None,
+                Latency::<1>,
+            );
+        }
+    }
+
+    /// Embed mixed/reordered sources in one launch. Each packed row has u64
+    /// [address, inline_id]; address=0 selects inline_id, otherwise load a GPU i32.
+    /// Example: old GPU ids=[101(A),202(B)], current [B,A,C(prompt=[7,8])]:
+    /// sources=[&ids[1],0, &ids[0],0, 0,7, 0,8] -> out=[w[202],w[101],w[7],w[8]].
+    /// Caller retains every addressed GPU allocation through completion. Output
+    /// rows follow current query_ranges; no intermediate token-gather tensor is needed.
+    #[cutile::entry()]
+    pub(super) unsafe fn embedding_gather(
+        out: &mut Tensor<f32, { [1, 256] }>,
+        sources: &Tensor<u64, { [-1] }>,
+        w: &Tensor<f32, { [-1, -1] }>,
+        vocab_size: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let address = sources
+            .partition(shape![1])
+            .load([pid.0 * EMBEDDING_SOURCE_WIDTH]);
+        let inline_id = sources
+            .partition(shape![1])
+            .load([pid.0 * EMBEDDING_SOURCE_WIDTH + 1]);
+        let source: u64 = tile_to_scalar(address.reshape(shape![]));
+        // Inline host IDs are vocabulary-validated and fit in i32.
+        let mut raw: Tile<i32, { [1] }> = trunci(inline_id, overflow::NoUnsignedWrap);
+        if source != 0u64 {
+            let pointer: PointerTile<*mut i32, { [1] }> = int_to_ptr(address);
+            let (value, _token): (Tile<i32, { [1] }>, Token) = unsafe {
+                load_ptr_tko(
+                    pointer,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    None,
+                    None,
+                    Latency::<1>,
+                )
+            };
+            raw = value;
+        }
+        // Preserve embedding_at's protection while CPU validation runs concurrently.
+        let zero: Tile<i32, { [1] }> = constant(0i32, shape![1]);
+        let last: Tile<i32, { [1] }> = (vocab_size - 1).broadcast(shape![1]);
+        let id: i32 = tile_to_scalar(min_tile(max_tile(raw, zero), last).reshape(shape![]));
         out.store(w.partition(shape![1, 256]).load([id, pid.1]));
     }
 

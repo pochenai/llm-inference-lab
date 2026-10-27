@@ -41,7 +41,7 @@ impl BatchPolicy for MixedChunkPolicy {
         // decode only after producing its first real output token.
         let mut decode_budget = active
             .iter()
-            .filter(|request| request.generated_tokens > 0)
+            .filter(|request| request.is_decode())
             .count()
             .min(self.max_batch_tokens.get());
         let mut prefill_budget = self.max_batch_tokens.get() - decode_budget;
@@ -49,7 +49,7 @@ impl BatchPolicy for MixedChunkPolicy {
             .iter_mut()
             .filter_map(|request| {
                 let ready = request.state.kv.ready_len();
-                let count = if request.generated_tokens > 0 {
+                let count = if request.is_decode() {
                     // decoding
                     if decode_budget == 0 {
                         return None;
@@ -65,7 +65,7 @@ impl BatchPolicy for MixedChunkPolicy {
                     if prefill_budget == 0 {
                         return None;
                     }
-                    let count = (request.state.tokens.len() - ready).min(prefill_budget);
+                    let count = (request.sequence_len() - ready).min(prefill_budget);
                     prefill_budget -= count;
                     count
                 };

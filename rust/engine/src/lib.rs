@@ -4,4 +4,6 @@ pub mod runner;
 pub mod scheduler;
 pub mod types;
 
-pub use runner::model::{AttentionBackend, CausalModel, ModelError, ModelInput};
+pub use runner::model::{
+    AttentionBackend, CausalModel, DeviceToken, ModelError, ModelInput, ModelTokens, NextToken,
+};
