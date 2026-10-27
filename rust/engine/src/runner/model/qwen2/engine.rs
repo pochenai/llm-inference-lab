@@ -759,11 +759,14 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             {
                 let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
                 kernels::swiglu(
-                    (&mut scratch.activated).partition([1, 256]),
+                    (&mut scratch.activated).partition([pointwise_rows::<T>(rows, 256), 256]),
                     &scratch.gate,
                     &scratch.up,
                 )
-                .generics(vec![T::DTYPE.to_string()])
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    pointwise_rows::<T>(rows, 256).to_string(),
+                ])
                 .execute(exec)?;
             }
             self.linear(
@@ -860,9 +863,14 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
     ) -> Result<(), ModelError> {
         let width = self.config.hidden_size;
         let _range = crate::profiling::ScopedRange::new(c"qwen2.rms_norm");
+        let tile_rows = if gather {
+            1
+        } else {
+            pointwise_rows::<T>(x.shape()[0] as usize, width.next_power_of_two())
+        };
         let last_rows_offset = x.shape()[0] * kernels::TOKEN_METADATA_WIDTH;
         kernels::rms_norm(
-            out.partition([1, width.next_power_of_two()]),
+            out.partition([tile_rows, width.next_power_of_two()]),
             x,
             w,
             metadata,
@@ -874,6 +882,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             T::DTYPE.to_string(),
             width.next_power_of_two().to_string(),
             gather.to_string(),
+            tile_rows.to_string(),
         ])
         .execute(exec)?;
         Ok(())
@@ -887,9 +896,15 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.rope");
-        kernels::rope(out.partition([1, 64]), x, self.inv_freq.clone(), metadata)
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
+        let tile_rows = pointwise_rows::<T>(x.shape()[0] as usize, 64);
+        kernels::rope(
+            out.partition([tile_rows, 64]),
+            x,
+            self.inv_freq.clone(),
+            metadata,
+        )
+        .generics(vec![T::DTYPE.to_string(), tile_rows.to_string()])
+        .execute(exec)?;
         Ok(())
     }
 }
@@ -1362,6 +1377,16 @@ async fn weight<T: WeightElement>(
     Ok(w)
 }
 
+/// Amortize CTA scheduling and reuse weights for long packed pointwise work.
+/// Cap live tile elements for wider models; tiny suffixes and gathered rows stay scalar.
+fn pointwise_rows<T: DType>(rows: usize, columns: usize) -> usize {
+    if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 512 {
+        (4096 / columns).clamp(1, 8)
+    } else {
+        1
+    }
+}
+
 unsafe fn add<T: DType>(
     out: &mut Tensor<T>,
     x: &Tensor<T>,
@@ -1369,9 +1394,16 @@ unsafe fn add<T: DType>(
     exec: &ExecutionContext,
 ) -> Result<(), ModelError> {
     let _range = crate::profiling::ScopedRange::new(c"qwen2.residual_add");
-    kernels::add(out.partition([1, 256]), x, y)
-        .generics(vec![T::DTYPE.to_string()])
-        .execute(exec)?;
+    kernels::add(
+        out.partition([pointwise_rows::<T>(x.shape()[0] as usize, 256), 256]),
+        x,
+        y,
+    )
+    .generics(vec![
+        T::DTYPE.to_string(),
+        pointwise_rows::<T>(x.shape()[0] as usize, 256).to_string(),
+    ])
+    .execute(exec)?;
     Ok(())
 }
 
@@ -1808,6 +1840,7 @@ mod tests {
                     columns: 64,
                     reduction: 32,
                 },
+                LinearTile::for_shape::<cutile::core::bf16>(128, 4864),
                 LinearTile::for_shape::<cutile::core::bf16>(4096, 4864),
             ] {
                 for has_bias in [false, true] {
@@ -2890,6 +2923,123 @@ mod tests {
             context.commit_append()?;
             context.release();
             assert_eq!(pool.metrics(), initial);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bf16_pointwise_row_tiles_match_scalar_with_partial_rows() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        assert_eq!(pointwise_rows::<bf16>(511, 256), 1);
+        assert_eq!(pointwise_rows::<bf16>(512, 256), 8);
+        assert_eq!(pointwise_rows::<bf16>(512, 1024), 4);
+        assert_eq!(pointwise_rows::<bf16>(4096, 8192), 1);
+        assert_eq!(pointwise_rows::<f32>(4096, 256), 1);
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let cache = ReadbackCache::default();
+        let rows = 137;
+        let input: Arc<Vec<bf16>> = Arc::new(
+            (0..rows * 128)
+                .map(|i| bf16::from_f32(((i * 17 % 101) as f32 - 50.0) / 32.0))
+                .collect(),
+        );
+        let weights: Arc<Vec<bf16>> = Arc::new(
+            (0..128)
+                .map(|i| bf16::from_f32(0.5 + i as f32 / 128.0))
+                .collect(),
+        );
+        let frequencies: Arc<Vec<f32>> = Arc::new((0..32).map(|i| 1.0 / (i + 1) as f32).collect());
+        let metadata: Arc<Vec<i32>> = Arc::new(
+            (0..rows)
+                .flat_map(|i| [0, (i % 11 + 3) as i32, 0])
+                .collect(),
+        );
+        let mut scalar: Option<Vec<Vec<f32>>> = None;
+        for tile_rows in [1, 4, 8] {
+            let actual = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    // SAFETY: every readback follows its producer on exec; await before host access.
+                    unsafe {
+                        let x = api::copy_host_vec_to_device(&input)
+                            .execute(exec)?
+                            .reshape(&[rows, 128])?;
+                        let w = api::copy_host_vec_to_device(&weights).execute(exec)?;
+                        let freq = api::copy_host_vec_to_device(&frequencies).execute(exec)?;
+                        let metadata = api::copy_host_vec_to_device(&metadata).execute(exec)?;
+                        let mut outputs = Vec::new();
+                        for op in 0..4 {
+                            let mut out =
+                                api::full(bf16::from_f32(f32::NAN), &[rows, 128]).execute(exec)?;
+                            match op {
+                                0 => {
+                                    kernels::add((&mut out).partition([tile_rows, 256]), &x, &x)
+                                        .generics(vec!["bf16".into(), tile_rows.to_string()])
+                                        .execute(exec)?;
+                                }
+                                1 => {
+                                    kernels::rms_norm(
+                                        (&mut out).partition([tile_rows, 128]),
+                                        &x,
+                                        &w,
+                                        &metadata,
+                                        1e-6,
+                                        128,
+                                        0,
+                                    )
+                                    .generics(vec![
+                                        "bf16".into(),
+                                        "128".into(),
+                                        "false".into(),
+                                        tile_rows.to_string(),
+                                    ])
+                                    .execute(exec)?;
+                                }
+                                2 => {
+                                    kernels::swiglu((&mut out).partition([tile_rows, 256]), &x, &x)
+                                        .generics(vec!["bf16".into(), tile_rows.to_string()])
+                                        .execute(exec)?;
+                                }
+                                _ => {
+                                    kernels::rope(
+                                        (&mut out).partition([tile_rows, 64]),
+                                        &x,
+                                        &freq,
+                                        &metadata,
+                                    )
+                                    .generics(vec!["bf16".into(), tile_rows.to_string()])
+                                    .execute(exec)?;
+                                }
+                            }
+                            outputs.push(cache.enqueue(out, exec)?);
+                        }
+                        Ok(outputs)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            let values: Vec<Vec<f32>> = actual
+                .iter()
+                .map(|buffer| buffer.as_slice().iter().map(|v| v.to_f32()).collect())
+                .collect();
+            for output in &values {
+                assert!(
+                    output.iter().all(|v| v.is_finite()),
+                    "every valid output must be written"
+                );
+            }
+            if let Some(expected) = &scalar {
+                for (op, (actual, expected)) in values.iter().zip(expected).enumerate() {
+                    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= 0.001,
+                            "operator {op}, element {index}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            } else {
+                scalar = Some(values);
+            }
         }
         Ok(())
     }
