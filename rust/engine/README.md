@@ -699,3 +699,12 @@ The SGLang adapter offers --comparison-nvtx module hooks for profiling only; lea
 it off for native timing. It requires --disable-cuda-graph. An eager prefill capture
 uses --profile --profile-activities CUDA_PROFILER --profile-stage prefill under
 nsys --capture-range=cudaProfilerApi --capture-range-end=stop. Prewarm the same shape.
+
+
+Large BF16 linear matrices use a finite `LinearTile` bucket (at least 128 packed
+rows: 32x128, K-reduction 64). Smaller shapes and FP32 retain prior tiles, including
+decode/LM-head matrices. Linear rows are independent and may cross request boundaries;
+attention routing still checks each context separately. Masked K tails use ceiling
+iteration. This isolated blocking change reduces 4K prefill by about another 32-33%
+after attention MMA; the [tuning report](../profiling/qwen2/bf16-eager-tuning/RESULTS.md)
+retains the full short/long B1/2/4 matrix, candidate screens and precision checks.

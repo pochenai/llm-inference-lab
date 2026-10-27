@@ -76,6 +76,37 @@ const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
 
+/// Finite shape buckets keep JIT specializations bounded and preserve small/FP32 tiles.
+#[derive(Clone, Copy, Debug)]
+struct LinearTile {
+    rows: usize,
+    columns: usize,
+    reduction: usize,
+}
+
+impl LinearTile {
+    fn for_shape<T: DType>(rows: usize) -> Self {
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 128 {
+            Self {
+                rows: 32,
+                columns: 128,
+                reduction: 64,
+            }
+        } else {
+            let tile = if rows >= LINEAR_PREFILL_TILE[0] {
+                LINEAR_PREFILL_TILE
+            } else {
+                LINEAR_DECODE_TILE
+            };
+            Self {
+                rows: tile[0],
+                columns: tile[1],
+                reduction: 32,
+            }
+        }
+    }
+}
+
 type Weight<T> = Arc<Tensor<T>>;
 
 /// One invocation's outputs: GPU readbacks before outer completion, CPU values after it.
@@ -793,20 +824,17 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         let has_bias = bias.is_some();
         // Bias-free specializations never read this existing rank-one weight.
         let bias = bias.unwrap_or_else(|| self.norm.clone());
-        // Reuse weights across packed token rows; keep small tiles for decode.
-        let tile = if x.shape()[0] as usize >= LINEAR_PREFILL_TILE[0] {
-            LINEAR_PREFILL_TILE
-        } else {
-            LINEAR_DECODE_TILE
-        };
-        kernels::linear(out.partition(tile), x, w, bias)
+        // Independent packed rows can share a tile even across request boundaries.
+        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize);
+        kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
             .generics(vec![
                 T::DTYPE.to_string(),
                 O::DTYPE.to_string(),
                 k.to_string(),
                 has_bias.to_string(),
-                tile[0].to_string(),
-                tile[1].to_string(),
+                tile.rows.to_string(),
+                tile.columns.to_string(),
+                tile.reduction.to_string(),
             ])
             .execute(exec)?;
         Ok(())
@@ -1740,7 +1768,7 @@ mod tests {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = cuda_async::device_context::global_policy(0)?;
         let cache = ReadbackCache::default();
-        // Exercise both dispatch tiles, including partial input rows and output columns.
+        // Cover all buckets with partial M/N/K, including K smaller than the reduction tile.
         for (rows, width) in [(3, 32), (35, 64), (33, 96)] {
             let input: Arc<Vec<f32>> = Arc::new(
                 (0..rows * width)
@@ -1753,7 +1781,23 @@ mod tests {
                     .collect(),
             );
             let biases: Arc<Vec<f32>> = Arc::new((0..96).map(|i| i as f32 / 128.0).collect());
-            for tile in [LINEAR_DECODE_TILE, LINEAR_PREFILL_TILE] {
+            for tile in [
+                LinearTile {
+                    rows: 4,
+                    columns: 32,
+                    reduction: 32,
+                },
+                LinearTile {
+                    rows: 16,
+                    columns: 64,
+                    reduction: 32,
+                },
+                LinearTile {
+                    rows: 32,
+                    columns: 128,
+                    reduction: 64,
+                },
+            ] {
                 for has_bias in [false, true] {
                     let actual = with_context(|exec| {
                         value((|| -> Result<_, ModelError> {
@@ -1771,7 +1815,7 @@ mod tests {
                                         .execute(exec)?
                                         .assume_init()
                                         .reshape(&[rows, 96])?
-                                        .partition(tile),
+                                        .partition([tile.rows, tile.columns]),
                                     x,
                                     w,
                                     bias,
@@ -1781,8 +1825,9 @@ mod tests {
                                     "f32".into(),
                                     width.to_string(),
                                     has_bias.to_string(),
-                                    tile[0].to_string(),
-                                    tile[1].to_string(),
+                                    tile.rows.to_string(),
+                                    tile.columns.to_string(),
+                                    tile.reduction.to_string(),
                                 ])
                                 .map(|(out, ..)| out)
                                 .unpartition()

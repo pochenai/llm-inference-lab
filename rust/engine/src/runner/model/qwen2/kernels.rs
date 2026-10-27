@@ -150,6 +150,7 @@ pub(super) mod ops {
         const HAS_BIAS: bool,
         const BM: i32,
         const BN: i32,
+        const BK: i32,
     >(
         out: &mut Tensor<O, { [BM, BN] }>,
         x: &Tensor<T, { [-1, K] }>,
@@ -157,10 +158,10 @@ pub(super) mod ops {
         bias: &Tensor<T, { [-1] }>,
     ) {
         let pid = get_tile_block_id();
-        let px = x.partition(shape![BM, 32]);
-        let pw = w.partition(shape![BN, 32]);
+        let px = x.partition(shape![BM, BK]);
+        let pw = w.partition(shape![BN, BK]);
         let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
-        for i in 0i32..(K / 32) {
+        for i in 0i32..((K + BK - 1) / BK) {
             acc = mma(px.load([pid.0, i]), pw.load([pid.1, i]).transpose(), acc);
         }
         if HAS_BIAS {
