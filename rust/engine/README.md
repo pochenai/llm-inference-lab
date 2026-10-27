@@ -715,3 +715,34 @@ projections and smaller matrices keep the earlier tiles. Three-process B1/2/4
 CPU output-coverage tests and a >2048-token Transformers BF16 SDPA reference pass.
 Benchmark `--input-pattern ramp` complements the default repeated-token baseline;
 comparison runs assert matching input-pattern checksums for both engines.
+
+### Matched BF16 eager 4K prefill
+
+On this RTX 5060 Ti 8 GiB, optimized Rust now reaches the SGLang eager baseline.
+Both engines use fresh KV, two warmups, three measured cohorts and three independent
+processes per shape, with 64 fixed outputs and GPU feedback. CUDA Graph is disabled.
+Values below are prefill milliseconds (median of process means):
+
+| Input IDs | Batch | Rust | SGLang |
+| --- | ---: | ---: | ---: |
+| repeated | 1 | 92.36 | 94.67 |
+| repeated | 2 | 182.32 | 184.42 |
+| repeated | 4 | 366.40 | 369.92 |
+| ramp | 1 | 92.51 | 94.54 |
+| ramp | 2 | 182.76 | 184.31 |
+| ramp | 4 | 367.66 | 369.89 |
+
+Additional finite buckets pack GQA heads into attention MMA rows, cap bulk pointwise
+row tiles by column width, and fuse the up projection/SwiGLU for large BF16 inputs.
+Small/FP32 operators retain their previous paths; the shared projection helper
+keeps bias and gated epilogues on the same GEMM math. No model/KV interface changes
+or extra global scratch are required. Fusion preserves BF16 intermediate rounding
+and removes temporary up traffic; the fallback workspace remains reserved.
+
+The [experiment summary](../profiling/qwen2/bf16-eager-tuning/SUMMARY.md) records
+all six independent steps, native samples, Nsight attribution and correctness checks.
+This measures static-model prefill, not serving throughput. Native logits are FP32;
+HF BF16 logits can tie after rounding, so strict greedy IDs may differ on ambiguous
+samples even with unchanged logits before/after fusion. The retained tie case is
+reported alongside passing long/exact-4K references; checks are not relaxed.
+Decode and Qwen CUDA Graph remain follow-up work.

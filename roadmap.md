@@ -83,13 +83,15 @@ A separate Nsight capture confirms 64 Rust forwards followed by one final 4-byte
 D2H, with no per-step readback. Profile BF16 long prefill next to distinguish
 attention from linear cost before selecting kernel changes.
 
-Follow-up profiling identifies scalar attention as 85.8% of B4/4K kernel time.
-Multi-query BF16 MMA prefill attention is now implemented with per-context size
-routing; three-process 4K measurements improve about 5.9x at B1/2/4, with a remaining
-roughly 2x eager gap. Linear configuration is unchanged in this first isolated step.
-See the [eager tuning report](rust/profiling/qwen2/bf16-eager-tuning/RESULTS.md).
-
-
+Follow-up release/Nsight work closes the BF16 eager 4K prefill gap: repeated-token
+B1/B2/B4 medians are 92.36/182.32/366.40 ms versus SGLang 94.68/184.42/369.93 ms.
+A second three-process matrix with varied ramp IDs also reaches parity. The isolated
+changes are attention MMA, finite linear M/N buckets, GQA reuse, bounded pointwise
+row tiles and up/SwiGLU fusion; small/FP32 paths and model/KV APIs are retained.
+See the [experiment summary](rust/profiling/qwen2/bf16-eager-tuning/SUMMARY.md) for
+protocol, raw artifacts, validation, allocator scopes and the retained BF16 argmax-tie
+case. This establishes static-model prefill parity on this GPU, not serving or
+quality equivalence. Decode and Qwen CUDA Graph are the next optimization target.
 
 ### Next sequence and comparison protocol
 
@@ -99,9 +101,9 @@ See the [eager tuning report](rust/profiling/qwen2/bf16-eager-tuning/RESULTS.md)
    /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --dtype f32 --profile.
    Native timing determines speedup; separate captures validate ordering and overlap.
    Retain the serial mode and evaluate mixed arrivals/chunk budgets separately.
-2. Next: profile BF16 long prefill to locate the measured gap in attention/linear.
-   Qwen CUDA Graph remains a separate decode task; retain the eager baseline and
-   ownership/completion contracts, and measure graph off/on independently.
+2. Completed: profile and optimize BF16 long prefill against SGLang eager at B1/2/4.
+   Next: profile decode and add the Qwen CUDA Graph option; retain the eager baseline
+   and ownership/completion contracts, and measure graph off/on independently.
 3. Implemented: native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
    numerical reference; validate BF16 tolerances and accumulation rather than
    requiring every generated token to match FP32 bit-for-bit.
@@ -537,7 +539,9 @@ BF16 completion does not satisfy the quantization items below.
   At batch 4 / 4096 input tokens, scratch is about 638 MiB vs 1274 MiB in FP32.
   See the local [BF16 validation report](rust/profiling/qwen2/bf16/RESULTS.md) for
   errors, memory and short latency samples; held-out generation quality remains unmeasured.
-- [ ] Compare matched BF16/eager and BF16/graph settings with SGLang before claiming parity.
+- [x] Compare matched BF16 eager 4K prefill with SGLang at B1/2/4, repeated and varied
+  token inputs, three independent processes; parity is specific to this static setup.
+- [ ] Add Qwen Graph and compare matched BF16 decode eager/graph settings with SGLang.
 - [ ] Quantize/dequantize a small linear layer or KV tensor; compare at least two scale granularities with independently computed reference values.
 - [ ] Integrate one path into Qwen and compare quality, storage/traffic, workspace and steady-state latency for at least two shapes.
 - [ ] State which operations remain floating point and where extra conversion occurs; reuse cache/graph tests for the selected path.

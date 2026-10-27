@@ -63,7 +63,10 @@ cohorts at batch 1/2/4 and input 32/4096; native BF16 is now supported and Qwen 
 The [BF16 static SGLang comparison](rust/profiling/qwen2/sglang-comparison/RESULTS.md)
 uses GPU-resident feedback and separate eager/Graph modes; its model-level timings
 do not measure serving overlap. Reproduce it with
-[the matrix driver](rust/engine/benches/qwen2_sglang_compare.py).
+[the matrix driver](rust/engine/benches/qwen2_sglang_compare.py). The follow-up
+[eager prefill summary](rust/profiling/qwen2/bf16-eager-tuning/SUMMARY.md) reaches
+SGLang parity on this GPU for 4K input at batch 1/2/4, with both repeated and varied
+IDs; decode/CUDA Graph remain next. This is a static-model result, not serving throughput.
 Radix caching and quantization follow.
 
 ## Future plans
