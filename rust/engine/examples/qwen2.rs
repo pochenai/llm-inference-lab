@@ -151,9 +151,12 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
             max_error < if size_of::<T>() == 2 { 0.5 } else { 0.001 },
             "logit max error too large: {max_error}"
         );
+        let expected_token = reference["generated_ids"][0].as_u64().unwrap() as u32;
         ensure!(
-            next == reference["generated_ids"][0].as_u64().unwrap() as u32,
-            "first token differs"
+            next == expected_token,
+            "first token differs: actual={next} {:?}, expected={expected_token} {:?}; reference logits {:?}, {:?}",
+            actual.get(next as usize), actual.get(expected_token as usize),
+            expected.get(next as usize), expected.get(expected_token as usize),
         );
         comparison = serde_json::json!({"max_abs_logit_error":max_error,"rms_logit_error":rms,"first_token":next,"prefill_with_jit_seconds":start.elapsed().as_secs_f64()});
         kv.release();

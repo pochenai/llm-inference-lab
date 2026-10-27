@@ -138,6 +138,23 @@ pub(super) mod ops {
         out.store(w.partition(shape![1, 256]).load([id, pid.1]));
     }
 
+    /// Shared projection math; epilogues retain their own activation-dtype rounding.
+    /// Callers reshape concrete results to their symbolic tile shape for cuTile 0.4.
+    fn project_tile<T: ElementType, const K: i32, const BM: i32, const BN: i32, const BK: i32>(
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        row: i32,
+        column: i32,
+    ) -> Tile<f32, { [BM, BN] }> {
+        let px = x.partition(shape![BM, BK]);
+        let pw = w.partition(shape![BN, BK]);
+        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        for i in 0i32..((K + BK - 1) / BK) {
+            acc = mma(px.load([row, i]), pw.load([column, i]).transpose(), acc);
+        }
+        acc
+    }
+
     /// Storage uses T; MMA accumulates in FP32 and casts once to output O.
     /// PyTorch checkpoint weights are [out,in]; transpose each tile in registers.
     /// Optional projection bias is fused into the epilogue before the single store.
@@ -158,18 +175,44 @@ pub(super) mod ops {
         bias: &Tensor<T, { [-1] }>,
     ) {
         let pid = get_tile_block_id();
-        let px = x.partition(shape![BM, BK]);
-        let pw = w.partition(shape![BN, BK]);
-        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
-        for i in 0i32..((K + BK - 1) / BK) {
-            acc = mma(px.load([pid.0, i]), pw.load([pid.1, i]).transpose(), acc);
-        }
+        let mut acc: Tile<f32, { [BM, BN] }> =
+            project_tile::<T, K, BM, BN, BK>(x, w, pid.0, pid.1).reshape(shape![BM, BN]);
         if HAS_BIAS {
             let bias_tile: Tile<f32, { [BN] }> =
                 convert_tile(bias.partition(shape![BN]).load([pid.1]));
             acc = acc + bias_tile.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
         }
         let result: Tile<O, { [BM, BN] }> = convert_tile(acc);
+        out.store(result);
+    }
+
+    /// Fuse the up projection with SiLU(gate) * up, avoiding a global up temporary.
+    /// Round both up and SiLU to T before multiplying, matching the unfused kernels.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn linear_swiglu<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+    >(
+        out: &mut Tensor<T, { [BM, BN] }>,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        gate: &Tensor<T, { [-1, -1] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let acc: Tile<f32, { [BM, BN] }> =
+            project_tile::<T, K, BM, BN, BK>(x, w, pid.0, pid.1).reshape(shape![BM, BN]);
+        let up: Tile<T, { [BM, BN] }> = convert_tile(acc);
+        let up: Tile<f32, { [BM, BN] }> = convert_tile(up);
+        let g: Tile<f32, { [BM, BN] }> =
+            convert_tile(gate.partition(shape![BM, BN]).load([pid.0, pid.1]));
+        let one: Tile<f32, { [BM, BN] }> = constant(1.0f32, shape![BM, BN]);
+        let zero: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        let activated: Tile<T, { [BM, BN] }> = convert_tile(true_div(g, one + exp(zero - g)));
+        let activated: Tile<f32, { [BM, BN] }> = convert_tile(activated);
+        let result: Tile<T, { [BM, BN] }> = convert_tile(activated * up);
         out.store(result);
     }
 
@@ -584,21 +627,21 @@ pub(super) mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn swiglu<T: ElementType, const ROWS: i32>(
-        out: &mut Tensor<T, { [ROWS, 256] }>,
+    pub(super) fn swiglu<T: ElementType>(
+        out: &mut Tensor<T, { [1, 256] }>,
         gate: &Tensor<T, { [-1, -1] }>,
         up: &Tensor<T, { [-1, -1] }>,
     ) {
         let pid = get_tile_block_id();
-        let g: Tile<f32, { [ROWS, 256] }> =
-            convert_tile(gate.partition(shape![ROWS, 256]).load([pid.0, pid.1]));
-        let one: Tile<f32, { [ROWS, 256] }> = constant(1.0f32, shape![ROWS, 256]);
-        let zero: Tile<f32, { [ROWS, 256] }> = constant(0.0f32, shape![ROWS, 256]);
-        let activated: Tile<T, { [ROWS, 256] }> = convert_tile(true_div(g, one + exp(zero - g)));
-        let activated: Tile<f32, { [ROWS, 256] }> = convert_tile(activated);
-        let up: Tile<f32, { [ROWS, 256] }> =
-            convert_tile(up.partition(shape![ROWS, 256]).load([pid.0, pid.1]));
-        let result: Tile<T, { [ROWS, 256] }> = convert_tile(activated * up);
+        let g: Tile<f32, { [1, 256] }> =
+            convert_tile(gate.partition(shape![1, 256]).load([pid.0, pid.1]));
+        let one: Tile<f32, { [1, 256] }> = constant(1.0f32, shape![1, 256]);
+        let zero: Tile<f32, { [1, 256] }> = constant(0.0f32, shape![1, 256]);
+        let activated: Tile<T, { [1, 256] }> = convert_tile(true_div(g, one + exp(zero - g)));
+        let activated: Tile<f32, { [1, 256] }> = convert_tile(activated);
+        let up: Tile<f32, { [1, 256] }> =
+            convert_tile(up.partition(shape![1, 256]).load([pid.0, pid.1]));
+        let result: Tile<T, { [1, 256] }> = convert_tile(activated * up);
         out.store(result);
     }
 

@@ -70,6 +70,8 @@ use std::{ffi::CStr, ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
 const KV_TOKENS_PER_TILE: i32 = 32;
+/// Retain small-input parallelism before enabling bulk pointwise/fused epilogues.
+const MIN_BULK_TOKEN_ROWS: usize = 512;
 // Keep narrow/decode work on the scalar path; tiled prefill reuses K/V across queries.
 const ATTENTION_PREFILL_TILE: [usize; 2] = [32, 64];
 const MIN_TILED_PREFILL_QUERIES: usize = 64;
@@ -748,25 +750,30 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 None,
                 exec,
             )?;
-            self.linear(
-                c"qwen2.linear.up",
-                &mut scratch.up,
-                &scratch.norm,
-                layer.up.clone(),
-                None,
-                exec,
-            )?;
-            {
+            if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
+                self.linear_swiglu(
+                    &mut scratch.activated,
+                    &scratch.norm,
+                    layer.up.clone(),
+                    &scratch.gate,
+                    exec,
+                )?;
+            } else {
+                self.linear(
+                    c"qwen2.linear.up",
+                    &mut scratch.up,
+                    &scratch.norm,
+                    layer.up.clone(),
+                    None,
+                    exec,
+                )?;
                 let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
                 kernels::swiglu(
-                    (&mut scratch.activated).partition([pointwise_rows::<T>(rows, 256), 256]),
+                    (&mut scratch.activated).partition([1, 256]),
                     &scratch.gate,
                     &scratch.up,
                 )
-                .generics(vec![
-                    T::DTYPE.to_string(),
-                    pointwise_rows::<T>(rows, 256).to_string(),
-                ])
+                .generics(vec![T::DTYPE.to_string()])
                 .execute(exec)?;
             }
             self.linear(
@@ -844,6 +851,29 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 O::DTYPE.to_string(),
                 k.to_string(),
                 has_bias.to_string(),
+                tile.rows.to_string(),
+                tile.columns.to_string(),
+                tile.reduction.to_string(),
+            ])
+            .execute(exec)?;
+        Ok(())
+    }
+
+    /// Write the FFN activation directly; small and FP32 inputs keep separate operators.
+    unsafe fn linear_swiglu(
+        &self,
+        out: &mut Tensor<T>,
+        x: &Tensor<T>,
+        w: Weight<T>,
+        gate: &Tensor<T>,
+        exec: &ExecutionContext,
+    ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.up_swiglu");
+        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        kernels::linear_swiglu(out.partition([tile.rows, tile.columns]), x, w, gate)
+            .generics(vec![
+                T::DTYPE.to_string(),
+                x.shape()[1].to_string(),
                 tile.rows.to_string(),
                 tile.columns.to_string(),
                 tile.reduction.to_string(),
@@ -1380,7 +1410,7 @@ async fn weight<T: WeightElement>(
 /// Amortize CTA scheduling and reuse weights for long packed pointwise work.
 /// Cap live tile elements for wider models; tiny suffixes and gathered rows stay scalar.
 fn pointwise_rows<T: DType>(rows: usize, columns: usize) -> usize {
-    if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 512 {
+    if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
         (4096 / columns).clamp(1, 8)
     } else {
         1
@@ -2745,15 +2775,15 @@ mod tests {
         let policy = cuda_async::device_context::global_policy(0)?;
         let mut model = tiny_model_with_dtype::<bf16>(&policy).await?;
         let mut reference = tiny_model(&policy).await?;
-        model.config.max_position_embeddings = 256;
-        reference.config.max_position_embeddings = 256;
-        let mut config = model.kv_pool_config(256)?;
+        model.config.max_position_embeddings = 512;
+        reference.config.max_position_embeddings = 512;
+        let mut config = model.kv_pool_config(512)?;
         config.max_rows = 6;
         config.num_slots *= 6;
         let pool = NaiveKVPool::<bf16>::new(config, &policy).await?;
         let reference_pool = NaiveKVPool::<f32>::new(config, &policy).await?;
         let initial = pool.metrics();
-        let histories: Vec<Vec<u32>> = [99, 135]
+        let histories: Vec<Vec<u32>> = [259, 287]
             .into_iter()
             .enumerate()
             .map(|(r, n)| (0..n).map(|i| ((i * 13 + r * 17) % 251) as u32).collect())
@@ -2967,7 +2997,7 @@ mod tests {
                         let freq = api::copy_host_vec_to_device(&frequencies).execute(exec)?;
                         let metadata = api::copy_host_vec_to_device(&metadata).execute(exec)?;
                         let mut outputs = Vec::new();
-                        for op in 0..4 {
+                        for op in 0..3 {
                             let mut out =
                                 api::full(bf16::from_f32(f32::NAN), &[rows, 128]).execute(exec)?;
                             match op {
@@ -2993,11 +3023,6 @@ mod tests {
                                         tile_rows.to_string(),
                                     ])
                                     .execute(exec)?;
-                                }
-                                2 => {
-                                    kernels::swiglu((&mut out).partition([tile_rows, 256]), &x, &x)
-                                        .generics(vec!["bf16".into(), tile_rows.to_string()])
-                                        .execute(exec)?;
                                 }
                                 _ => {
                                     kernels::rope(
@@ -3039,6 +3064,87 @@ mod tests {
                 }
             } else {
                 scalar = Some(values);
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bf16_fused_up_swiglu_matches_cpu_rounding_with_partial_tiles() -> Result<(), ModelError>
+    {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let (rows, columns, width) = (137, 259, 96);
+        let input: Arc<Vec<bf16>> = Arc::new(
+            (0..rows * width)
+                .map(|i| bf16::from_f32(((i * 17 % 31) as f32 - 15.0) / 32.0))
+                .collect(),
+        );
+        let weights: Arc<Vec<bf16>> = Arc::new(
+            (0..columns * width)
+                .map(|i| bf16::from_f32(((i * 7 % 29) as f32 - 14.0) / 64.0))
+                .collect(),
+        );
+        let gate: Arc<Vec<bf16>> = Arc::new(
+            (0..rows * columns)
+                .map(|i| bf16::from_f32(((i * 13 % 101) as f32 - 50.0) / 32.0))
+                .collect(),
+        );
+        let cache = ReadbackCache::default();
+        for tile in [
+            LinearTile::for_shape::<bf16>(512, 4864),
+            LinearTile::for_shape::<bf16>(4096, 4864),
+        ] {
+            let actual = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    // SAFETY: producers and D2H share exec; host reads follow completion.
+                    unsafe {
+                        let x = api::copy_host_vec_to_device(&input)
+                            .execute(exec)?
+                            .reshape(&[rows, width])?;
+                        let w = api::copy_host_vec_to_device(&weights)
+                            .execute(exec)?
+                            .reshape(&[columns, width])?;
+                        let g = api::copy_host_vec_to_device(&gate)
+                            .execute(exec)?
+                            .reshape(&[rows, columns])?;
+                        let mut out =
+                            api::full(bf16::from_f32(f32::NAN), &[rows, columns]).execute(exec)?;
+                        kernels::linear_swiglu(
+                            (&mut out).partition([tile.rows, tile.columns]),
+                            x,
+                            w,
+                            g,
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            width.to_string(),
+                            tile.rows.to_string(),
+                            tile.columns.to_string(),
+                            tile.reduction.to_string(),
+                        ])
+                        .execute(exec)?;
+                        Ok(cache.enqueue(out, exec)?)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            for (index, value) in actual.as_slice().iter().enumerate() {
+                let row = index / columns;
+                let column = index % columns;
+                let sum = (0..width)
+                    .map(|k| input[row * width + k].to_f32() * weights[column * width + k].to_f32())
+                    .sum::<f32>();
+                let up = bf16::from_f32(sum).to_f32();
+                let g = gate[index].to_f32();
+                let activated = bf16::from_f32(g / (1.0 + (-g).exp())).to_f32();
+                let expected = bf16::from_f32(activated * up).to_f32();
+                assert!(
+                    (value.to_f32() - expected).abs() < 1e-5,
+                    "output {index}: {} vs {expected}",
+                    value.to_f32()
+                );
             }
         }
         Ok(())
