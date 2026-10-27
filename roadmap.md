@@ -1,48 +1,174 @@
 # LLM Inference 学习路线图
 
-更新日期：2026-10-26。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
+更新日期：2026-10-27。资料优先采用官方文档、原始论文和项目源码；文档中的 `latest` / `main` 会变化，做实验时固定实际使用的版本或 commit。
 
 ## Current checkpoint and next work
 
-Qwen2.5-0.5B-Instruct now runs through Scheduler -> Runner -> CausalModel,
-with greedy token steps, streaming text, session continuation and independent
-request completion. FP32 reference logits/tokens and full/chunked KV checks are
-in place. Qwen reuses scratch across decoder layers; Scheduler observers and
-model/pool `metrics` instruments cover request timing, execution and memory.
-The standalone Qwen benchmark separates model execution from request latency.
-No exporter is installed.
+Qwen2.5-0.5B-Instruct runs through Scheduler -> Runner -> CausalModel with packed
+ragged GPU batches, streaming greedy generation, session continuation, reusable
+scratch and metrics. Continuous batching and token-budgeted chunked prefill are
+implemented. Qwen still computes in FP32/eager mode.
 
-Initial KV-block attention optimization is complete: 32 tokens per compute tile
-and occupancy target 2 preserve the cache/API contracts. The release diagnostic
-comparison reduces B1/4K prefill from 32.86 s to 5.78 s and decode from 45.19 ms to
-17.28 ms/step; the local [attention report](rust/profiling/qwen2/attention-tiling/RESULTS.md)
-includes hardware counters, alternatives, correctness checks and limits.
+### Immediate target: a comparable Qwen benchmark against SGLang
 
-Subsequent [batch tuning](rust/profiling/qwen2/batch-tuning/RESULTS.md) compares
-32/4096-token prompts at batch sizes 1, 2 and 4. Linear now uses 16x64 output
-tiles for at least 16 packed rows and 4x32 for smaller inputs. SM120 entry hints
-target occupancy 2 for linear and 4 for attention, without additional GPU scratch.
+The three comparison-alignment tasks are GPU token feedback/CPU overlap,
+Qwen CUDA Graph, and native BF16 execution. The first task initially proposed CPU
+decoding every 64/128 tokens; we instead chose asynchronous readback and one-round
+submission-first overlap, preserving per-token EOS and continuous scheduling.
 
-1. Use the updated kernel-time breakdown to choose further linear reuse or
-   long-context attention work. Single-request decode still launches only 14
-   query/head blocks; investigate split-KV partial softmax reduction separately.
-2. Revisit CUDA Graph when host submission becomes material; current replay
-   supports SimpleMLP only. Compare CPU submission, GPU work and timeline gaps
-   without treating their durations as additive.
-3. Minimal continuous batching now admits new requests between forwards and
-   releases completed KV independently; clients serialize turns of one session.
-   Chunked prefill shares a bounded per-forward token budget with decode. Next
-   measure interference on mixed long/short arrivals and tune the budget.
-   Radix prefix caching and quantization remain subsequent experiments.
+| Alignment item | Current state | Remaining acceptance |
+| --- | --- | --- |
+| GPU feedback and submission-first overlap | Implemented; Runner A/B matrix and all 12 Nsight captures validated | Extend to mixed arrivals and other dtypes; the current fixed-cohort speedup is workload-dependent |
+| Native BF16 storage and computation | Planned; loader dtype support exists, but Qwen explicitly loads/computes FP32 | Support BF16 tensors/kernels and document accumulation dtype, numerical error and memory/latency |
+| Qwen CUDA Graph option | Planned; replay currently supports SimpleMLP only | Qwen eager/replay agreement, stable buffers/metadata and controlled graph-on/off measurements |
 
-Packed Qwen GPU execution is implemented: ragged suffixes, different cached
-prefix lengths, batched decode and per-request validation share one forward.
-Release profiling at batch sizes 1 and 4 is complete; see the local
-[packed Qwen report](rust/profiling/qwen2/packed-nsys/RESULTS.md) for workloads,
-raw artifacts and reproducible commands.
+BF16 is a lower-precision floating-point execution path. It is separate from the
+INT8/INT4/FP8 or KV quantization experiment: loading BF16 weights into FP32 tensors
+is not BF16 execution, and BF16 support must not mark quantization complete.
 
-Units are numbered by the current implementation sequence: W5 covers the completed
-Qwen baseline, followed by performance work, scheduling, prefix reuse and quantization.
+### Overlap: implementation and fixed-cohort performance validation complete
+
+- Runner submits F(N) before waiting/committing/processing F(N-1), using one ordered
+  compute stream. GPU token handles feed the next forward without a CPU-ID/H2D round trip.
+- CausalModel::enqueue_append_batch handles stream checks, queued KV reservation
+  and context restoration. KVContext stores ready_len plus at most two pending_ends;
+  FIFO commit follows the matching completion, never submission alone.
+- GpuTokenReadback provides one shared deferred D2H per output batch on an independent
+  stream, with reusable pinned buffers. CPU token acceptance, EOS and text decoding
+  still happen per token; there is no fixed 64/128-token CPU blackout or unbounded GPU queue.
+- Qwen enables overlap by default; [the example](rust/engine/examples/qwen2.rs) exposes
+  --disable-overlap for the serial baseline. EOS can leave one extra submitted step,
+  which drains before cleanup. Gate tests cover handoff/lifetime behavior and regressions
+  cover FIFO, mixed/reordered feedback, streaming and session continuation.
+- Latest release regression evidence: 82 engine tests and 3 compile-fail doc tests
+  passed; the real-checkpoint opt-in test is excluded from that count. Earlier real-weight
+  serial/overlap smoke runs separately matched the FP32 CPU reference and released KV.
+
+[Runner benchmark](rust/engine/benches/qwen2_runner.rs) and
+[comparison/Nsight analyzer](rust/engine/benches/qwen2_runner_compare.py) now measure
+serial and overlap on identical cohorts. The local
+[report](rust/profiling/qwen2/runner-overlap/RESULTS.md) preserves commands, native
+samples, memory and profiler captures: three independent processes per mode/case,
+batch 1/2/4, input 32/4096, 64 outputs. Short batch 2 improves about 8% by process
+medians; other cases are small/noisy or approximately flat. Every overlap trace
+completes the next submission before the previous D2H in 63/63 adjacent pairs;
+serial is 0/63. CPU accept and D2H genuinely intersect subsequent GPU work.
+
+Keep the measurement boundaries separate: [benches/qwen2.rs](rust/engine/benches/qwen2.rs)
+remains a serial model-level baseline using next_tokens().await and per-step CPU
+readback. [sglang_qwen2.py](rust/engine/benches/sglang_qwen2.py) keeps sampled IDs on
+GPU and uses the SGLang static model path. A matched static-model comparison still
+needs a Rust GPU-resident-feedback benchmark (the forward API already supports it).
+The completed Runner A/B is not a SGLang performance result.
+
+### Next sequence and comparison protocol
+
+1. Completed: Runner serial/overlap release comparison and Nsight validation with
+   fresh KV, exact full-batch assertions, stable output text/counts and scratch/KV
+   release checks. See the benchmark header or run:
+   /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --profile.
+   Native timing determines speedup; separate captures validate ordering and overlap.
+   Retain the serial mode and evaluate mixed arrivals/chunk budgets separately.
+2. Implement the Qwen CUDA Graph option, retaining the serial/eager baseline and
+   the same ownership/completion contracts. Measure graph off/on independently.
+3. Add native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
+   numerical reference; validate BF16 tolerances and accumulation rather than
+   requiring every generated token to match FP32 bit-for-bit.
+4. Run the matched SGLang comparison with fixed versions, model revision, dtype,
+   graph mode, batch/lengths, stopping/cache policy and timing boundaries. Alternate
+   engines and collect at least three independent runs before drawing conclusions.
+   Label FP32-vs-BF16 or mismatched-readback results as diagnostic. Align counts:
+   Runner output_tokens = SGLang output_len; the older Rust model bench uses
+   decode_steps = output_len - 1 (64 outputs means 63 decode steps after prefill).
+5. Use those measurements to choose further kernel work. Radix prefix caching is
+   now W8; a true quantization path remains a separate W7 follow-up. Mixed long/short
+   arrival interference, budget tuning and split-KV remain open, with no claimed benefit yet.
+
+### SGLang benchmark recipe and measurement boundary
+
+Reference entry: installed SGLang **0.5.9**, sglang.bench_one_batch. Use our
+[adapter](rust/engine/benches/sglang_qwen2.py), which replaces synthetic input
+preparation and repeated sampling but leaves SGLang model kernels unchanged.
+Version changes require rechecking the adapter; use the same HF snapshot/revision
+as Rust. The following is the reproducible recipe, not a recorded performance result.
+
+```bash
+# Run from the repository root; replace with the same local checkpoint used by Rust.
+MODEL_DIR=/absolute/path/to/Qwen2.5-0.5B-Instruct/snapshot
+RESULT_DIR=rust/profiling/qwen2/sglang-comparison
+mkdir -p "$RESULT_DIR"
+CUDA_HOME=/usr/local/cuda HF_HUB_OFFLINE=1 ~/.venvs/py3.12/bin/python \
+  rust/engine/benches/sglang_qwen2.py \
+  --model-path "$MODEL_DIR" --dtype bfloat16 --mem-fraction-static 0.5 \
+  --context-length 8192 --disable-cuda-graph \
+  --batch-size 1 2 4 --input-len 32 4096 --output-len 9 \
+  --comparison-warmup 2 --comparison-iterations 3 \
+  --result-filename "$RESULT_DIR/sglang-bf16-eager.jsonl"
+```
+
+For a separate graph-enabled baseline, omit --disable-cuda-graph and use a different
+result filename, such as sglang-bf16-graph.jsonl. Record the actual graph capture/
+replay shapes and attention backend in addition to the requested setting. Result files
+are appended; use a new filename/run directory for each independent experiment.
+
+| Setting | SGLang adapter | Rust comparison requirement |
+| --- | --- | --- |
+| Inputs | Every request uses token ID 9707 repeated to input_len; batch 1/2/4, length 32/4096 | Same token IDs, batch sizes and cached-prefix state |
+| Generation | Greedy temperature=0; one prefill plus output_len-1 decode steps; fixed loop without EOS early exit | Equal number of forwards and actual outputs; output_len=9 matches decode_steps=8 |
+| Cache/warmup | Fresh Req objects and cleared request/KV allocation state per run; weights and runtime caches stay warm | Fresh request KV for every warmup/measured sample; keep weights/workspaces warm |
+| Samples | Two adapter warmups and three measured runs per configuration; upstream also has a first-case warmup | Separate warmup and measurement; repeat at least three independent process runs |
+| Precision/graphs | BF16; explicit eager baseline, then a separate graph-enabled run | Native BF16 required for matched-dtype claims; graph modes must match |
+| Scope | One fixed batch through ModelRunner, no HTTP, request queue or text decode | Compare to a model-level path first; serving latency is a separate experiment |
+
+**What the upstream timer measures:** latency_test_run_once clears both
+req_to_token_pool and token_to_kv_pool_allocator. Prefill and every decode step
+use device synchronization around a host perf_counter interval. The measured wall
+time includes CPU step preparation/submission and GPU completion; it is not pure
+CUDA-event kernel time. The latency loop passes sampled IDs directly on GPU:
+
+```python
+next_token_ids, _, batch = extend(reqs, model_runner)
+# decode() assigns batch.output_ids = next_token_ids before preparing the next step.
+next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+```
+
+extend() constructs ScheduleBatch with **enable_overlap=False**, and the latency
+loop synchronizes after each step. Consequently this benchmark does not exercise
+SGLang's serving overlap scheduler, continuous arrivals, cancellation or text D2H/
+decoding. It cannot establish whether our Runner overlap matches SGLang serving.
+For a later serving A/B, compare the resolved default overlap configuration against
+--disable-overlap-schedule, keeping graph/dtype/workload settings identical and
+checking the actual timeline; do not substitute this static benchmark for that test.
+Keep two experiments distinct: model-step timing with GPU-resident sampled IDs,
+and an independent Runner/server serial-vs-overlap test with matching delivery policy.
+Our existing direct Rust benchmark still performs pinned D2H per step, so even the
+model-level comparison needs its CPU/readback boundary aligned or explicitly labeled.
+
+**Results to retain:** adapter output includes version/dtype/graph settings, batch/
+input/output lengths, warmup/iteration counts and raw samples. prefill_mean_seconds
+is the mean prefill latency; decode_median_seconds is the median of per-run median
+decode latencies. output_len=1 has no decode and reports null. Upstream decode
+throughput is batch_size / median_decode_latency; overall_throughput uses
+(input_len + output_len) * batch_size / total_latency, counting input and output
+tokens together. Compare that only with the same definition; Runner output tokens/s
+and request/first-text latency are separate metrics. Preserve raw JSONL and launch
+settings under rust/profiling/qwen2/sglang-comparison; disable profiling/tracing for
+latency samples and capture a separate diagnostic run when needed.
+
+### Completed kernel groundwork
+
+Packed Qwen profiling is recorded in the local
+[packed report](rust/profiling/qwen2/packed-nsys/RESULTS.md). The initial
+[attention tiling](rust/profiling/qwen2/attention-tiling/RESULTS.md) diagnostic reduced
+B1/4K prefill from 32.86 s to 5.78 s and decode from 45.19 ms to 17.28 ms/step.
+Subsequent [batch tuning](rust/profiling/qwen2/batch-tuning/RESULTS.md) covers
+32/4096-token inputs at batch 1/2/4: linear uses 16x64 tiles for at least 16 packed
+rows and 4x32 otherwise; SM120 occupancy targets are 2 for linear and 4 for attention.
+These historical FP32 kernel comparisons do not establish an overlap or SGLang speedup.
+
+Unit labels describe implementation/learning milestones. Qwen graph support is a
+W4 follow-up; BF16 alignment is prioritized before W8 prefix caching. W9 onward
+remains unchanged.
 
 ## 1. 目标、投入与学习边界
 
@@ -102,21 +228,22 @@ prerequisite week.
 | W3 | KVPool/KVContext + KV-cache indirection; attention and KV-write kernels | Session continuation, cache addressing, typed views, fused writes, release |
 | W4 | CUDA Graph and reusable execution buffers (SimpleMLP implemented) | Pooled exact-shape replay, dynamic inputs, mapped output; Qwen replay pending |
 | W5 | Qwen2.5-0.5B-Instruct baseline — Done | Reference logits/tokens, sessions/streaming, scratch reuse, metrics and benchmark |
-| W6 | Continuous batching and chunked-prefill scheduling | Use packed Qwen execution and the existing Runner token-step lifecycle; arrivals/completions, budgets and cancellation |
-| W7 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
-| W8 | One quantization path on Qwen | FP32 reference, quality/error, memory/traffic and latency |
+| W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
+| W7 | Native BF16 Qwen, then a separate quantization path | BF16 alignment planned; true quantization acceptance remains separate |
+| W8 | Radix prefix caching, sharing/reclamation, and cache-aware routing | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
 | W9 | Speculative decoding | Original plan retained |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
-| W13 | Distributed routing, SLO, and serving semantics | Original plan retained; extends W7's cache-locality routing |
+| W13 | Distributed routing, SLO, and serving semantics | Original plan retained; extends W8's cache-locality routing |
 | W14 | End-to-end synthesis | Original plan retained |
 
 Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
 Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
 Qwen uses eager execution with packed ragged GPU batches. Runner now interleaves
-chunked prefill with decode under a token budget; mixed-workload performance
-evaluation and radix prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
+chunked prefill with decode under a token budget and overlaps submission with prior
+CPU results; fixed-cohort overlap measurements are complete. Qwen replay, native
+BF16, mixed-arrival evaluation and prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
 commands and metric contracts.
 
 多模态编码器、LoRA 服务、structured output、弹性伸缩在扩展表中了解位置；本轮主线覆盖文本自回归 LLM inference，不要求深入所有相邻工作负载。
@@ -160,11 +287,12 @@ model loader
   -> KVPool / KVContext + token-slot indirection + attention / cache writes
   -> CUDA Graph on SimpleMLP
   -> Qwen2.5-0.5B-Instruct + shared causal steps / Runner streaming
-  -> scratch reuse + metrics / benchmarks (current)
+  -> scratch reuse + metrics / benchmarks
   -> profile and optimize Qwen + packed batch execution
-  -> continuous batching / chunked-prefill scheduling
-  -> radix prefix reuse + cache-aware routing
-  -> quantization on Qwen
+  -> continuous batching / chunked prefill / submission-first overlap (implemented)
+  -> Runner overlap measurement (validated) -> Qwen CUDA Graph -> native BF16
+  -> matched SGLang performance comparison
+  -> radix prefix reuse + cache-aware routing; separate quantization follow-up
   -> W9 onward: revisit when these foundations are validated
 ```
 
@@ -230,7 +358,7 @@ model loader
 - [ ] Full prefill, chunked appends, and one-token appends match an independent CPU reference; actual K/V entries match projected values.
 - [ ] Different sessions remain isolated; nonzero append positions, fragmented slots, and padding do not overwrite another context.
 - [ ] Read/write view misuse fails to compile; dynamic bounds and missing pending state fail at runtime. Release waits for in-flight GPU resource ownership.
-- [ ] Report pool allocation/mapping bytes and free/assigned capacity. Prefix sharing and radix indexing remain W7 work.
+- [ ] Report pool allocation/mapping bytes and free/assigned capacity. Prefix sharing and radix indexing remain W8 work.
 
 ### Phase B: real-model baseline and execution improvements (W4–W8)
 
@@ -264,8 +392,8 @@ milestones include `24a6ce6` (pooled scoped capture) and `60dd84a` (mapped outpu
 Performance conclusions distinguish graph replay from workspace, upload, mapped
 output, and completion-policy changes. Eager and the final graph path have different
 host transfer/completion behavior, so their whole-path latency difference must not
-be reported as an isolated graph-launch speedup. Bucket-based dispatch and changing
-active-request membership are W6 follow-up work.
+be reported as an isolated graph-launch speedup. Bucketed graph replay with changing
+membership remains follow-up work; Runner dynamic membership is implemented in W6.
 
 #### W5: Qwen2.5-0.5B-Instruct baseline
 
@@ -302,15 +430,16 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 - [x] Add KV-block attention, compare block sizes/occupancy targets, and validate ragged/causal/cache behavior against CPU and real-model references.
 - [x] Compare prefill linear tiles and attention occupancy at batch sizes 1, 2 and 4; retain measured improvements with CPU/checkpoint regressions and unchanged workspace capacity.
 - [ ] Improve long-context decode parallelism against the recorded release baseline.
-- Port CUDA Graph if host submission overhead warrants it; schedule changing
-  request membership in W6 using the packed executor.
+- Port Qwen CUDA Graph as the comparison-alignment follow-up; W6 already supports
+  changing membership and chunked prefill using the packed executor.
 - Add selected intermediate-tensor checks when changing numerical kernels.
-- Validate graph replay and prefix reuse as each feature is added; evaluate quantized quality/performance in W8.
+- Validate graph replay and prefix reuse as each feature is added; evaluate quantized quality/performance in W7.
 
 #### W6: step-level generation, continuous batching, and chunked prefill
 
-Status: minimal continuous batching and token-budgeted chunked prefill implemented;
-mixed-workload performance evaluation remains open.
+Status: minimal continuous batching, token-budgeted chunked prefill and submission-first
+overlap implemented; fixed-cohort Runner serial/overlap measurements and Nsight are
+complete, while mixed-arrival workload evaluation remains open.
 Runner admits requests at forward boundaries, dynamically changes packed batch membership,
 protects active requests' future KV budget, and rejects accidental same-session overlap
 under the client-serialized session contract.
@@ -323,7 +452,9 @@ API computes an unused LM head on intermediate chunks; measure before separating
 
 **Focus**
 
-- Reuse packed Qwen execution through `CausalModel::next_tokens` and Runner greedy/EOS/length handling; keep per-request error isolation and stream completion.
+- Reuse packed Qwen through the completed next_tokens path for serial execution and
+  enqueue_forward_and_return_completion for overlap; keep Runner greedy/EOS/length
+  handling, per-request errors and completion-before-KV-commit.
 - Move from batching whole requests to scheduling model steps: waiting/running requests, token budgets, arrivals, completions, cancellation, and local KV admission.
 - Interleave chunked prefill with decode. Maintain the invariant between accepted tokens, computed KV, and any last generated token whose KV is not computed yet.
 - Keep Runner lifecycle independent from the ingress Scheduler. Place execution-batch decisions where local KV/workspace capacity is known.
@@ -340,10 +471,46 @@ API computes an unused LM head on intermediate chunks; measure before separating
 - [x] Packed and serial Qwen execution agree for ragged prefill, different cached-prefix lengths and decode.
 - [x] Dynamic arrivals and session continuations agree with serial generation; existing packed Qwen numerical checks remain required.
 - [x] New requests join ongoing decodes, completed requests release resources independently, and shutdown cancellation releases active/pending work. Per-request cancellation remains deferred.
+- [x] One-round lookahead, GPU feedback, FIFO KV commits and safe extra-step draining
+  are covered by submission/lifetime and Runner regressions.
+- [x] Runner serial vs overlap measured under identical fixed-cohort settings;
+  36 native processes and 12 Nsight captures validate output, release and ordering.
+  Speedup depends on the workload; mixed arrivals are not covered by this result.
 - [ ] Compare at least two prefill budgets on the same mixed long/short workload; report request/first-text latency, per-step latency and throughput. Add an explicit Runner-start event before claiming exact queue time.
 - [ ] CUDA Graph bucket selection and dynamic metadata remain correct when batch membership changes.
 
-#### W7: radix prefix caching, shared ownership, and cache-aware routing
+#### W7: native BF16 Qwen and a separate quantization path
+
+Status: Planned. Native BF16 is the immediate precision-alignment prerequisite for
+SGLang comparisons; its completion does not satisfy the quantization items below.
+
+**Focus**
+
+- Implement BF16 weight/activation/KV storage and cuTile computation where appropriate;
+  document FP32 accumulation and operations kept in FP32. Existing loader dtype support
+  is reusable; Qwen's current Tensor<f32> kernels still require implementation work.
+- Select one small weight-only or KV quantization path. Understand scale granularity, packing, dequantization, and the kernel/layout contract before adding algorithms.
+- Keep quantization algorithm, checkpoint representation, and execution kernel separate; smaller storage does not establish faster inference.
+- Measure tensor/logit error and held-out generation quality against the working Qwen FP32 baseline.
+- Keep the floating-point path available for Qwen numerical comparisons and regression tests; quantization is a selectable backend rather than a required correctness baseline.
+
+**References**
+
+1. [vLLM quantization](https://docs.vllm.ai/en/latest/features/quantization/) and [quantized KV cache](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/).
+2. [Marlin](https://github.com/IST-DASLab/marlin) as an optional example of weight packing/dequantization in compute kernels.
+
+**Acceptance**
+
+- [ ] Validate native BF16 prefill/decode against a documented numerical reference;
+  report error, output quality, storage/workspace and latency against FP32.
+- [ ] Compare matched BF16/eager and BF16/graph settings with SGLang before claiming parity.
+- [ ] Quantize/dequantize a small linear layer or KV tensor; compare at least two scale granularities with independently computed reference values.
+- [ ] Integrate one path into Qwen and compare quality, storage/traffic, workspace and steady-state latency for at least two shapes.
+- [ ] State which operations remain floating point and where extra conversion occurs; reuse cache/graph tests for the selected path.
+
+#### W8: radix prefix caching, shared ownership, and cache-aware routing
+
+Status: Planned; resume after the initial SGLang comparison-alignment work.
 
 **Focus**
 
@@ -363,26 +530,6 @@ API computes an unused LM head on intermediate chunks; measure before separating
 - [ ] Shared prefixes survive closing one session; eviction cannot reclaim referenced or in-flight KV; final release restores capacity.
 - [ ] A small controlled multi-owner routing experiment chooses the appropriate cached owner and handles misses/stale hints; label any mock routing as simulation.
 - [ ] Distinguish hit rate, prefill work saved, latency, and throughput rather than treating them as interchangeable.
-
-#### W8: one quantization path on Qwen
-
-**Focus**
-
-- Select one small weight-only or KV quantization path. Understand scale granularity, packing, dequantization, and the kernel/layout contract before adding algorithms.
-- Keep quantization algorithm, checkpoint representation, and execution kernel separate; smaller storage does not establish faster inference.
-- Measure tensor/logit error and held-out generation quality against the working Qwen FP32 baseline.
-- Keep the floating-point path available for Qwen numerical comparisons and regression tests; quantization is a selectable backend rather than a required correctness baseline.
-
-**References**
-
-1. [vLLM quantization](https://docs.vllm.ai/en/latest/features/quantization/) and [quantized KV cache](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/).
-2. [Marlin](https://github.com/IST-DASLab/marlin) as an optional example of weight packing/dequantization in compute kernels.
-
-**Acceptance**
-
-- [ ] Quantize/dequantize a small linear layer or KV tensor; compare at least two scale granularities with independently computed reference values.
-- [ ] Integrate one path into Qwen and compare quality, storage/traffic, workspace and steady-state latency for at least two shapes.
-- [ ] State which operations remain floating point and where extra conversion occurs; reuse cache/graph tests for the selected path.
 
 ### Phase C: later algorithms and model families (W9–W10; existing plan retained)
 
@@ -536,13 +683,13 @@ API computes an unused LM head on intermediate chunks; measure before separating
 | GEMM/ReLU, attention/softmax, RMSNorm/GEMV | W2 MLP, W3 attention, W5 real-model operators | 某算子在 profile 中占据显著时间 |
 | FlashAttention、Flash-Decoding | W3 numerical/parallelism references; mature-kernel integration optional | 对 Attention kernel 感兴趣时，再读 [FlashAttention 实现](https://github.com/Dao-AILab/flash-attention)及硬件专项优化 |
 | ChunkAttention | 暂不要求；不等于 chunked prefill | 需要研究共享前缀的 attention 计算复用时再读原论文 |
-| KV-cache indirection, allocation granularity, prefix cache | W3 mapping/allocation; W7 radix sharing/reuse and routing | PagedAttention is a paged example; [vAttention](https://arxiv.org/abs/2405.04437) compares a virtual-memory approach |
+| KV-cache indirection, allocation granularity, prefix cache | W3 mapping/allocation; W8 radix sharing/reuse and routing | PagedAttention is a paged example; [vAttention](https://arxiv.org/abs/2405.04437) compares a virtual-memory approach |
 | 分布式 / 异构 KV | W12 核心，跑一条路径 | 在 CPU / NVMe / RDMA 的实际瓶颈出现后再扩展 |
 | TP、PP、EP、DP、all-reduce | W11 核心，TP 与 DP 实测 | 实际受通信限制后再考虑 custom collective、拓扑调优 |
 | 序列并行、序列流水并行 | W11 了解划分对象与通信 | 长上下文成为主兴趣后深入具体 context parallel / pipeline 实现 |
 | 分离式架构 | W12 学一次交接与成本 | 需要研究资源配比、多机容错时再深入 |
 | 异步调度、NanoFlow | W2 submission/completion, W4 replay, W6 step scheduling; NanoFlow optional | 对算子级流水与资源重叠感兴趣时读 [NanoFlow](https://arxiv.org/abs/2408.12757) |
-| Weight-only、W8A8、FP8 | W8 one Qwen path against the W5 FP32 reference | 质量 / 性能出现具体差异后再深挖 AWQ、GPTQ、SmoothQuant 等 |
+| Weight-only、W8A8、FP8 | W7 one Qwen path against the W5 FP32 reference | 质量 / 性能出现具体差异后再深挖 AWQ、GPTQ、SmoothQuant 等 |
 | torch.compile、CUDA Graph | W4 CUDA Graph; torch.compile is an optional reference comparison | 产生编译瓶颈后再学 Inductor / Triton / MLIR 细节 |
 | Lookahead、tree attention | W9 理解其在 draft / verify 中的位置 | 投机解码成为兴趣方向后再专门实现 |
 | MoE、MLA、混合状态模型 | W10 补齐现代模型差异 | 不要求每种模型都部署完整规模 |

@@ -73,13 +73,13 @@ invalidated. Cancellation drops active local states, and GPU submission leases
 keep storage alive until in-flight accesses finish. Dropping an output stream
 still stops delivery rather than cancelling generation.
 
-This follows SGLang's normal loop (local source revision `0263fdacb2`):
+The serial control flow follows SGLang's normal loop (local source revision `0263fdacb2`):
 `event_loop_normal` receives work, `get_next_batch_to_run` selects/merges requests,
 then one forward runs and results update the running batch. Our existing packed
-backend permits full prefills and decodes in the same forward. Chunked-prefill
-budgets, preemption, scheduling/GPU overlap and Qwen CUDA Graph remain deferred.
-A full long prefill can still delay decodes; this change establishes dynamic
-membership and lifecycle correctness, without a throughput claim.
+backend permits prefills and decodes in the same forward. Token-budgeted chunked
+prefill is implemented; preemption and Qwen CUDA Graph remain deferred. The
+implemented one-round submission-first overlap is described below. Fixed-cohort
+performance results do not establish mixed-arrival scheduling benefits.
 
 `Qwen2Engine::kv_pool_config` defaults to one context row. Applications enabling
 concurrency must size their pool accordingly, for example:
@@ -558,3 +558,44 @@ The English run stopped at EOS after ten generated IDs and produced
 logit error below `1e-3`, and KV allocation release. Local logs and reference data
 are under `rust/engine/artifacts/qwen2*` (ignored by Git). Timings include eager
 allocation and possible JIT and must not be interpreted as steady-state serving latency.
+
+### Runner serial/overlap benchmark
+
+[benches/qwen2_runner.rs](benches/qwen2_runner.rs) measures real Scheduler -> Runner
+requests, including tokenization, incremental text decoding and response delivery.
+Its bench-only model wrapper disables EOS stopping to produce a fixed output budget;
+it delegates all numerical computation to Qwen. Repeated ID 9707 is decoded and
+round-trip checked against the real tokenizer before timing. Uniform requests are
+admitted before yielding; assertions check full GPU batch shapes, exactly one full
+prefill plus output_tokens-1 decodes, stable output text/counts and KV/scratch release.
+The token budget fits the entire prefill, so this experiment excludes chunking and
+continuous arrivals. Each warmup and measured cohort starts with fresh KV.
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --mode serial --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_runner -- --model-dir "$QWEN2_MODEL_DIR" --mode overlap --tokens 32 --batch-size 4 --output-tokens 64 --warmup 2 --iterations 3
+/usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir "$QWEN2_MODEL_DIR" --profile
+```
+
+The comparison script freezes the release/bench binary and records commands/source
+provenance. Defaults alternate serial/overlap order across three independent process
+runs, batch 1/2/4 and input 32/4096. Every process has two warmups and three measured
+cohorts; Nsight captures are separate, with one measured cohort after warmup. A new
+results directory under rust/profiling/qwen2/runner-overlap preserves raw JSONL,
+comparison.json, nsys-rep/SQLite traces and traces.json. See the benchmark header for
+a direct Nsight command or pass --results-dir to choose a new experiment directory.
+
+Cohort wall time/output TPS includes ingress and text delivery; observer first-text
+time is distinct from pure prefill and first-token timing. CUDA-pool high-water marks reset per cohort and
+exclude other processes/non-pool allocations. Workspace peaks are cumulative model
+resource snapshots. Do not derive pure decode time by subtracting first-text time.
+Profiler output validates submission/readback ordering and measures CPU accept/D2H
+intersection with GPU kernel intervals; the GPU activity union is application-trace
+coverage, not SM occupancy. Only unprofiled independent runs determine speedup.
+This is a Runner A/B test, separate from SGLang's GPU-token static model benchmark.
+
+The local [Runner overlap report](../profiling/qwen2/runner-overlap/RESULTS.md) records
+36 unprofiled process runs and 12 separate Nsight captures. Full next-submission
+completion precedes prior D2H in every overlap adjacent pair (63/63 per capture),
+versus 0/63 in serial. Short batch 2 shows the clearest native gain (about 8%);
+other configurations are small/noisy or flat. This is not a SGLang performance claim.

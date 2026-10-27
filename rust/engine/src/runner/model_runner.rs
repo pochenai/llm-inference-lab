@@ -264,6 +264,8 @@ impl RequestTokenGenerationState<'_> {
         replies: &mpsc::UnboundedSender<RunnerReply>,
         default_eos: impl FnOnce(u32) -> bool,
     ) {
+        // Synchronous CPU history/decoder/EOS work; this range never spans an await.
+        let _range = crate::profiling::ScopedRange::new(c"runner.accept_token");
         let token = match output {
             Ok(token) => token,
             Err(error) => {
