@@ -44,6 +44,9 @@ struct Args {
     dtype: String,
     #[arg(long)]
     model_dir: PathBuf,
+    /// Deterministic varied IDs expose cache/compression-sensitive tuning.
+    #[arg(long, default_value="repeated", value_parser=["repeated","ramp"])]
+    input_pattern: String,
     /// Cargo appends this flag even when the standard benchmark harness is disabled.
     #[arg(long = "bench", hide = true)]
     _bench: bool,
@@ -135,13 +138,24 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     let reserved_peak =
         metrics::gauge!("qwen2_cuda_pool_reserved_peak_bytes", "model_instance" => instance);
     let cuda_pool = device.default_mem_pool()?;
+    // Deterministic valid vocabulary IDs; this tests capacity, not natural-language quality.
+    let prefix = if args.input_pattern == "ramp" {
+        (0..args.tokens.get())
+            .map(|i| 9707 + (i % 4096) as u32)
+            .collect()
+    } else {
+        vec![9707u32; args.tokens.get()]
+    };
+    let input_checksum: u64 = prefix
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (i as u64 + 1) * u64::from(*id))
+        .sum();
     println!(
         "{}",
         json!({"event":"loaded", "seconds":load_start.elapsed().as_secs_f64(),
-        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string(), "gpu_feedback":args.gpu_feedback, "kv_slots":config.num_slots, "kv_bytes":initial_kv.layers.allocated_bytes})
+        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string(), "gpu_feedback":args.gpu_feedback, "input_pattern":args.input_pattern, "input_checksum":input_checksum, "kv_slots":config.num_slots, "kv_bytes":initial_kv.layers.allocated_bytes})
     );
-    // Deterministic valid vocabulary IDs; this tests capacity, not natural-language quality.
-    let prefix = vec![9707u32; args.tokens.get()];
     let mut expected = None;
     let mut prefills = Vec::with_capacity(args.iterations.get());
     let mut decodes = Vec::with_capacity(args.iterations.get() * args.decode_steps.get());

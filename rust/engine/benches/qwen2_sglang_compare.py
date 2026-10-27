@@ -35,6 +35,7 @@ def summarize(samples: list[dict[str, float]]) -> dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-pattern", choices=["repeated", "ramp"], default="repeated")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--sglang-python", type=Path, default=Path.home() / ".venvs/py3.12/bin/python")
     parser.add_argument("--results-dir", type=Path)
@@ -80,6 +81,7 @@ def main() -> None:
     (out / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "--", "rust/engine", ":!*.env", ":!.env*"], cwd=REPO))
     kv_slots = ((max(args.batch_size) * (max(args.tokens) + args.output_tokens) + 127) // 128) * 128
     cases = list(itertools.product(args.batch_size, args.tokens))
+    checksums = {n: sum((i+1)*(9707+(i%4096 if args.input_pattern=="ramp" else 0)) for i in range(n)) for n in args.tokens}
     engines = ["rust-eager", "sglang-eager"] + (["sglang-graph"] if args.include_sglang_graph else [])
     results: dict[tuple[int, int, str], list[dict[str, float]]] = {}
     for repetition in range(args.repetitions):
@@ -88,10 +90,11 @@ def main() -> None:
             if engine == "rust-eager":
                 for batch, tokens in cases:
                     label = f"r{repetition}-{engine}-b{batch}-t{tokens}"
-                    run(label, [str(frozen), "--model-dir", str(args.model_dir.resolve()), "--dtype", "bf16", "--gpu-feedback", "--kv-slots", str(kv_slots), "--batch-size", str(batch), "--tokens", str(tokens), "--decode-steps", str(args.output_tokens - 1), "--warmup", str(args.warmup), "--iterations", str(args.iterations)])
+                    run(label, [str(frozen), "--model-dir", str(args.model_dir.resolve()), "--dtype", "bf16", "--input-pattern", args.input_pattern, "--gpu-feedback", "--kv-slots", str(kv_slots), "--batch-size", str(batch), "--tokens", str(tokens), "--decode-steps", str(args.output_tokens - 1), "--warmup", str(args.warmup), "--iterations", str(args.iterations)])
                     records = read_jsonl(out / f"{label}.stdout")
                     loaded = next(r for r in records if r["event"] == "loaded")
                     assert loaded["dtype"] == "bf16" and loaded["gpu_feedback"] and loaded["kv_slots"] == kv_slots
+                    assert loaded["input_pattern"] == args.input_pattern and loaded["input_checksum"] == checksums[tokens]
                     measured = [r for r in records if r["event"] == "sample" and not r["warmup"]]
                     assert len(measured) == args.iterations
                     assert sum(r.get("host_validation", False) for r in records) == 1
@@ -108,7 +111,7 @@ def main() -> None:
             else:
                 label = f"r{repetition}-{engine}"
                 output = out / f"{label}.jsonl"
-                command = [str(args.sglang_python), str(out / "sglang_qwen2.py"), "--model-path", str(args.model_dir.resolve()), "--dtype", "bfloat16", "--mem-fraction-static", "0.5", "--max-total-tokens", str(kv_slots), "--max-running-requests", str(max(args.batch_size)), "--context-length", "8192", "--batch-size", *map(str, args.batch_size), "--input-len", *map(str, args.tokens), "--output-len", str(args.output_tokens), "--comparison-warmup", str(args.warmup), "--comparison-iterations", str(args.iterations), "--result-filename", str(output)]
+                command = [str(args.sglang_python), str(out / "sglang_qwen2.py"), "--model-path", str(args.model_dir.resolve()), "--dtype", "bfloat16", "--comparison-input-pattern", args.input_pattern, "--mem-fraction-static", "0.5", "--max-total-tokens", str(kv_slots), "--max-running-requests", str(max(args.batch_size)), "--context-length", "8192", "--batch-size", *map(str, args.batch_size), "--input-len", *map(str, args.tokens), "--output-len", str(args.output_tokens), "--comparison-warmup", str(args.warmup), "--comparison-iterations", str(args.iterations), "--result-filename", str(output)]
                 if engine == "sglang-eager":
                     command.append("--disable-cuda-graph")
                 run(label, command)
@@ -117,6 +120,7 @@ def main() -> None:
                 assert {(r["batch_size"], r["input_len"]) for r in records} == set(cases)
                 for record in records:
                     assert record["output_len"] == args.output_tokens and record["dtype"] == "bfloat16"
+                    assert record["input_pattern"] == args.input_pattern and record["input_checksum"] == checksums[record["input_len"]]
                     assert record["cuda_graph"] == (engine == "sglang-graph")
                     samples = record["samples"]
                     assert len(samples) == args.iterations
@@ -143,7 +147,7 @@ def main() -> None:
     for batch, tokens in cases:
         peaks = [max(p["pool_used_peak_bytes"] for p in results[(batch, tokens, e)]) / 2**20 for e in engines]
         lines.append(f"| {batch} | {tokens} | " + " | ".join(f"{peak:.2f}" for peak in peaks) + (" |" if args.include_sglang_graph else " | n/a |"))
-    lines += ["", f"KV token capacity is {kv_slots} in both engines; no prefix reuse, fixed {args.output_tokens} outputs, greedy and no EOS early stopping. Rust --gpu-feedback validates final IDs against an untimed host-feedback control, reads final IDs outside timers and does not retain all previous workspaces. SGLang uses its official synchronous static loop, not its serving overlap scheduler.", "", "Both timers include CPU preparation/submission and GPU completion. Rust input-view construction is outside timers; final D2H and text decode are excluded. SGLang has untimed device synchronization before each step; Rust forward awaits completion. Logit dtype/attention reduction rounding and kernel implementations are not identical even with BF16 weights/activations/KV. Graph reference accelerates decode only; Rust has no Qwen Graph yet.", "", "CUDA-pool used peaks (Rust) and torch allocated peaks (SGLang) are recorded with their allocator-specific meanings. They exclude whole-device/display memory; mapping/graph capacities differ, so they are not an allocator-efficiency ranking.", "", "Raw samples, backend class, graph capture logs, process aggregates, exact commands, frozen sources/binary and version/hardware metadata accompany this report. No Nsight profiler is attached to native samples. Results do not establish serving throughput, overlap parity, or output quality.", ""]
+    lines += ["", f"Input pattern is {args.input_pattern}: repeated token 9707, or ramp 9707+(position%4096). KV token capacity is {kv_slots} in both engines; no prefix reuse, fixed {args.output_tokens} outputs, greedy and no EOS early stopping. Rust --gpu-feedback validates final IDs against an untimed host-feedback control, reads final IDs outside timers and does not retain all previous workspaces. SGLang uses its official synchronous static loop, not its serving overlap scheduler.", "", "Both timers include CPU preparation/submission and GPU completion. Rust input-view construction is outside timers; final D2H and text decode are excluded. SGLang has untimed device synchronization before each step; Rust forward awaits completion. Logit dtype/attention reduction rounding and kernel implementations are not identical even with BF16 weights/activations/KV. Graph reference accelerates decode only; Rust has no Qwen Graph yet.", "", "CUDA-pool used peaks (Rust) and torch allocated peaks (SGLang) are recorded with their allocator-specific meanings. They exclude whole-device/display memory; mapping/graph capacities differ, so they are not an allocator-efficiency ranking.", "", "Raw samples, backend class, graph capture logs, process aggregates, exact commands, frozen sources/binary and version/hardware metadata accompany this report. No Nsight profiler is attached to native samples. Results do not establish serving throughput, overlap parity, or output quality.", ""]
     (out / "RESULTS.md").write_text("\n".join(lines))
     print(out, flush=True)
 

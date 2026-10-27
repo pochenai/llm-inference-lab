@@ -31,6 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     bench.ServerArgs.add_cli_args(parser)
     bench.BenchArgs.add_cli_args(parser)
+    parser.add_argument("--comparison-input-pattern", choices=["repeated", "ramp"], default="repeated")
     parser.add_argument("--comparison-warmup", type=int, default=2)
     parser.add_argument("--comparison-iterations", type=int, default=3)
     parser.add_argument("--comparison-nvtx", action="store_true", help="Profile-only module ranges; keep off for native latency measurements")
@@ -64,7 +65,8 @@ def main() -> None:
     def fixed_inputs(batch_size: int, input_len: int, custom_inputs: Any = None) -> Any:
         if custom_inputs:
             raise ValueError("Use deterministic token inputs, not --prompt-filename")
-        return prepare(batch_size, input_len, [[9707] * input_len for _ in range(batch_size)])
+        ids = [9707 + (i % 4096) for i in range(input_len)] if args.comparison_input_pattern == "ramp" else [9707] * input_len
+        return prepare(batch_size, input_len, [ids.copy() for _ in range(batch_size)])
 
     def repeated_measure(*call_args: Any, **call_kwargs: Any) -> dict[str, Any] | None:
         output_len = call_args[6]
@@ -73,6 +75,8 @@ def main() -> None:
             positional = list(call_args)
             # Req objects are mutated by extend/decode; regenerate them each time.
             positional[3] = fixed_inputs(positional[4], positional[5])
+            input_ids = positional[3][0].origin_input_ids
+            input_checksum = sum((i + 1) * token for i, token in enumerate(input_ids))
             torch.cuda.reset_peak_memory_stats()
             result = measure(*positional, **call_kwargs)
             if result is None:
@@ -83,6 +87,8 @@ def main() -> None:
                 samples.append(result)
         return {
             "sglang_version": version,
+            "input_pattern": args.comparison_input_pattern,
+            "input_checksum": input_checksum,
             "attention_backend": call_args[1].server_args.attention_backend,
             "attention_backend_class": type(call_args[1].attn_backend).__name__,
             "cuda_graph_max_bs": call_args[1].server_args.cuda_graph_max_bs,

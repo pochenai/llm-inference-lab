@@ -708,3 +708,10 @@ attention routing still checks each context separately. Masked K tails use ceili
 iteration. This isolated blocking change reduces 4K prefill by about another 32-33%
 after attention MMA; the [tuning report](../profiling/qwen2/bf16-eager-tuning/RESULTS.md)
 retains the full short/long B1/2/4 matrix, candidate screens and precision checks.
+
+For BF16 M >= 2048 and N >= 512, a third bucket uses 128x128/K64; skinny K/V
+projections and smaller matrices keep the earlier tiles. Three-process B1/2/4
+4K prefills are 114/227/452 ms, another 11–13% throughput improvement. Independent
+CPU output-coverage tests and a >2048-token Transformers BF16 SDPA reference pass.
+Benchmark `--input-pattern ramp` complements the default repeated-token baseline;
+comparison runs assert matching input-pattern checksums for both engines.
