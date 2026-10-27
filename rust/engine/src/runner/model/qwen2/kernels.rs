@@ -379,7 +379,12 @@ pub(super) mod ops {
     /// BF16 operands feed MMA directly; scores, normalizers and accumulators stay FP32.
     /// A launch covers one context/head group, so tiles never cross request boundaries.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
-    pub(super) unsafe fn attention_prefill<T: ElementType, const BQ: i32, const BK: i32>(
+    pub(super) unsafe fn attention_prefill<
+        T: ElementType,
+        const BQ: i32,
+        const BK: i32,
+        const GROUP: i32,
+    >(
         out: *mut T,
         q: &Tensor<T, { [-1, -1] }>,
         k: &Tensor<T, { [-1, -1] }>,
@@ -396,15 +401,22 @@ pub(super) mod ops {
         let pid = get_tile_block_id();
         let local: Tile<i32, { [BQ] }> = iota(shape![BQ]);
         let local = local + (pid.0 * BQ).broadcast(shape![BQ]);
+        // Pack GQA heads into the MMA row axis to reuse each K/V load across heads.
+        // GROUP=1 retains the ordinary query-only tile for small/non-GQA suffixes.
+        let heads = local % GROUP.broadcast(shape![BQ]) + (pid.1 * GROUP).broadcast(shape![BQ]);
+        let local = local / GROUP.broadcast(shape![BQ]);
         let valid_q = lt_tile(local, query_count.broadcast(shape![BQ]));
         let positions_q = local + absolute_start.broadcast(shape![BQ]);
         let packed_q = local + query_start.broadcast(shape![BQ]);
         let columns: Tile<i32, { [64] }> = iota(shape![64]);
-        let q_columns = columns + (pid.1 * 64).broadcast(shape![64]);
+
         let q_offsets = (packed_q * q.shape()[1].broadcast(shape![BQ]))
             .reshape(shape![BQ, 1])
             .broadcast(shape![BQ, 64])
-            + q_columns.reshape(shape![1, 64]).broadcast(shape![BQ, 64]);
+            + (heads * 64i32.broadcast(shape![BQ]))
+                .reshape(shape![BQ, 1])
+                .broadcast(shape![BQ, 64])
+            + columns.reshape(shape![1, 64]).broadcast(shape![BQ, 64]);
         let q_base: PointerTile<*const T, { [] }> = pointer_to_tile(q.as_ptr());
         let q_base: PointerTile<*const T, { [1, 1] }> = q_base.reshape(shape![1, 1]);
         let q_base: PointerTile<*const T, { [BQ, 64] }> = q_base.broadcast(shape![BQ, 64]);
@@ -434,8 +446,8 @@ pub(super) mod ops {
         let causal_q = (positions_q + 1i32.broadcast(shape![BQ]))
             .reshape(shape![BQ, 1])
             .broadcast(shape![BQ, BK]);
-        let kv_head = pid.1 / (qheads / kvheads);
-        let end = (pid.0 + 1) * BQ;
+        let kv_head = (pid.1 * GROUP) / (qheads / kvheads);
+        let end = ((pid.0 + 1) * BQ + GROUP - 1) / GROUP;
         let end = if end < query_count { end } else { query_count };
         let visible_end = absolute_start + end;
         let offsets_k: Tile<i32, { [BK] }> = iota(shape![BK]);
