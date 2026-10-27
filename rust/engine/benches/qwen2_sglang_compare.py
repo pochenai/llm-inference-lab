@@ -51,7 +51,9 @@ def main() -> None:
         parser.error("counts must be positive and output-tokens must exceed one")
     out = (args.results_dir or REPO / "rust/profiling/qwen2/sglang-comparison" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", CUDA_HOME="/usr/local/cuda", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", TOKENIZERS_PARALLELISM="false", PYTORCH_ALLOC_CONF="expandable_segments:True")
+    env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", CUDA_HOME="/usr/local/cuda", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", MAX_JOBS="2", TOKENIZERS_PARALLELISM="false", PYTORCH_ALLOC_CONF="expandable_segments:True")
+    # FlashInfer invokes Ninja by name; use the selected Python environment's tools.
+    env["PATH"] = str(args.sglang_python.parent.absolute()) + os.pathsep + env.get("PATH", os.defpath)
     commands: list[dict[str, Any]] = []
 
     def run(label: str, command: list[str]) -> None:
@@ -68,6 +70,7 @@ def main() -> None:
     for name in ["qwen2.rs", "sglang_qwen2.py", Path(__file__).name]:
         shutil.copy2(Path(__file__).with_name(name), out / name)
     metadata = {
+        "sglang_tool_directory": str(args.sglang_python.parent.absolute()),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "binary_sha256": hashlib.sha256(frozen.read_bytes()).hexdigest(),
@@ -75,7 +78,7 @@ def main() -> None:
         "model_snapshot": str(args.model_dir.resolve()),
         "gpu": subprocess.check_output(["nvidia-smi", "--query-gpu=name,driver_version,memory.total,temperature.gpu,pstate", "--format=csv"], text=True),
         "versions": subprocess.check_output([str(args.sglang_python), "-c", "import importlib.metadata as m; print({k:m.version(k) for k in ['sglang','torch','transformers','flashinfer-python']})"], text=True),
-        "environment_overrides": {k: env[k] for k in ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "CUDA_HOME", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "TOKENIZERS_PARALLELISM", "PYTORCH_ALLOC_CONF"]},
+        "environment_overrides": {k: env[k] for k in ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "CUDA_HOME", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "MAX_JOBS", "TOKENIZERS_PARALLELISM", "PYTORCH_ALLOC_CONF"]},
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     (out / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "--", "rust/engine", ":!*.env", ":!.env*"], cwd=REPO))
