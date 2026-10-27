@@ -10,8 +10,9 @@ The Rust/cuTile engine now runs Qwen2.5-0.5B-Instruct through Scheduler/Runner,
 with streaming greedy generation, sessions, reusable scratch and metrics.
 Packed GPU batches support ragged prefill and decode. Release profiling led to
 KV-block attention with a measured occupancy target and larger prefill linear tiles.
-Runner now supports minimal continuous batching. Next: chunked-prefill budgets,
-with further kernel work, prefix reuse and quantization guided by measurements.
+Runner supports continuous batching and token-budgeted chunked prefill. Next:
+measure mixed-request interference; guide further kernel work, prefix reuse and
+quantization with measurements.
 Profiling and numerical/lifecycle checks accompany every phase. Week labels are
 learning units; speculative decoding and the later plan remain unchanged.
 
@@ -22,7 +23,7 @@ learning units; speculative decoding and the later plan remain unchanged.
 | 3 | KVPool/KVContext, token-slot indirection, attention, and fused KV writes | ✅ Baseline implemented |
 | 4 | CUDA Graph, pooled workspace/replay, and mapped host output | ✅ SimpleMLP implemented; Qwen pending |
 | 5 | Qwen2.5-0.5B-Instruct: operators, reference checks, scratch reuse, metrics and benchmark | ✅ Done |
-| 6 | Continuous batching and chunked-prefill scheduling on the existing token-step API | 🚧 Continuous batching implemented; chunked prefill pending |
+| 6 | Continuous batching and chunked-prefill scheduling on the existing token-step API | ✅ Minimal implementation; mixed-workload performance evaluation pending |
 | 7 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
 | 8 | Quantization on Qwen | ⬜ Planned |
 | 9 | Speculative decoding | ⬜ Planned |
@@ -52,9 +53,9 @@ record short/long prefill and decode at batch sizes 1 and 4. The subsequent
 sizes 1, 2 and 4 with larger prefill linear tiles and attention occupancy targets.
 Split-KV decode remains open before revisiting Qwen CUDA Graph submission costs.
 Continuous batching admits new requests between packed forwards and releases
-finished requests independently. Chunked-prefill scheduling is next; radix caching
-and quantization follow.
-Existing chunked-KV correctness checks do not imply chunked-prefill scheduling.
+finished requests independently. Chunked prefill shares a bounded token budget
+with decode; intermediate chunks advance KV without emitting predictions. Mixed
+long/short workload profiling is next; radix caching and quantization follow.
 
 ## Future plans
 

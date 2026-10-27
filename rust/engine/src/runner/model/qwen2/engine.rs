@@ -1685,6 +1685,9 @@ mod tests {
         );
         let owned_pool = pool.clone();
         let runner = crate::runner::model_runner::RunnerBuilder::default()
+            // Force several Runner prefill chunks, including concurrent prompts
+            // and a continuation with one previously sampled uncached token.
+            .with_max_batch_tokens(std::num::NonZeroUsize::new(7).unwrap())
             .with_model_factory(move || async move { Ok(model) })
             .with_pool_factory(move |_| async move { Ok(owned_pool) })
             .with_policy_factory(move || Ok(policy))

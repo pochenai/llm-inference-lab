@@ -30,8 +30,9 @@ target occupancy 2 for linear and 4 for attention, without additional GPU scratc
    supports SimpleMLP only. Compare CPU submission, GPU work and timeline gaps
    without treating their durations as additive.
 3. Minimal continuous batching now admits new requests between forwards and
-   releases completed KV independently; clients serialize turns of one session. Next add chunked-prefill
-   budgets and measure interference on mixed long/short arrivals.
+   releases completed KV independently; clients serialize turns of one session.
+   Chunked prefill shares a bounded per-forward token budget with decode. Next
+   measure interference on mixed long/short arrivals and tune the budget.
    Radix prefix caching and quantization remain subsequent experiments.
 
 Packed Qwen GPU execution is implemented: ragged suffixes, different cached
@@ -113,9 +114,9 @@ prerequisite week.
 
 Current checkpoint: loader, Scheduler/Runner, KV/attention, SimpleMLP CUDA
 Graph and Qwen FP32 generation are implemented. Graph caching uses exact shapes;
-Qwen uses eager execution with packed ragged GPU batches. Chunked appends are numerically
-validated; interleaved chunked-prefill scheduling and radix
-prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
+Qwen uses eager execution with packed ragged GPU batches. Runner now interleaves
+chunked prefill with decode under a token budget; mixed-workload performance
+evaluation and radix prefix sharing remain open. See the [engine guide](rust/engine/README.md) for
 commands and metric contracts.
 
 多模态编码器、LoRA 服务、structured output、弹性伸缩在扩展表中了解位置；本轮主线覆盖文本自回归 LLM inference，不要求深入所有相邻工作负载。
@@ -308,11 +309,17 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 
 #### W6: step-level generation, continuous batching, and chunked prefill
 
-Status: minimal continuous batching implemented; chunked-prefill scheduling remains open.
+Status: minimal continuous batching and token-budgeted chunked prefill implemented;
+mixed-workload performance evaluation remains open.
 Runner admits requests at forward boundaries, dynamically changes packed batch membership,
 protects active requests' future KV budget, and rejects accidental same-session overlap
 under the client-serialized session contract.
-Correct chunked KV appends do not yet establish an interleaved chunked-prefill scheduler.
+Runner's internal MixedChunkPolicy reserves decode tokens and fills the remaining
+budget with prefill chunks. It returns borrowed ScheduledRequest entries through
+BatchPolicy::plan; intermediate prefill chunks commit KV without
+emitting or counting their discarded prediction. The default budget is 512 input
+tokens per forward and is configurable through RunnerBuilder. The existing model
+API computes an unused LM head on intermediate chunks; measure before separating it.
 
 **Focus**
 

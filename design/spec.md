@@ -316,9 +316,51 @@ retraction remain future policy refinements.
 
 The directory lock lasts only for lookup/insertion/removal; a session's async
 guard covers its turn, including GPU completion. Runner submits one packed forward
-at a time. Full prefills and decodes can share it through the existing ModelInput
-suffixes. Chunked-prefill budgets are not implemented, so a newly admitted long
-prefill can still delay existing decodes. Each completed step yields to Tokio so
+at a time. `RunnerBuilder::with_max_batch_tokens(NonZeroUsize)` bounds the sum of
+uncached input tokens in that forward (default 512, a policy default rather than
+a tuned optimum). Runner's internal `BatchPolicy` selects work without owning or
+copying request state. `MixedChunkPolicy` reserves one token for each existing
+decode, then attempts prefill chunks in active order using the remaining budget.
+Both execute together; without prefill work/budget, the forward contains decode
+only. A turn enters decode after its first output token; a one-token prompt is
+still prefill. If decodes alone exceed the budget, excess requests wait in active
+order. Requests that do not fit keep their state unchanged.
+The budget is separate from admission's full-turn KV capacity protection.
+
+```rust
+struct ScheduledRequest<'a, 'tok, P: KVPool> {
+    request: &'a mut ActiveRequest<'tok, P>,
+    /// Exclusive token position to compute up to in this forward.
+    compute_end: usize,
+}
+
+trait BatchPolicy {
+    fn plan<'a, 'tok, P: KVPool>(
+        &mut self,
+        active: &'a mut [ActiveRequest<'tok, P>],
+    ) -> Vec<ScheduledRequest<'a, 'tok, P>>;
+}
+```
+
+The trait and scheduled requests stay internal to Runner. Admission, KV lifetime,
+execution and result settlement remain Runner responsibilities; this policy only
+selects work among admitted requests. No RequestView or separate BatchPlan is needed.
+
+Runner passes `&history[..compute_end]` to ModelInput, where
+`compute_end = ready_len + selected_input_tokens`. Every chunk runs all
+model layers and commits its KV before scheduling continues. If `compute_end < history.len()`,
+the returned prediction is discarded: no CPU token append, output delta, EOS check,
+or generated-token budget decrement occurs. The last chunk samples the first real
+output token; subsequent decode steps compute the last generated token's KV.
+Session continuation uses the same rule, including any previously generated
+uncached final token. No separate prefill cursor is needed: ready_len is the cursor.
+
+The existing next_tokens API also computes an unused LM head/readback on intermediate
+chunks. This is an initial implementation shortcut; split prefill/sampling execution
+only if profiling justifies that extra contract. Chunk size bounds input rows, not
+attention latency: long cached histories can still make a chunk expensive. This
+does not implement preemption or adaptive fairness/SLO policy.
+Each completed step yields to Tokio so
 ingress and reply routing progress even for an immediately-ready model future.
 
 Runner holds the existing mutex guards, takes their states into local variables,
@@ -337,7 +379,7 @@ model-wide error result is added. Earlier completed execution groups stay saved.
 
 ```rust
 pub struct ModelInput<'a, P: KVPool> {
-    pub token_ids: &'a [u32], // Full history; compute only [kv.ready_len()..].
+    pub token_ids: &'a [u32], // History through compute_end; compute [kv.ready_len()..].
     pub kv: &'a mut KVContext<P>,
 }
 
@@ -770,8 +812,8 @@ Destination revalidates/protects prefix hits; stale stateless hits can recompute
 Session requests go to their owner;
 migration needs history and KV transfer. Namespace separates model/adapter/position
 semantics; transfers also check dtype/layout/shards. Prefix routing needs tokenizer
-semantics shared with Runner. Remote transfer, prefix routing and chunked-prefill
-budgets remain future extensions. Publish only ready prefixes; evict only unused slots.
+semantics shared with Runner. Remote transfer and prefix routing remain future
+extensions. Publish only ready prefixes; evict only unused slots.
 
 # Model loader
 

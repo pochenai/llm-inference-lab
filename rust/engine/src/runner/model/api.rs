@@ -9,7 +9,8 @@ use crate::runner::kv_pool::{KVContext, KVPool};
 use super::ModelError;
 
 pub struct ModelInput<'a, P: KVPool> {
-    /// Full accepted token history; only token_ids[kv.ready_len()..] is computed.
+    /// History through this step's end; only token_ids[kv.ready_len()..] is computed.
+    /// Runner may pass a prefix ending inside an accepted prompt for chunked prefill.
     pub token_ids: &'a [u32],
     pub kv: &'a mut KVContext<P>,
 }

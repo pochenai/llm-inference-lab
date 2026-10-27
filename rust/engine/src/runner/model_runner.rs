@@ -12,8 +12,13 @@
 //! Scheduling does not switch requests between individual layers or CTAs.
 //! Shared-reference APIs/resource pools permit broader use but do not change this
 //! Runner policy. Tokens/KV survive across steps; hidden intermediates are temporary.
+//! MixedChunkPolicy reserves decode tokens and fills the rest with prefill chunks.
+//! Intermediate chunks commit KV without appending or emitting their sampled token.
 
-use std::{collections::VecDeque, future::Future, sync::Arc};
+mod batch_policy;
+
+use self::batch_policy::{BatchPolicy, MixedChunkPolicy};
+use std::{collections::VecDeque, future::Future, num::NonZeroUsize, sync::Arc};
 
 use cuda_async::{device_context::global_policy, scheduling_policies::SchedulingPolicy};
 use dashmap::DashMap;
@@ -34,6 +39,7 @@ use crate::{
 };
 
 type Policy = Arc<dyn SchedulingPolicy + 'static>;
+const DEFAULT_MAX_BATCH_TOKENS: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 type Decoder<'a> = tokenizers::DecodeStream<
     'a,
     tokenizers::ModelWrapper,
@@ -104,6 +110,7 @@ pub struct RunnerBuilder<
     model_factory: MF,
     pool_factory: PF,
     policy_factory: SF,
+    max_batch_tokens: NonZeroUsize,
 }
 
 impl Default for RunnerBuilder {
@@ -112,6 +119,7 @@ impl Default for RunnerBuilder {
             model_factory: DefaultModelFactory,
             pool_factory: DefaultPoolFactory,
             policy_factory: || Ok(global_policy(0)?),
+            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
         }
     }
 }
@@ -122,6 +130,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             model_factory: factory,
             pool_factory: self.pool_factory,
             policy_factory: self.policy_factory,
+            max_batch_tokens: self.max_batch_tokens,
         }
     }
 
@@ -130,6 +139,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             model_factory: self.model_factory,
             pool_factory: factory,
             policy_factory: self.policy_factory,
+            max_batch_tokens: self.max_batch_tokens,
         }
     }
 
@@ -138,7 +148,16 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             model_factory: self.model_factory,
             pool_factory: self.pool_factory,
             policy_factory: factory,
+            max_batch_tokens: self.max_batch_tokens,
         }
+    }
+
+    /// Limit uncached input tokens per forward, including one token per decode.
+    /// MixedChunkPolicy reserves decode tokens and fills the remaining budget with
+    /// prefill chunks in active order; the default is 512 tokens.
+    pub fn with_max_batch_tokens(mut self, limit: NonZeroUsize) -> Self {
+        self.max_batch_tokens = limit;
+        self
     }
 
     pub fn build<M, P>(
@@ -157,13 +176,9 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             let policy = (self.policy_factory)()?;
             let model = self.model_factory.create(()).await?;
             let pool = self.pool_factory.create(policy.clone()).await?;
-            Ok(ModelRunner::new(
-                command_rx,
-                batch_reply_tx,
-                model,
-                pool,
-                policy,
-            ))
+            let mut runner = ModelRunner::new(command_rx, batch_reply_tx, model, pool, policy);
+            runner.max_batch_tokens = self.max_batch_tokens;
+            Ok(runner)
         }
     }
 }
@@ -178,6 +193,7 @@ pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
     pool: Arc<P>,
     policy: Policy,
     sessions: DashMap<SessionId, SessionEntry<P>>,
+    max_batch_tokens: NonZeroUsize,
 }
 
 struct SessionProgress {
@@ -268,6 +284,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
             pool,
             policy,
             sessions: DashMap::new(),
+            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
         }
     }
 
@@ -452,7 +469,8 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
     }
 
     /// One normal scheduling loop: ingest, admit, execute one packed forward, then
-    /// settle completions. Full prefills may join decodes; chunk budgets are deferred.
+    /// settle completions. Decode gets budget first; prefill advances in bounded
+    /// chunks. Only the last prompt chunk consumes a generation token budget.
     async fn drive(
         &self,
         commands: &mut mpsc::UnboundedReceiver<RunnerCommand>,
@@ -461,6 +479,7 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
         let tokenizer = self.model.tokenizer();
         let mut waiting = VecDeque::<SessionRequest<Encoding>>::new();
         let mut active: Vec<ActiveRequest<'_, P>> = Vec::new();
+        let mut batch_policy = MixedChunkPolicy::new(self.max_batch_tokens);
         loop {
             // A finite ingress snapshot prevents a continuous producer from starving GPU steps.
             for _ in 0..commands.len() {
@@ -505,25 +524,33 @@ impl<M: CausalModel<P>, P: KVPool> ModelRunner<M, P> {
                 }
                 continue;
             }
-            let mut inputs: Vec<_> = active
-                .iter_mut()
-                .map(|turn| ModelInput {
-                    token_ids: &turn.state.tokens,
-                    kv: &mut turn.state.kv,
-                })
-                .collect();
-            let outputs = self
-                .model
-                .next_tokens(&mut inputs, self.policy.clone())
-                .await;
+            let mut scheduled = batch_policy.plan(&mut active);
+            let outputs = {
+                let mut inputs: Vec<_> = scheduled
+                    .iter_mut()
+                    .map(|step| ModelInput {
+                        token_ids: &step.request.state.tokens[..step.compute_end],
+                        kv: &mut step.request.state.kv,
+                    })
+                    .collect();
+                self.model
+                    .next_tokens(&mut inputs, self.policy.clone())
+                    .await
+            };
             assert_eq!(
                 outputs.len(),
-                active.len(),
+                scheduled.len(),
                 "one next-token result per input"
             );
-            for (turn, output) in active.iter_mut().zip(outputs) {
+            for (step, output) in scheduled.into_iter().zip(outputs) {
+                let turn = step.request;
                 match output {
                     Ok(token) => {
+                        if step.compute_end < turn.state.tokens.len() {
+                            // shortcut: next_tokens also computes the LM head for
+                            // intermediate chunks; split prefill only if profiling warrants it.
+                            continue;
+                        }
                         Arc::make_mut(&mut turn.state.tokens).push(token);
                         turn.remaining -= 1;
                         turn.generated_tokens += 1;
@@ -658,6 +685,7 @@ mod tests {
     #[derive(Debug)]
     struct ForwardStep {
         histories: Vec<Vec<u32>>,
+        ready_lens: Vec<usize>,
         resume: tokio::sync::oneshot::Sender<()>,
     }
 
@@ -688,6 +716,7 @@ mod tests {
             self.steps
                 .send(ForwardStep {
                     histories: batch.iter().map(|input| input.token_ids.to_vec()).collect(),
+                    ready_lens: batch.iter().map(|input| input.kv.ready_len()).collect(),
                     resume,
                 })
                 .unwrap();
@@ -707,6 +736,13 @@ mod tests {
 
     impl ContinuousRunner {
         async fn new(config: NaiveKVPoolConfig) -> Result<Self, EngineError> {
+            Self::with_budget(config, DEFAULT_MAX_BATCH_TOKENS).await
+        }
+
+        async fn with_budget(
+            config: NaiveKVPoolConfig,
+            max_batch_tokens: NonZeroUsize,
+        ) -> Result<Self, EngineError> {
             let policy = global_policy(0)?;
             let pool = NaiveKVPool::new(config, &policy).await?;
             let (steps, step_rx) = mpsc::unbounded_channel();
@@ -733,7 +769,8 @@ mod tests {
                     },
                 )],
             );
-            let runner = ModelRunner::new(rx, replies, model, pool.clone(), policy);
+            let mut runner = ModelRunner::new(rx, replies, model, pool.clone(), policy);
+            runner.max_batch_tokens = max_batch_tokens;
             let task = tokio::spawn(runner.run(cancel.child_token()));
             Ok(Self {
                 scheduler,
@@ -768,6 +805,188 @@ mod tests {
             ..Default::default()
         });
         request
+    }
+
+    #[tokio::test]
+    async fn mixed_chunk_policy_reserves_decode_without_prioritizing_one_token_prompts(
+    ) -> Result<(), EngineError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let runner = runner().await?;
+        let tokenizer = runner.model.tokenizer();
+        let mut active = Vec::new();
+        for (id, input) in [(0, "1 2 3"), (1, "7"), (2, "9")] {
+            let encoded = tokenizer.encode(input, true).unwrap();
+            let request = SessionRequest::new(None, encoded).with_request_id(id);
+            active.push(runner.try_admit(&request, 0, tokenizer)?);
+        }
+        // A one-token prompt does not bypass the older prefill.
+        let mut policy = MixedChunkPolicy::new(NonZeroUsize::new(1).unwrap());
+        let steps = policy.plan(&mut active);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].request.request_id, 0);
+        assert_eq!(steps[0].compute_end, 1);
+        drop(steps);
+
+        active[2].generated_tokens = 1;
+        // The decoder is last in active order; its reservation still prevents
+        // the earlier long prefill from consuming the entire budget.
+        let mut policy = MixedChunkPolicy::new(NonZeroUsize::new(2).unwrap());
+        let steps = policy.plan(&mut active);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].request.request_id, 0);
+        assert_eq!(steps[1].request.request_id, 2);
+        assert!(steps.iter().all(|step| step.compute_end == 1));
+        drop(steps);
+        assert!(active
+            .iter()
+            .all(|request| request.state.kv.ready_len() == 0));
+
+        // No prefill budget: select pure decode. Excess decoders wait unchanged.
+        active[1].generated_tokens = 1;
+        let mut policy = MixedChunkPolicy::new(NonZeroUsize::new(1).unwrap());
+        let steps = policy.plan(&mut active);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].request.request_id, 1);
+        drop(steps);
+        assert_eq!(active[2].state.tokens.as_slice(), [9]);
+        assert!(policy.plan::<NaiveKVPool>(&mut []).is_empty());
+        drop(active);
+        assert_eq!(runner.pool.metrics().index.assigned_bytes, 0);
+        Ok(())
+    }
+
+    /// Intermediate chunks only advance KV: no sampled token is appended, counted
+    /// or decoded. A short peer joins and decodes before the long prompt finishes.
+    #[tokio::test]
+    async fn chunked_prefill_interleaves_decode_and_session_continuation() -> Result<(), EngineError>
+    {
+        use futures::TryStreamExt;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let reference = runner().await?;
+        reference.open_session(0)?;
+        let expected_a = reference
+            .execute_session(generation(Some(0), "1 2 3 4 5", 2).with_request_id(100))
+            .await?;
+        let expected_a2 = reference
+            .execute_session(generation(Some(0), "10 11 12", 1).with_request_id(101))
+            .await?;
+        reference.close_session(0)?;
+        let expected_b = reference
+            .execute_session(generation(None, "7", 5).with_request_id(102))
+            .await?;
+        let mut harness = ContinuousRunner::with_budget(
+            NaiveKVPoolConfig {
+                max_rows: 2,
+                num_slots: 32,
+                max_seq_len: 32,
+                ..Default::default()
+            },
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await?;
+        let scheduler = harness.scheduler.clone();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let session = scheduler.open_session().await?;
+            let b = scheduler.execute_stream(generation(None, "7", 5))?;
+            let first = harness.step().await;
+            assert_eq!(first.histories, [vec![7]]);
+            assert_eq!(first.ready_lens, [0]);
+            let a = scheduler.execute_stream(generation(Some(session), "1 2 3 4 5", 2))?;
+            first.resume.send(()).unwrap();
+            for end in 1..=4 {
+                let step = harness.step().await;
+                assert_eq!(step.members(), [7, 1]);
+                assert_eq!(step.histories[0].len(), end + 1);
+                assert_eq!(step.histories[1], (1..=end as u32).collect::<Vec<_>>());
+                assert_eq!(step.ready_lens, [end, end - 1]);
+                // One decode token plus one prefill token fills the two-token
+                // budget. Intermediate chunks never append a prediction to A.
+                assert_eq!(
+                    step.histories
+                        .iter()
+                        .zip(&step.ready_lens)
+                        .map(|(ids, &ready)| ids.len() - ready)
+                        .sum::<usize>(),
+                    2
+                );
+                step.resume.send(()).unwrap();
+            }
+            let last_prefill = harness.step().await;
+            let b = b.try_collect::<Vec<_>>().await?;
+            assert_eq!(
+                b.iter().map(|r| r.output.as_str()).collect::<String>(),
+                expected_b.output
+            );
+            assert_eq!(harness.finished_tokens.lock().unwrap().get(&0), Some(&5));
+            assert!(!harness.finished_tokens.lock().unwrap().contains_key(&1));
+            // B finished while A's prompt still needed its final token's KV.
+            assert_eq!(last_prefill.histories, [vec![1, 2, 3, 4, 5]]);
+            assert_eq!(last_prefill.ready_lens, [4]);
+            last_prefill.resume.send(()).unwrap();
+            let decode = harness.step().await;
+            assert_eq!(decode.histories[0].len(), 6);
+            assert_eq!(decode.ready_lens, [5]);
+            decode.resume.send(()).unwrap();
+            let a = a.try_collect::<Vec<_>>().await?;
+            assert_eq!(
+                a.iter().map(|r| r.output.as_str()).collect::<String>(),
+                expected_a.output
+            );
+            let a2 = scheduler.execute_stream(generation(Some(session), "10 11 12", 1))?;
+            let sixth = harness.step().await;
+            assert_eq!(sixth.ready_lens, [6]);
+            assert_eq!(sixth.histories[0].len(), 8);
+            assert_eq!(sixth.histories[0][7], 10);
+            sixth.resume.send(()).unwrap();
+            let seventh = harness.step().await;
+            assert_eq!(seventh.ready_lens, [8]);
+            assert_eq!(seventh.histories[0].len(), 10);
+            assert_eq!(&seventh.histories[0][7..], [10, 11, 12]);
+            seventh.resume.send(()).unwrap();
+            let a2 = a2.try_collect::<Vec<_>>().await?;
+            assert_eq!(
+                a2.iter().map(|r| r.output.as_str()).collect::<String>(),
+                expected_a2.output
+            );
+            assert_eq!(
+                *harness.finished_tokens.lock().unwrap(),
+                HashMap::from([(0, 5), (1, 2), (2, 1)])
+            );
+            scheduler.close_session(session).await?;
+            Ok::<_, EngineError>(())
+        })
+        .await
+        .expect("chunked generation must make progress");
+        harness.stop().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_budget_one_keeps_unscheduled_requests_intact(
+    ) -> Result<(), EngineError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let mut runner = runner().await?;
+        let batch = vec![
+            generation(None, "1 2 3 4 5", 3).with_request_id(0),
+            generation(None, "7", 3).with_request_id(1),
+            generation(None, "10 11 12", 2).with_request_id(2),
+        ];
+        let expected = runner.execute_collect(batch.clone()).await;
+        for limit in [1, 2, 3] {
+            runner.max_batch_tokens = NonZeroUsize::new(limit).unwrap();
+            let actual = tokio::time::timeout(
+                Duration::from_secs(30),
+                runner.execute_collect(batch.clone()),
+            )
+            .await
+            .expect("a budget smaller than the active set must still make progress");
+            for ((id, value), (expected_id, expected)) in actual.into_iter().zip(&expected) {
+                assert_eq!(id, *expected_id);
+                assert_eq!(value?.output, expected.as_ref().unwrap().output);
+            }
+            assert_eq!(runner.pool.metrics().layers.assigned_bytes, 0);
+        }
+        Ok(())
     }
 
     /// Happy path: [A] -> [A, B] -> [A] -> [C] -> [C, A2].

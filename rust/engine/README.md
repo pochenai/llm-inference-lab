@@ -310,6 +310,23 @@ while let Some(chunk) = chunks.try_next().await? {
 
 Runner drives batch steps, appends generated IDs to each session's history, removes
 finished requests from later steps, and stops at EOS or max_new_tokens (default 1).
+`RunnerBuilder::with_max_batch_tokens(NonZeroUsize)` limits uncached input tokens
+per forward (default 512). Runner's internal `BatchPolicy::plan` returns borrowed
+`ScheduledRequest { request, compute_end }` entries. `MixedChunkPolicy` reserves
+one token per existing decode, fills the rest with prefill chunks in active order,
+and executes them together. Without prefill work/budget, it executes decode alone.
+A turn enters decode after its first generated token; a one-token prompt remains
+prefill. Admission and result/KV settlement stay in Runner. Requests that do not fit wait
+until a later forward. Each prefill chunk completes all model layers and commits
+KV; only the final chunk appends/emits a generated token and consumes max_new_tokens.
+Intermediate chunks currently compute and discard next_tokens' LM-head prediction.
+Accepted CPU history stays intact; ModelInput borrows a prefix ending at the chunk
+boundary. Session continuation also computes any uncached last output token first.
+The token budget bounds packed scratch rows, not cached-history attention latency;
+it does not replace full-turn KV admission or implement preemption.
+The Qwen example exposes the same setting as `--max-batch-tokens`, for example
+`--max-batch-tokens 7 --max-new-tokens 8 --reference-dir rust/engine/artifacts/qwen2`
+to force several chunks while checking the reference response.
 Admission budgets include all possible generated KV positions, excluding the final
 sampled token whose KV will be computed in a subsequent turn. Only pure greedy
 settings are supported. Mid-turn cancellation releases contexts; partial failed

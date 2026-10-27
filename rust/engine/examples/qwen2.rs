@@ -39,6 +39,9 @@ struct Args {
     /// Maximum number of generated tokens; must be positive.
     #[arg(long, default_value = "8")]
     max_new_tokens: NonZeroUsize,
+    /// Maximum uncached input tokens per Runner forward, shared by decode and prefill.
+    #[arg(long, default_value = "512")]
+    max_batch_tokens: NonZeroUsize,
     /// Directory containing reference.json and logits.f32 for validation.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
@@ -53,6 +56,7 @@ async fn main() -> Result<()> {
         model_dir,
         prompt,
         max_new_tokens,
+        max_batch_tokens,
         reference_dir,
         trace_steps,
     } = Args::parse();
@@ -151,6 +155,7 @@ async fn main() -> Result<()> {
     );
     let owned_pool = pool.clone();
     let runner = RunnerBuilder::default()
+        .with_max_batch_tokens(max_batch_tokens)
         .with_model_factory(move || async move { Ok(model) })
         .with_pool_factory(move |_| async move { Ok(owned_pool) })
         .with_policy_factory(move || Ok(policy))
