@@ -66,10 +66,13 @@ use cutile::{
 };
 use futures::FutureExt;
 use serde::Deserialize;
-use std::{ops::Range, path::Path, sync::Arc, time::Instant};
+use std::{ffi::CStr, ops::Range, path::Path, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 
 const KV_TOKENS_PER_TILE: i32 = 32;
+// Keep narrow/decode work on the scalar path; tiled prefill reuses K/V across queries.
+const ATTENTION_PREFILL_TILE: [usize; 2] = [32, 64];
+const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
 
@@ -512,6 +515,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             .workspaces
             .acquire(rows, batch.len(), &self.config, exec)?;
         let metadata = {
+            let _range = crate::profiling::ScopedRange::new(c"qwen2.metadata");
             let views = batch
                 .iter()
                 .map(|input| input.kv.read_view(0))
@@ -519,94 +523,98 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             self.attention
                 .prepare_metadata(rows, &views, &query_ranges, exec)?
         };
-        // Keep host-only batches packed into one upload/embedding launch. Pure
-        // decode can likewise reuse a contiguous previous GPU batch without packing.
-        let contiguous_feedback = match &batch[0].token_ids {
+        {
+            let _range = crate::profiling::ScopedRange::new(c"qwen2.embedding");
+            // Keep host-only batches packed into one upload/embedding launch. Pure
+            // decode can likewise reuse a contiguous previous GPU batch without packing.
+            let contiguous_feedback = match &batch[0].token_ids {
             ModelTokens::Device(first) if batch.iter().enumerate().all(|(index, input)| {
                 matches!(&input.token_ids, ModelTokens::Device(token)
                     if Arc::ptr_eq(&token.values, &first.values) && token.index == first.index + index)
             }) => Some(first),
             _ => None,
         };
-        if batch
-            .iter()
-            .all(|input| !matches!(input.token_ids, ModelTokens::Device(_)))
-        {
-            let ids = self.input_uploads.upload_iter(
-                batch.iter().flat_map(|input| {
-                    input.token_ids.host().unwrap()[input.kv.pending_range().unwrap().start..]
-                        .iter()
-                        .copied()
-                }),
-                exec,
-            )?;
-            kernels::embedding(
-                (&mut scratch.x).partition([1, 256]),
-                ids,
-                self.embedding.clone(),
-            )
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
-        } else if let Some(first) = contiguous_feedback {
-            // acquire retains the workspace lease on exec; this raw write covers
-            // exactly the rows subsequently read by the first layer on the same stream.
-            kernels::embedding_at(
-                scratch.x.device_pointer(),
-                first.values.clone(),
-                self.embedding.clone(),
-                first.index as i32,
-                0,
-                self.config.hidden_size as i32,
-                self.config.vocab_size as i32,
-            )
-            .grid((
-                batch.len() as u32,
-                self.config.hidden_size.div_ceil(256) as u32,
-                1,
-            ))
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
-        } else {
-            // Source addresses bypass typed kernel arguments, so retain their owners
-            // explicitly. Adjacent feedback usually shares one previous batch buffer.
-            let mut retained_source = None;
-            for input in batch.iter() {
-                if let ModelTokens::Device(token) = &input.token_ids {
-                    if retained_source.is_none_or(|previous| !Arc::ptr_eq(previous, &token.values))
-                    {
-                        exec.retain(token.values.clone())?;
-                        retained_source = Some(&token.values);
+            if batch
+                .iter()
+                .all(|input| !matches!(input.token_ids, ModelTokens::Device(_)))
+            {
+                let ids = self.input_uploads.upload_iter(
+                    batch.iter().flat_map(|input| {
+                        input.token_ids.host().unwrap()[input.kv.pending_range().unwrap().start..]
+                            .iter()
+                            .copied()
+                    }),
+                    exec,
+                )?;
+                kernels::embedding(
+                    (&mut scratch.x).partition([1, 256]),
+                    ids,
+                    self.embedding.clone(),
+                )
+                .generics(vec![T::DTYPE.to_string()])
+                .execute(exec)?;
+            } else if let Some(first) = contiguous_feedback {
+                // acquire retains the workspace lease on exec; this raw write covers
+                // exactly the rows subsequently read by the first layer on the same stream.
+                kernels::embedding_at(
+                    scratch.x.device_pointer(),
+                    first.values.clone(),
+                    self.embedding.clone(),
+                    first.index as i32,
+                    0,
+                    self.config.hidden_size as i32,
+                    self.config.vocab_size as i32,
+                )
+                .grid((
+                    batch.len() as u32,
+                    self.config.hidden_size.div_ceil(256) as u32,
+                    1,
+                ))
+                .generics(vec![T::DTYPE.to_string()])
+                .execute(exec)?;
+            } else {
+                // Source addresses bypass typed kernel arguments, so retain their owners
+                // explicitly. Adjacent feedback usually shares one previous batch buffer.
+                let mut retained_source = None;
+                for input in batch.iter() {
+                    if let ModelTokens::Device(token) = &input.token_ids {
+                        if retained_source
+                            .is_none_or(|previous| !Arc::ptr_eq(previous, &token.values))
+                        {
+                            exec.retain(token.values.clone())?;
+                            retained_source = Some(&token.values);
+                        }
                     }
                 }
+                // Upload one addressing table, including inline host IDs. No per-request
+                // uploads/launches and no extra GPU token-packing pass are required.
+                let sources = self.embedding_sources.upload_iter(
+                    batch.iter().flat_map(|input| {
+                        (0..input.uncached_len()).flat_map(move |local| match &input.token_ids {
+                            ModelTokens::BorrowedHost(_) | ModelTokens::SharedHost { .. } => [
+                                0,
+                                input.token_ids.host().unwrap()
+                                    [input.kv.pending_range().unwrap().start + local]
+                                    as u64,
+                            ],
+                            ModelTokens::Device(token) => [
+                                token.values.device_pointer().cu_deviceptr()
+                                    + (token.index * std::mem::size_of::<i32>()) as u64,
+                                0,
+                            ],
+                        })
+                    }),
+                    exec,
+                )?;
+                kernels::embedding_gather(
+                    (&mut scratch.x).partition([1, 256]),
+                    sources,
+                    self.embedding.clone(),
+                    self.config.vocab_size as i32,
+                )
+                .generics(vec![T::DTYPE.to_string()])
+                .execute(exec)?;
             }
-            // Upload one addressing table, including inline host IDs. No per-request
-            // uploads/launches and no extra GPU token-packing pass are required.
-            let sources = self.embedding_sources.upload_iter(
-                batch.iter().flat_map(|input| {
-                    (0..input.uncached_len()).flat_map(move |local| match &input.token_ids {
-                        ModelTokens::BorrowedHost(_) | ModelTokens::SharedHost { .. } => [
-                            0,
-                            input.token_ids.host().unwrap()
-                                [input.kv.pending_range().unwrap().start + local]
-                                as u64,
-                        ],
-                        ModelTokens::Device(token) => [
-                            token.values.device_pointer().cu_deviceptr()
-                                + (token.index * std::mem::size_of::<i32>()) as u64,
-                            0,
-                        ],
-                    })
-                }),
-                exec,
-            )?;
-            kernels::embedding_gather(
-                (&mut scratch.x).partition([1, 256]),
-                sources,
-                self.embedding.clone(),
-                self.config.vocab_size as i32,
-            )
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
         }
         // All layer accesses share exec's stream. A buffer is overwritten only after
         // its last consumer; no scratch allocation grows with the number of layers.
@@ -620,6 +628,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 exec,
             )?;
             self.linear(
+                c"qwen2.linear.q",
                 &mut scratch.q,
                 &scratch.norm,
                 layer.q.clone(),
@@ -627,6 +636,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 exec,
             )?;
             self.linear(
+                c"qwen2.linear.k",
                 &mut scratch.k,
                 &scratch.norm,
                 layer.k.clone(),
@@ -634,6 +644,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 exec,
             )?;
             self.linear(
+                c"qwen2.linear.v",
                 &mut scratch.v,
                 &scratch.norm,
                 layer.v.clone(),
@@ -642,25 +653,41 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             )?;
             self.rope(&mut scratch.rotated_q, &scratch.q, &metadata, exec)?;
             self.rope(&mut scratch.rotated_k, &scratch.k, &metadata, exec)?;
-            for (input, range) in batch.iter_mut().zip(&query_ranges) {
-                input.kv.store(
-                    index,
-                    scratch.rotated_k.slice(&[range.clone()])?,
-                    scratch.v.slice(&[range.clone()])?,
+            {
+                let _range = crate::profiling::ScopedRange::new(c"qwen2.kv_store");
+                for (input, range) in batch.iter_mut().zip(&query_ranges) {
+                    input.kv.store(
+                        index,
+                        scratch.rotated_k.slice(&[range.clone()])?,
+                        scratch.v.slice(&[range.clone()])?,
+                        exec,
+                    )?;
+                }
+            }
+            if GqaAttention::use_tiled_prefill::<T>(&query_ranges) {
+                for (input, range) in batch.iter().zip(&query_ranges) {
+                    self.attention.submit_prefill(
+                        &mut scratch.attention,
+                        &scratch.rotated_q,
+                        &input.kv.read_view(index)?,
+                        range,
+                        exec,
+                    )?;
+                }
+            } else {
+                // Shared scalar launch handles decode, small and mixed suffixes unchanged.
+                let view = batch[0].kv.read_view(index)?;
+                self.attention.submit_prepared(
+                    &mut scratch.attention,
+                    &scratch.rotated_q,
+                    &view,
+                    &metadata,
                     exec,
                 )?;
             }
-            // Preparation retains every context; all requests share this layer's backing storage.
-            let view = batch[0].kv.read_view(index)?;
-            self.attention.submit_prepared(
-                &mut scratch.attention,
-                &scratch.rotated_q,
-                &view,
-                &metadata,
-                exec,
-            )?;
             // Q projection has no remaining consumers: reuse its buffer for O/down.
             self.linear(
+                c"qwen2.linear.o",
                 &mut scratch.q,
                 &scratch.attention,
                 layer.o.clone(),
@@ -677,21 +704,33 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 exec,
             )?;
             self.linear(
+                c"qwen2.linear.gate",
                 &mut scratch.gate,
                 &scratch.norm,
                 layer.gate.clone(),
                 None,
                 exec,
             )?;
-            self.linear(&mut scratch.up, &scratch.norm, layer.up.clone(), None, exec)?;
-            kernels::swiglu(
-                (&mut scratch.activated).partition([1, 256]),
-                &scratch.gate,
-                &scratch.up,
-            )
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
             self.linear(
+                c"qwen2.linear.up",
+                &mut scratch.up,
+                &scratch.norm,
+                layer.up.clone(),
+                None,
+                exec,
+            )?;
+            {
+                let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
+                kernels::swiglu(
+                    (&mut scratch.activated).partition([1, 256]),
+                    &scratch.gate,
+                    &scratch.up,
+                )
+                .generics(vec![T::DTYPE.to_string()])
+                .execute(exec)?;
+            }
+            self.linear(
+                c"qwen2.linear.down",
                 &mut scratch.q,
                 &scratch.activated,
                 layer.down.clone(),
@@ -709,12 +748,14 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             exec,
         )?;
         self.linear(
+            c"qwen2.linear.lm_head",
             &mut scratch.logits,
             &scratch.final_norm,
             self.lm_head.clone(),
             None,
             exec,
         )?;
+        let _argmax = crate::profiling::ScopedRange::new(c"qwen2.argmax");
         let blocks = self.config.vocab_size.div_ceil(256);
         kernels::argmax_blocks(
             (&mut scratch.maxima).partition([1, 1]),
@@ -740,12 +781,14 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
 
     unsafe fn linear<O: DType>(
         &self,
+        name: &'static CStr,
         out: &mut Tensor<O>,
         x: &Tensor<T>,
         w: Weight<T>,
         bias: Option<Weight<T>>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(name);
         let k = x.shape()[1] as usize;
         let has_bias = bias.is_some();
         // Bias-free specializations never read this existing rank-one weight.
@@ -779,6 +822,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
         let width = self.config.hidden_size;
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.rms_norm");
         let last_rows_offset = x.shape()[0] * kernels::TOKEN_METADATA_WIDTH;
         kernels::rms_norm(
             out.partition([1, width.next_power_of_two()]),
@@ -805,6 +849,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.rope");
         kernels::rope(out.partition([1, 64]), x, self.inv_freq.clone(), metadata)
             .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
@@ -820,6 +865,57 @@ struct GqaAttention {
 }
 
 impl GqaAttention {
+    /// Dispatch by per-context query count, never total packed rows across requests.
+    /// Mixed/small suffixes and FP32 retain the existing scalar path.
+    fn use_tiled_prefill<T: DType>(ranges: &[Range<usize>]) -> bool {
+        T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && !ranges.is_empty()
+            && ranges
+                .iter()
+                .all(|range| range.len() >= MIN_TILED_PREFILL_QUERIES)
+    }
+
+    /// Output storage is retained by the caller; this launch writes only this request's rows.
+    /// Slot indirection and absolute causal positions support cached/chunked/ragged prefill.
+    unsafe fn submit_prefill<T: DType>(
+        &self,
+        out: &mut Tensor<T>,
+        q: &Tensor<T>,
+        view: &NaiveReadView<'_, T>,
+        queries: &Range<usize>,
+        exec: &ExecutionContext,
+    ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.attention.prefill");
+        view.retain(exec)?;
+        let (k, v, table) = view.tensors();
+        kernels::attention_prefill(
+            out.device_pointer(),
+            q,
+            k.clone(),
+            v.clone(),
+            table.clone(),
+            view.row() as i32,
+            queries.start as i32,
+            queries.len() as i32,
+            (view.positions().end - queries.len()) as i32,
+            view.positions().start as i32,
+            self.q_heads as i32,
+            self.kv_heads as i32,
+        )
+        .generics(vec![
+            T::DTYPE.to_string(),
+            ATTENTION_PREFILL_TILE[0].to_string(),
+            ATTENTION_PREFILL_TILE[1].to_string(),
+        ])
+        .grid((
+            queries.len().div_ceil(ATTENTION_PREFILL_TILE[0]) as u32,
+            self.q_heads as u32,
+            1,
+        ))
+        .execute(exec)?;
+        Ok(())
+    }
+
     /// Per packed token: context row, absolute position, visible history start.
     /// The tail stores range.end - 1 for each request's final RMSNorm/LM-head row.
     /// Built/uploaded once per forward and reused by RoPE and every attention layer.
@@ -891,6 +987,7 @@ impl GqaAttention {
         metadata: &Tensor<i32>,
         exec: &ExecutionContext,
     ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.attention");
         view.retain(exec)?;
         let (k, v, table) = view.tensors();
         kernels::attention(
@@ -930,7 +1027,16 @@ impl<T: DType + ElementType> AttentionBackend<NaiveKVPool<T>> for GqaAttention {
                 .reshape(&[q.shape()[0] as usize, self.q_heads * 64])?;
             let metadata =
                 self.prepare_metadata(q.shape()[0] as usize, views, query_ranges, exec)?;
-            self.submit_prepared(&mut out, &q, &views[0], &metadata, exec)?;
+            if Self::use_tiled_prefill::<T>(query_ranges) {
+                // Raw output writes must survive an error before this handle is returned.
+                // The alias is retained only; all accesses remain ordered on this exec.
+                exec.retain(out.into_shared_alias())?;
+                for (view, queries) in views.iter().zip(query_ranges) {
+                    self.submit_prefill(&mut out, &q, view, queries, exec)?;
+                }
+            } else {
+                self.submit_prepared(&mut out, &q, &views[0], &metadata, exec)?;
+            }
             Ok(Arc::new(out))
         }
     }
@@ -1218,6 +1324,7 @@ unsafe fn add<T: DType>(
     y: &Tensor<T>,
     exec: &ExecutionContext,
 ) -> Result<(), ModelError> {
+    let _range = crate::profiling::ScopedRange::new(c"qwen2.residual_add");
     kernels::add(out.partition([1, 256]), x, y)
         .generics(vec![T::DTYPE.to_string()])
         .execute(exec)?;
@@ -2523,6 +2630,85 @@ mod tests {
                 assert_eq!(output.token.as_slice()[index] as u32, expected.token);
                 history.push(output.token.as_slice()[index] as u32);
             }
+        }
+        drop(contexts);
+        assert_eq!(pool.metrics(), initial);
+        assert_eq!(model.workspace_metrics().in_use_bytes, 0);
+        Ok(())
+    }
+    #[test]
+    fn tiled_prefill_dispatch_uses_each_suffix_not_packed_batch_size() {
+        use cutile::core::bf16;
+        assert!(GqaAttention::use_tiled_prefill::<bf16>(&[0..67, 67..142]));
+        assert!(!GqaAttention::use_tiled_prefill::<bf16>(&[
+            0..32,
+            32..64,
+            64..96
+        ]));
+        assert!(!GqaAttention::use_tiled_prefill::<bf16>(&[0..1, 1..200]));
+        assert!(!GqaAttention::use_tiled_prefill::<f32>(&[0..4096]));
+        assert!(!GqaAttention::use_tiled_prefill::<bf16>(&[]));
+    }
+
+    #[tokio::test]
+    async fn bf16_tiled_prefill_matches_cached_ragged_and_fp32_history() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let mut model = tiny_model_with_dtype::<bf16>(&policy).await?;
+        let mut reference = tiny_model(&policy).await?;
+        model.config.max_position_embeddings = 256;
+        reference.config.max_position_embeddings = 256;
+        let mut config = model.kv_pool_config(256)?;
+        config.max_rows = 6;
+        config.num_slots *= 6;
+        let pool = NaiveKVPool::<bf16>::new(config, &policy).await?;
+        let reference_pool = NaiveKVPool::<f32>::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let histories: Vec<Vec<u32>> = [99, 135]
+            .into_iter()
+            .enumerate()
+            .map(|(r, n)| (0..n).map(|i| ((i * 13 + r * 17) % 251) as u32).collect())
+            .collect();
+        let mut contexts = [KVContext::new(pool.clone())?, KVContext::new(pool.clone())?];
+        // Fragment A's slots with B's prefix; neither query range starts on a tile boundary.
+        for ((ids, kv), prefix) in histories.iter().zip(&mut contexts).zip([7, 11]) {
+            model
+                .step(&ids[..prefix], kv, policy.clone(), false)
+                .await?;
+        }
+        let mut inputs: Vec<_> = histories
+            .iter()
+            .zip(&mut contexts)
+            .map(|(ids, kv)| ModelInput {
+                token_ids: ids.into(),
+                kv,
+            })
+            .collect();
+        let output = model
+            .forward_batch(&mut inputs, policy.clone(), true)
+            .await?;
+        drop(inputs);
+        for (index, ids) in histories.iter().enumerate() {
+            let mut full = KVContext::new(pool.clone())?;
+            let expected = model.step(ids, &mut full, policy.clone(), true).await?;
+            let mut fp32 = KVContext::new(reference_pool.clone())?;
+            let fp32 = reference.step(ids, &mut fp32, policy.clone(), true).await?;
+            let logits =
+                &output.logits.as_ref().unwrap().as_slice()[index * 257..(index + 1) * 257];
+            for (name, values, tolerance) in [
+                ("cached/full", expected.logits.unwrap(), 0.015),
+                ("bf16/fp32", fp32.logits.unwrap(), 0.03),
+            ] {
+                let error = logits
+                    .iter()
+                    .zip(values)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(error < tolerance, "{name}: {error}");
+            }
+            assert_eq!(contexts[index].ready_len(), ids.len());
+            assert_eq!(output.token.as_slice()[index] as u32, expected.token);
         }
         drop(contexts);
         assert_eq!(pool.metrics(), initial);

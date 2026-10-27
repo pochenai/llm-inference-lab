@@ -680,3 +680,22 @@ Graph further reduces decode latency. A separate Nsight capture verifies 64 Rust
 forwards and only one final 4-byte D2H after the last kernel. Profile long prefill
 to separate attention/linear cost before tuning; these static results do not
 establish serving throughput or cross-engine generated-ID equivalence.
+
+
+### Prefill attention routing and operator profiling
+
+BF16 suffixes with at least 64 queries per context use multi-query MMA attention;
+small/mixed suffixes, FP32 and decode retain scalar attention. The tiled path shares
+K/V across queries, preserves token-slot indirection and cached/ragged causal offsets,
+and keeps online softmax/accumulation in FP32. No extra global score buffer is used.
+The initial 4K comparison improves prefill about 5.9x at B1/2/4 while leaving linear
+tiles unchanged; see the local [eager tuning report](../profiling/qwen2/bf16-eager-tuning/RESULTS.md).
+
+NVTX ranges name embedding, metadata, projection roles (`qwen2.linear.q/k/v/o/gate/up/down/lm_head`),
+RMSNorm, RoPE, KV store, scalar/tiled attention, residual add, SwiGLU and argmax.
+They are thread-local synchronous submission scopes, never GPU timers or ranges
+across await. Use launch correlation / projected GPU intervals for attribution.
+The SGLang adapter offers --comparison-nvtx module hooks for profiling only; leave
+it off for native timing. It requires --disable-cuda-graph. An eager prefill capture
+uses --profile --profile-activities CUDA_PROFILER --profile-stage prefill under
+nsys --capture-range=cudaProfilerApi --capture-range-end=stop. Prewarm the same shape.

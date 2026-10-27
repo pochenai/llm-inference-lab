@@ -83,6 +83,13 @@ A separate Nsight capture confirms 64 Rust forwards followed by one final 4-byte
 D2H, with no per-step readback. Profile BF16 long prefill next to distinguish
 attention from linear cost before selecting kernel changes.
 
+Follow-up profiling identifies scalar attention as 85.8% of B4/4K kernel time.
+Multi-query BF16 MMA prefill attention is now implemented with per-context size
+routing; three-process 4K measurements improve about 5.9x at B1/2/4, with a remaining
+roughly 2x eager gap. Linear configuration is unchanged in this first isolated step.
+See the [eager tuning report](rust/profiling/qwen2/bf16-eager-tuning/RESULTS.md).
+
+
 
 ### Next sequence and comparison protocol
 

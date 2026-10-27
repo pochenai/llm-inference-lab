@@ -33,9 +33,30 @@ def main() -> None:
     bench.BenchArgs.add_cli_args(parser)
     parser.add_argument("--comparison-warmup", type=int, default=2)
     parser.add_argument("--comparison-iterations", type=int, default=3)
+    parser.add_argument("--comparison-nvtx", action="store_true", help="Profile-only module ranges; keep off for native latency measurements")
     args = parser.parse_args()
     if args.comparison_warmup < 1 or args.comparison_iterations < 1:
         parser.error("warmup and iterations must be positive")
+    if args.comparison_nvtx:
+        if not args.disable_cuda_graph:
+            parser.error("module NVTX hooks require --disable-cuda-graph")
+        load_model = bench.load_model
+
+        def instrument_model(*values: Any, **kwargs: Any) -> Any:
+            loaded = load_model(*values, **kwargs)
+            # Profile-only: hook modules, without patching SGLang kernels or installed files.
+            for name, module in loaded[0].model.named_modules():
+                if name.rsplit(".", 1)[-1] not in {"qkv_proj", "o_proj", "gate_up_proj", "down_proj", "attn", "input_layernorm", "post_attention_layernorm", "embed_tokens", "norm", "lm_head"}:
+                    continue
+                def push(_module: Any, _inputs: Any, label: str = "sglang." + name) -> None:
+                    torch.cuda.nvtx.range_push(label)
+                def pop(_module: Any, _inputs: Any, _output: Any) -> None:
+                    torch.cuda.nvtx.range_pop()
+                module.register_forward_pre_hook(push)
+                module.register_forward_hook(pop, always_call=True)
+            return loaded
+
+        bench.load_model = instrument_model
     prepare = bench.prepare_synthetic_inputs_for_latency_test
     measure = bench.latency_test_run_once
 

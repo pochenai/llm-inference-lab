@@ -374,6 +374,162 @@ pub(super) mod ops {
         out.store(result);
     }
 
+    /// Multi-query online softmax: reuse each gathered K/V tile across BQ queries.
+    /// BF16 operands feed MMA directly; scores, normalizers and accumulators stay FP32.
+    /// A launch covers one context/head group, so tiles never cross request boundaries.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn attention_prefill<T: ElementType, const BQ: i32, const BK: i32>(
+        out: *mut T,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        context_row: i32,
+        query_start: i32,
+        query_count: i32,
+        absolute_start: i32,
+        history_start: i32,
+        qheads: i32,
+        kvheads: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let local: Tile<i32, { [BQ] }> = iota(shape![BQ]);
+        let local = local + (pid.0 * BQ).broadcast(shape![BQ]);
+        let valid_q = lt_tile(local, query_count.broadcast(shape![BQ]));
+        let positions_q = local + absolute_start.broadcast(shape![BQ]);
+        let packed_q = local + query_start.broadcast(shape![BQ]);
+        let columns: Tile<i32, { [64] }> = iota(shape![64]);
+        let q_columns = columns + (pid.1 * 64).broadcast(shape![64]);
+        let q_offsets = (packed_q * q.shape()[1].broadcast(shape![BQ]))
+            .reshape(shape![BQ, 1])
+            .broadcast(shape![BQ, 64])
+            + q_columns.reshape(shape![1, 64]).broadcast(shape![BQ, 64]);
+        let q_base: PointerTile<*const T, { [] }> = pointer_to_tile(q.as_ptr());
+        let q_base: PointerTile<*const T, { [1, 1] }> = q_base.reshape(shape![1, 1]);
+        let q_base: PointerTile<*const T, { [BQ, 64] }> = q_base.broadcast(shape![BQ, 64]);
+        let q_ptrs: PointerTile<*const T, { [BQ, 64] }> = q_base.offset_tile(q_offsets);
+        let q_mask = valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, 64]);
+        let zero_q_f32: Tile<f32, { [BQ, 64] }> = constant(0.0f32, shape![BQ, 64]);
+        let zero_q: Tile<T, { [BQ, 64] }> = convert_tile(zero_q_f32);
+        let (query, _token): (Tile<T, { [BQ, 64] }>, Token) = load_ptr_tko(
+            q_ptrs,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(q_mask),
+            None::<T>,
+            None,
+            Latency::<1>,
+        );
+        let query = select(q_mask, query, zero_q);
+        let mut maximum: Tile<f32, { [BQ, 1] }> = constant(f32::NEG_INFINITY, shape![BQ, 1]);
+        let mut denominator: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
+        let mut acc: Tile<f32, { [BQ, 64] }> = constant(0.0f32, shape![BQ, 64]);
+        let zero_scores: Tile<f32, { [BQ, BK] }> = constant(0.0f32, shape![BQ, BK]);
+        let negative: Tile<f32, { [BQ, BK] }> = constant(f32::NEG_INFINITY, shape![BQ, BK]);
+        let zero_kv_f32: Tile<f32, { [BK, 64] }> = constant(0.0f32, shape![BK, 64]);
+        let zero_kv: Tile<T, { [BK, 64] }> = convert_tile(zero_kv_f32);
+        let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
+        let valid_rows = valid_q.reshape(shape![BQ, 1]);
+        let causal_q = (positions_q + 1i32.broadcast(shape![BQ]))
+            .reshape(shape![BQ, 1])
+            .broadcast(shape![BQ, BK]);
+        let kv_head = pid.1 / (qheads / kvheads);
+        let end = (pid.0 + 1) * BQ;
+        let end = if end < query_count { end } else { query_count };
+        let visible_end = absolute_start + end;
+        let offsets_k: Tile<i32, { [BK] }> = iota(shape![BK]);
+        let table_base: PointerTile<*const i32, { [] }> = pointer_to_tile(table.as_ptr());
+        let table_base: PointerTile<*const i32, { [] }> =
+            table_base.offset(context_row * table.shape()[1]);
+        let table_base: PointerTile<*const i32, { [1] }> = table_base.reshape(shape![1]);
+        let table_base: PointerTile<*const i32, { [BK] }> = table_base.broadcast(shape![BK]);
+        let k_base: PointerTile<*const T, { [] }> = pointer_to_tile(k.as_ptr());
+        let v_base: PointerTile<*const T, { [] }> = pointer_to_tile(v.as_ptr());
+        for block in 0i32..((visible_end - history_start + BK - 1) / BK) {
+            let positions_k = offsets_k + (history_start + block * BK).broadcast(shape![BK]);
+            let valid_k = lt_tile(positions_k, visible_end.broadcast(shape![BK]));
+            let table_ptrs: PointerTile<*const i32, { [BK] }> = table_base.offset_tile(positions_k);
+            let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
+                table_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid_k),
+                Some(0i32),
+                None,
+                Latency::<1>,
+            );
+            let offsets =
+                slots * (kvheads * 64).broadcast(shape![BK]) + (kv_head * 64).broadcast(shape![BK]);
+            let offsets = offsets.reshape(shape![BK, 1]).broadcast(shape![BK, 64])
+                + columns.reshape(shape![1, 64]).broadcast(shape![BK, 64]);
+            let k_base_2d: PointerTile<*const T, { [1, 1] }> = k_base.reshape(shape![1, 1]);
+            let k_base_2d: PointerTile<*const T, { [BK, 64] }> =
+                k_base_2d.broadcast(shape![BK, 64]);
+            let k_ptrs: PointerTile<*const T, { [BK, 64] }> = k_base_2d.offset_tile(offsets);
+            let v_base_2d: PointerTile<*const T, { [1, 1] }> = v_base.reshape(shape![1, 1]);
+            let v_base_2d: PointerTile<*const T, { [BK, 64] }> =
+                v_base_2d.broadcast(shape![BK, 64]);
+            let v_ptrs: PointerTile<*const T, { [BK, 64] }> = v_base_2d.offset_tile(offsets);
+            let kv_mask = valid_k.reshape(shape![BK, 1]).broadcast(shape![BK, 64]);
+            let (keys, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
+                k_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(kv_mask),
+                None::<T>,
+                None,
+                Latency::<1>,
+            );
+            let keys = select(kv_mask, keys, zero_kv);
+            let scores: Tile<f32, { [BQ, BK] }> = mma(query, keys.transpose(), zero_scores);
+            let causal = lt_tile(
+                positions_k.reshape(shape![1, BK]).broadcast(shape![BQ, BK]),
+                causal_q,
+            ) & valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, BK]);
+            let scores = select(
+                causal,
+                scores * 0.125f32.broadcast(shape![BQ, BK]),
+                negative,
+            );
+            let block_max: Tile<f32, { [BQ] }> = reduce_max(scores, 1);
+            let next = max_tile(maximum, block_max.reshape(shape![BQ, 1]));
+            // Padded query rows must not introduce -inf - -inf into the MMA operands.
+            let next = select(valid_rows, next, zero_rows);
+            let alpha = exp(maximum - next);
+            let probabilities = exp(scores - next.broadcast(shape![BQ, BK]));
+            let sum: Tile<f32, { [BQ] }> = reduce_sum(probabilities, 1);
+            denominator = denominator * alpha + sum.reshape(shape![BQ, 1]);
+            let p: Tile<T, { [BQ, BK] }> = convert_tile(probabilities);
+            let (values, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
+                v_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(kv_mask),
+                None::<T>,
+                None,
+                Latency::<1>,
+            );
+            let values = select(kv_mask, values, zero_kv);
+            acc = mma(p, values, acc * alpha.broadcast(shape![BQ, 64]));
+            maximum = next;
+        }
+        let result: Tile<T, { [BQ, 64] }> =
+            convert_tile(true_div(acc, denominator.broadcast(shape![BQ, 64])));
+        let out_base: PointerTile<*mut T, { [] }> = pointer_to_tile(out);
+        let out_base: PointerTile<*mut T, { [1, 1] }> = out_base.reshape(shape![1, 1]);
+        let out_base: PointerTile<*mut T, { [BQ, 64] }> = out_base.broadcast(shape![BQ, 64]);
+        let out_ptrs: PointerTile<*mut T, { [BQ, 64] }> = out_base.offset_tile(q_offsets);
+        store_ptr_tko(
+            out_ptrs,
+            result,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(q_mask),
+            None,
+            Latency::<1>,
+        );
+    }
+
     #[cutile::entry()]
     pub(super) fn add<T: ElementType>(
         out: &mut Tensor<T, { [1, 256] }>,
