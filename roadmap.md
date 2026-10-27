@@ -55,11 +55,34 @@ completes the next submission before the previous D2H in 63/63 adjacent pairs;
 serial is 0/63. CPU accept and D2H genuinely intersect subsequent GPU work.
 
 Keep the measurement boundaries separate: [benches/qwen2.rs](rust/engine/benches/qwen2.rs)
-remains a serial model-level baseline using next_tokens().await and per-step CPU
-readback. [sglang_qwen2.py](rust/engine/benches/sglang_qwen2.py) keeps sampled IDs on
-GPU and uses the SGLang static model path. A matched static-model comparison still
-needs a Rust GPU-resident-feedback benchmark (the forward API already supports it).
-The completed Runner A/B is not a SGLang performance result.
+retains its per-step CPU-readback baseline and now supports --gpu-feedback for
+static model comparisons. That mode uses forward().await, keeps predictions on
+GPU, checks final IDs against an untimed host-feedback control and reads final IDs
+outside timers. It does not exercise Runner serving overlap. The official SGLang
+static loop likewise synchronizes after each step; its serving scheduler is separate.
+
+The BF16 static comparison is reproducible with:
+
+```bash
+/usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir MODEL_DIR --include-sglang-graph
+```
+
+This runs eager against eager, plus a separate SGLang decode-Graph reference;
+B=1/2/4, input=32/4096, 64 outputs, two warmups, three measured samples and three
+independent process repetitions. Engine order rotates and GPU jobs run sequentially.
+Both use the same snapshot and 16640 physical KV token slots for this matrix.
+Raw samples, frozen sources/binary, backend/capture logs and version/hardware metadata
+are retained with the local [static comparison report](rust/profiling/qwen2/sglang-comparison/RESULTS.md).
+The completed Runner A/B is not a SGLang serving-performance result.
+
+Initial measured result: eager short-context decode is 26-31% lower latency in
+Rust, but 4K prefill is about 12x slower than SGLang FlashInfer. SGLang decode Graph
+is faster still; Qwen Graph is not implemented here. Three independent process
+repetitions per case support the observed directions, not serving or quality claims.
+A separate Nsight capture confirms 64 Rust forwards followed by one final 4-byte
+D2H, with no per-step readback. Profile BF16 long prefill next to distinguish
+attention from linear cost before selecting kernel changes.
+
 
 ### Next sequence and comparison protocol
 
@@ -69,12 +92,13 @@ The completed Runner A/B is not a SGLang performance result.
    /usr/bin/python3 rust/engine/benches/qwen2_runner_compare.py --model-dir MODEL_DIR --dtype f32 --profile.
    Native timing determines speedup; separate captures validate ordering and overlap.
    Retain the serial mode and evaluate mixed arrivals/chunk budgets separately.
-2. Implement the Qwen CUDA Graph option, retaining the serial/eager baseline and
-   the same ownership/completion contracts. Measure graph off/on independently.
+2. Next: profile BF16 long prefill to locate the measured gap in attention/linear.
+   Qwen CUDA Graph remains a separate decode task; retain the eager baseline and
+   ownership/completion contracts, and measure graph off/on independently.
 3. Implemented: native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
    numerical reference; validate BF16 tolerances and accumulation rather than
    requiring every generated token to match FP32 bit-for-bit.
-4. Run the matched SGLang comparison with fixed versions, model revision, dtype,
+4. Static BF16 comparison implemented; retain fixed versions, model revision, dtype,
    graph mode, batch/lengths, stopping/cache policy and timing boundaries. Alternate
    engines and collect at least three independent runs before drawing conclusions.
    Label FP32-vs-BF16 or mismatched-readback results as diagnostic. Align counts:
@@ -90,7 +114,7 @@ Reference entry: installed SGLang **0.5.9**, sglang.bench_one_batch. Use our
 [adapter](rust/engine/benches/sglang_qwen2.py), which replaces synthetic input
 preparation and repeated sampling but leaves SGLang model kernels unchanged.
 Version changes require rechecking the adapter; use the same HF snapshot/revision
-as Rust. The following is the reproducible recipe, not a recorded performance result.
+as Rust. The matrix driver above is the preferred measured protocol; the following runs the SGLang adapter alone.
 
 ```bash
 # Run from the repository root; replace with the same local checkpoint used by Rust.
@@ -101,7 +125,7 @@ CUDA_HOME=/usr/local/cuda HF_HUB_OFFLINE=1 ~/.venvs/py3.12/bin/python \
   rust/engine/benches/sglang_qwen2.py \
   --model-path "$MODEL_DIR" --dtype bfloat16 --mem-fraction-static 0.5 \
   --context-length 8192 --disable-cuda-graph \
-  --batch-size 1 2 4 --input-len 32 4096 --output-len 9 \
+  --batch-size 1 2 4 --input-len 32 4096 --output-len 64 \
   --comparison-warmup 2 --comparison-iterations 3 \
   --result-filename "$RESULT_DIR/sglang-bf16-eager.jsonl"
 ```
@@ -114,7 +138,7 @@ are appended; use a new filename/run directory for each independent experiment.
 | Setting | SGLang adapter | Rust comparison requirement |
 | --- | --- | --- |
 | Inputs | Every request uses token ID 9707 repeated to input_len; batch 1/2/4, length 32/4096 | Same token IDs, batch sizes and cached-prefix state |
-| Generation | Greedy temperature=0; one prefill plus output_len-1 decode steps; fixed loop without EOS early exit | Equal number of forwards and actual outputs; output_len=9 matches decode_steps=8 |
+| Generation | Greedy temperature=0; one prefill plus output_len-1 decode steps; fixed loop without EOS early exit | Equal number of forwards and actual outputs; output_len=64 matches decode_steps=63 |
 | Cache/warmup | Fresh Req objects and cleared request/KV allocation state per run; weights and runtime caches stay warm | Fresh request KV for every warmup/measured sample; keep weights/workspaces warm |
 | Samples | Two adapter warmups and three measured runs per configuration; upstream also has a first-case warmup | Separate warmup and measurement; repeat at least three independent process runs |
 | Precision/graphs | BF16; explicit eager baseline, then a separate graph-enabled run | Native BF16 required for matched-dtype claims; graph modes must match |
@@ -141,8 +165,8 @@ For a later serving A/B, compare the resolved default overlap configuration agai
 checking the actual timeline; do not substitute this static benchmark for that test.
 Keep two experiments distinct: model-step timing with GPU-resident sampled IDs,
 and an independent Runner/server serial-vs-overlap test with matching delivery policy.
-Our existing direct Rust benchmark still performs pinned D2H per step, so even the
-model-level comparison needs its CPU/readback boundary aligned or explicitly labeled.
+The direct Rust benchmark defaults to pinned D2H per step. The comparison driver
+explicitly selects --gpu-feedback to exclude per-step D2H in its static model timings.
 
 **Results to retain:** adapter output includes version/dtype/graph settings, batch/
 input/output lengths, warmup/iteration counts and raw samples. prefill_mean_seconds

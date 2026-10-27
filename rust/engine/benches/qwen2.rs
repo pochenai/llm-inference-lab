@@ -11,7 +11,11 @@
 //! ```bash
 //! nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --event-sample=none --backtrace=none --capture-range=cudaProfilerApi --capture-range-end=stop --output=rust/profiling/qwen2/packed-b1-t32 BENCH_PATH --model-dir MODEL_DIR --tokens 32 --batch-size 1 --decode-steps 8 --warmup 3 --iterations 5 --profile
 //! ```
-//! Timings are host wall time through GPU/D2H completion, not CUDA event/kernel time.
+//! Timings are host wall time through GPU completion, not CUDA event/kernel time.
+//! --gpu-feedback matches the static SGLang boundary: no per-step D2H/text decode.
+//! It checks final IDs against an extra untimed host-feedback run and reads final IDs
+//! after timing; prior prediction handles are dropped to avoid retaining all scratch.
+//! Without that flag, timings include pinned D2H on every step.
 //! --trace-steps adds structured tracing JSON to stderr; omit it for latency sampling.
 
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
@@ -29,7 +33,7 @@ use engine::{
         kv_pool::{KVContext, KVPool, NaiveKVPool},
         model::Qwen2Engine,
     },
-    CausalModel, ModelInput,
+    CausalModel, GpuTokenPredictionHandle, ModelInput, ModelTokens, NextToken,
 };
 use serde_json::json;
 
@@ -51,6 +55,9 @@ struct Args {
     /// Number of requests sharing one packed GPU forward.
     #[arg(long, default_value = "1")]
     batch_size: NonZeroUsize,
+    /// Optional fixed physical KV capacity for comparisons across batch/length cases.
+    #[arg(long)]
+    kv_slots: Option<NonZeroUsize>,
     #[arg(long, default_value = "1")]
     warmup: NonZeroUsize,
     #[arg(long, default_value = "3")]
@@ -60,6 +67,10 @@ struct Args {
     validate_chunked: bool,
     #[arg(long, default_value = "256")]
     chunk_size: NonZeroUsize,
+    /// Keep predictions on GPU between steps; read only the final IDs after timing.
+    /// An additional untimed host-feedback run verifies those final IDs.
+    #[arg(long)]
+    gpu_feedback: bool,
     #[arg(long)]
     trace_steps: bool,
     /// Start CUDA profiler capture after warmup and stop before diagnostic validation.
@@ -109,6 +120,13 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         .num_slots
         .checked_mul(config.max_rows)
         .ok_or_else(|| anyhow::anyhow!("batch capacity overflow"))?;
+    if let Some(slots) = args.kv_slots {
+        ensure!(
+            slots.get() >= config.num_slots,
+            "KV capacity is smaller than this batch"
+        );
+        config.num_slots = slots.get();
+    }
     let pool = NaiveKVPool::<T>::new(config, &policy).await?;
     let initial_kv = pool.metrics();
     let instance = model.workspace_metrics().model_instance.to_string();
@@ -120,16 +138,19 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     println!(
         "{}",
         json!({"event":"loaded", "seconds":load_start.elapsed().as_secs_f64(),
-        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string()})
+        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string(), "gpu_feedback":args.gpu_feedback, "kv_slots":config.num_slots, "kv_bytes":initial_kv.layers.allocated_bytes})
     );
     // Deterministic valid vocabulary IDs; this tests capacity, not natural-language quality.
     let prefix = vec![9707u32; args.tokens.get()];
     let mut expected = None;
     let mut prefills = Vec::with_capacity(args.iterations.get());
     let mut decodes = Vec::with_capacity(args.iterations.get() * args.decode_steps.get());
-    for iteration in 0..args.warmup.get() + args.iterations.get() {
-        let warmup = iteration < args.warmup.get();
-        if args.profile && iteration == args.warmup.get() {
+    let warmup_count = args.warmup.get() + usize::from(args.gpu_feedback);
+    for iteration in 0..warmup_count + args.iterations.get() {
+        let host_validation = args.gpu_feedback && iteration == 0;
+        let gpu_feedback = args.gpu_feedback && !host_validation;
+        let warmup = iteration < warmup_count;
+        if args.profile && iteration == warmup_count {
             device.bind_to_thread()?;
             // SAFETY: all warmup GPU work and readbacks have completed.
             ensure!(unsafe { profiler_start() } == 0, "cuProfilerStart failed");
@@ -147,25 +168,58 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
             })
             .collect();
         let mut step_seconds = Vec::with_capacity(args.decode_steps.get() + 1);
+        let mut feedback: Vec<GpuTokenPredictionHandle> = Vec::new();
         for _ in 0..=args.decode_steps.get() {
             let mut inputs: Vec<_> = histories
                 .iter()
                 .zip(&mut contexts)
-                .map(|(ids, kv)| ModelInput {
-                    token_ids: ids.into(),
+                .enumerate()
+                .map(|(index, (ids, kv))| ModelInput {
+                    token_ids: if feedback.is_empty() {
+                        ids.into()
+                    } else {
+                        ModelTokens::Device(feedback[index].clone())
+                    },
                     kv,
                 })
                 .collect();
             let start = Instant::now();
-            let outputs = model.next_tokens(&mut inputs, policy.clone()).await;
-            step_seconds.push(start.elapsed().as_secs_f64());
-            for (history, output) in histories.iter_mut().zip(outputs) {
-                history.push(output?);
+            if gpu_feedback {
+                let outputs = model.forward(&mut inputs, policy.clone()).await;
+                step_seconds.push(start.elapsed().as_secs_f64());
+                feedback = outputs
+                    .into_iter()
+                    .map(|output| match output? {
+                        NextToken::Device(token) => Ok(token),
+                        NextToken::Host(_) => {
+                            anyhow::bail!("GPU feedback requires device predictions")
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            } else {
+                let outputs = model.next_tokens(&mut inputs, policy.clone()).await;
+                step_seconds.push(start.elapsed().as_secs_f64());
+                for (history, output) in histories.iter_mut().zip(outputs) {
+                    history.push(output?);
+                }
             }
+        }
+        // Only current predictions survive a step. Final readback is outside all timers.
+        if gpu_feedback {
+            for (history, token) in histories.iter_mut().zip(&feedback) {
+                history.push(token.read().await?);
+            }
+            feedback.clear();
         }
         let generated: Vec<_> = histories
             .iter()
-            .map(|ids| ids[prefix.len()..].to_vec())
+            .map(|ids| {
+                if args.gpu_feedback {
+                    vec![*ids.last().unwrap()]
+                } else {
+                    ids[prefix.len()..].to_vec()
+                }
+            })
             .collect();
         if let Some(expected) = &expected {
             ensure!(
@@ -191,6 +245,9 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         println!(
             "{}",
             json!({"event":"sample", "warmup":warmup, "iteration":iteration,
+            "gpu_feedback":gpu_feedback, "host_validation":host_validation,
+            "generated_ids_scope":if args.gpu_feedback { "final_token" } else { "all_tokens" },
+            "forward_count":args.decode_steps.get()+1,
             "prefill_seconds":step_seconds[0], "decode_seconds":decode_seconds,
             "decode_step_seconds":&step_seconds[1..], "generated_ids":generated,
             "prefill_tokens_per_second":(prefix.len()*args.batch_size.get()) as f64/step_seconds[0],

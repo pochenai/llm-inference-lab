@@ -4,12 +4,13 @@ From the repository root (MODEL_DIR is the local HF snapshot directory):
 CUDA_HOME=/usr/local/cuda HF_HUB_OFFLINE=1 ~/.venvs/py3.12/bin/python rust/engine/benches/sglang_qwen2.py \
   --model-path MODEL_DIR --dtype bfloat16 --mem-fraction-static 0.5 \
   --context-length 8192 --disable-cuda-graph --batch-size 1 2 4 \
-  --input-len 32 4096 --output-len 9 --comparison-warmup 2 --comparison-iterations 3 \
+  --input-len 32 4096 --output-len 64 --comparison-warmup 2 --comparison-iterations 3 \
   --result-filename rust/profiling/qwen2/sglang-comparison/sglang-bf16-eager.jsonl
 
 Omit --disable-cuda-graph for a separate graph-enabled baseline. Both engines use
 token ID 9707, fresh KV per sample, one prefill and output_len - 1 decode forwards.
-SGLang leaves sampled IDs on GPU; our Rust model includes a pinned CPU readback.
+Both leave sampled IDs on GPU when Rust uses --gpu-feedback. Neither exercises
+serving overlap; host wall timers include CPU submission and GPU completion.
 No SGLang model kernels are patched. This adapter targets the installed 0.5.9 API.
 """
 
@@ -20,6 +21,7 @@ from statistics import mean, median
 from typing import Any
 
 import sglang.bench_one_batch as bench
+import torch
 
 
 def main() -> None:
@@ -50,13 +52,19 @@ def main() -> None:
             positional = list(call_args)
             # Req objects are mutated by extend/decode; regenerate them each time.
             positional[3] = fixed_inputs(positional[4], positional[5])
+            torch.cuda.reset_peak_memory_stats()
             result = measure(*positional, **call_kwargs)
             if result is None:
                 return None
+            result["torch_allocated_peak_bytes"] = torch.cuda.max_memory_allocated()
+            result["torch_reserved_peak_bytes"] = torch.cuda.max_memory_reserved()
             if iteration >= args.comparison_warmup:
                 samples.append(result)
         return {
             "sglang_version": version,
+            "attention_backend": call_args[1].server_args.attention_backend,
+            "attention_backend_class": type(call_args[1].attn_backend).__name__,
+            "cuda_graph_max_bs": call_args[1].server_args.cuda_graph_max_bs,
             "dtype": args.dtype,
             "cuda_graph": not args.disable_cuda_graph,
             "batch_size": call_args[4],

@@ -60,6 +60,10 @@ with decode; intermediate chunks advance KV without emitting predictions. Mixed
 long/short arrival profiling remains open. The local
 [Runner overlap report](rust/profiling/qwen2/runner-overlap/RESULTS.md) compares fixed
 cohorts at batch 1/2/4 and input 32/4096; native BF16 is now supported and Qwen CUDA Graph remains next.
+The [BF16 static SGLang comparison](rust/profiling/qwen2/sglang-comparison/RESULTS.md)
+uses GPU-resident feedback and separate eager/Graph modes; its model-level timings
+do not measure serving overlap. Reproduce it with
+[the matrix driver](rust/engine/benches/qwen2_sglang_compare.py).
 Radix caching and quantization follow.
 
 ## Future plans

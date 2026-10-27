@@ -642,3 +642,41 @@ The local [Runner overlap report](../profiling/qwen2/runner-overlap/RESULTS.md) 
 completion precedes prior D2H in every overlap adjacent pair (63/63 per capture),
 versus 0/63 in serial. Short batch 2 shows the clearest native gain (about 8%);
 other configurations are small/noisy or flat. This is not a SGLang performance claim.
+
+
+## BF16 static-model comparison with SGLang
+
+Run the sequential release matrix from the repository root:
+
+```bash
+/usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir "$QWEN2_MODEL_DIR" --include-sglang-graph
+```
+
+The primary comparison is eager vs eager, with SGLang decode CUDA Graph reported
+separately. Both use BF16 weights/activations/KV, token ID 9707, fresh KV, batch
+1/2/4, 32/4096 input tokens, and 64 outputs regardless of EOS. The default matrix
+reserves 16640 KV token slots in both engines. Two warmups and three measured
+samples are repeated in three independent processes; engine order rotates.
+
+`benches/qwen2.rs --gpu-feedback` reuses forward and GPU prediction handles without
+per-step D2H. A separate untimed host-feedback control checks final IDs. Only the
+current predictions survive a step, avoiding retention of all previous scratch
+buffers. Final IDs are read after timing. Without this flag the original benchmark
+still includes token readback on every step. Both static timers include CPU submission
+and GPU completion; Rust input-view construction and final readback are outside timers.
+
+The official SGLang loop uses FlashInfer and synchronizes each step. It does not
+exercise serving overlap, HTTP or streamed text. This experiment cannot establish
+serving parity, cross-engine output equivalence or pure-kernel speed. Local
+[results](../profiling/qwen2/sglang-comparison/RESULTS.md) retain raw samples, backend
+and graph capture logs, exact commands, version/hardware metadata, process aggregates
+and frozen source/binary. CUDA/torch allocator peaks have different accounting and
+are not whole-device memory measurements. No profiler is attached to native runs.
+
+
+In the initial three-process BF16 matrix, Rust eager short-context decode has
+26-31% lower latency than SGLang eager; 4K prefill is about 12x slower. SGLang
+Graph further reduces decode latency. A separate Nsight capture verifies 64 Rust
+forwards and only one final 4-byte D2H after the last kernel. Profile long prefill
+to separate attention/linear cost before tuning; these static results do not
+establish serving throughput or cross-engine generated-ID equivalence.
