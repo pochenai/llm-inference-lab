@@ -27,6 +27,9 @@ pub(super) use ops::*;
 pub(super) mod ops {
     use cutile::core::*;
 
+    /// Head-vector width, independent of the query/key tile sizes BQ/BK.
+    const HEAD_DIM: i32 = 64;
+
     /// Integers per packed token: context row, absolute position, history start.
     pub(in crate::runner::model::qwen2) const TOKEN_METADATA_WIDTH: i32 = 3;
     /// Words per packed embedding row: GPU token address, inline host token ID.
@@ -74,11 +77,11 @@ pub(super) mod ops {
             .reshape(shape![256]);
         let columns: Tile<i32, { [256] }> = iota(shape![256]);
         let columns = columns + (pid.1 * 256).broadcast(shape![256]);
-        let base: PointerTile<*mut T, { [] }> = pointer_to_tile(out);
+        let base = pointer_to_tile(out);
         let base = base.offset((destination_start + pid.0) * width);
-        let base: PointerTile<*mut T, { [1] }> = base.reshape(shape![1]);
-        let base: PointerTile<*mut T, { [256] }> = base.broadcast(shape![256]);
-        let destination: PointerTile<*mut T, { [256] }> = base.offset_tile(columns);
+        let base = base.reshape(shape![1]);
+        let base = base.broadcast(shape![256]);
+        let destination = base.offset_tile(columns);
         let valid = lt_tile(columns, width.broadcast(shape![256]));
         unsafe {
             store_ptr_tko(
@@ -283,12 +286,12 @@ pub(super) mod ops {
         let rows: Tile<i32, { [ROWS] }> = iota(shape![ROWS]);
         let rows = rows + (pid.0 * ROWS).broadcast(shape![ROWS]);
         let valid = lt_tile(rows, x.shape()[0].broadcast(shape![ROWS]));
-        let base: PointerTile<*const i32, { [] }> = pointer_to_tile(metadata.as_ptr());
-        let base: PointerTile<*const i32, { [1] }> = base.reshape(shape![1]);
-        let base: PointerTile<*const i32, { [ROWS] }> = base.broadcast(shape![ROWS]);
+        let base = pointer_to_tile(metadata.as_ptr());
+        let base = base.reshape(shape![1]);
+        let base = base.broadcast(shape![ROWS]);
         let offsets =
             rows * TOKEN_METADATA_WIDTH.broadcast(shape![ROWS]) + 1i32.broadcast(shape![ROWS]);
-        let pointers: PointerTile<*const i32, { [ROWS] }> = base.offset_tile(offsets);
+        let pointers = base.offset_tile(offsets);
         let (positions, _token): (Tile<i32, { [ROWS] }>, Token) = load_ptr_tko(
             pointers,
             ordering::Weak,
@@ -363,21 +366,21 @@ pub(super) mod ops {
         let columns: Tile<i32, { [64] }> = iota(shape![64]);
         let columns: Tile<i32, { [1, 64] }> = columns.reshape(shape![1, 64]);
         let columns: Tile<i32, { [BK, 64] }> = columns.broadcast(shape![BK, 64]);
-        let table_base: PointerTile<*const i32, { [] }> = pointer_to_tile(table.as_ptr());
-        let table_base: PointerTile<*const i32, { [] }> = table_base.offset(row * table.shape()[1]);
-        let table_base: PointerTile<*const i32, { [1] }> = table_base.reshape(shape![1]);
-        let table_base: PointerTile<*const i32, { [BK] }> = table_base.broadcast(shape![BK]);
-        let kp: PointerTile<*const T, { [] }> = pointer_to_tile(k.as_ptr());
-        let kp: PointerTile<*const T, { [1, 1] }> = kp.reshape(shape![1, 1]);
-        let kp: PointerTile<*const T, { [BK, 64] }> = kp.broadcast(shape![BK, 64]);
-        let vp: PointerTile<*const T, { [] }> = pointer_to_tile(v.as_ptr());
-        let vp: PointerTile<*const T, { [1, 1] }> = vp.reshape(shape![1, 1]);
-        let vp: PointerTile<*const T, { [BK, 64] }> = vp.broadcast(shape![BK, 64]);
+        let table_base = pointer_to_tile(table.as_ptr());
+        let table_base = table_base.offset(row * table.shape()[1]);
+        let table_base = table_base.reshape(shape![1]);
+        let table_base = table_base.broadcast(shape![BK]);
+        let kp = pointer_to_tile(k.as_ptr());
+        let kp = kp.reshape(shape![1, 1]);
+        let kp = kp.broadcast(shape![BK, 64]);
+        let vp = pointer_to_tile(v.as_ptr());
+        let vp = vp.reshape(shape![1, 1]);
+        let vp = vp.broadcast(shape![BK, 64]);
         for block in 0i32..((position - history_start + BK) / BK) {
             let positions = local + (history_start + block * BK).broadcast(shape![BK]);
             let valid = lt_tile(positions, (position + 1).broadcast(shape![BK]));
             // Read only mapped, visible positions; masked lanes never dereference a slot.
-            let table_ptrs: PointerTile<*const i32, { [BK] }> = table_base.offset_tile(positions);
+            let table_ptrs = table_base.offset_tile(positions);
             let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
                 table_ptrs,
                 ordering::Weak,
@@ -394,7 +397,7 @@ pub(super) mod ops {
             let offsets = offsets + columns;
             let mask: Tile<bool, { [BK, 1] }> = valid.reshape(shape![BK, 1]);
             let mask: Tile<bool, { [BK, 64] }> = mask.broadcast(shape![BK, 64]);
-            let key_ptrs: PointerTile<*const T, { [BK, 64] }> = kp.offset_tile(offsets);
+            let key_ptrs = kp.offset_tile(offsets);
             let (keys, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
                 key_ptrs,
                 ordering::Weak,
@@ -417,7 +420,7 @@ pub(super) mod ops {
             let next_vector: Tile<f32, { [1] }> = next.reshape(shape![1]);
             let next_vector: Tile<f32, { [BK] }> = next_vector.broadcast(shape![BK]);
             let probabilities = exp(scores - next_vector);
-            let value_ptrs: PointerTile<*const T, { [BK, 64] }> = vp.offset_tile(offsets);
+            let value_ptrs = vp.offset_tile(offsets);
             let (values, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
                 value_ptrs,
                 ordering::Weak,
@@ -443,9 +446,37 @@ pub(super) mod ops {
         out.store(result);
     }
 
-    /// Multi-query online softmax: reuse each gathered K/V tile across BQ queries.
-    /// BF16 operands feed MMA directly; scores, normalizers and accumulators stay FP32.
-    /// A launch covers one context/head group, so tiles never cross request boundaries.
+    /// Causal prefill attention for one context, over the visible key/value history.
+    /// ```text
+    /// kv_head = query_heads / (qheads / kvheads)
+    /// causal  = valid_q && (history_start <= key_positions <= query_positions)
+    ///
+    /// scores = query * keys^T / sqrt(HEAD_DIM)
+    /// scores = where(causal, scores, -infinity)
+    /// result = cast_T(softmax_rows(scores) * values)
+    /// ```
+    /// Q/K/V projections are already complete; the causal mask applies to scores only.
+    ///
+    /// The implementation streams key/value blocks with these tile shapes:
+    /// ```text
+    /// query        : [BQ, HEAD_DIM]
+    /// keys, values : [BK, HEAD_DIM]
+    /// scores       : [BQ, BK]
+    /// acc          : [BQ, HEAD_DIM]
+    ///
+    /// (qheads / kvheads) % GROUP = 0
+    /// ```
+    /// Single-head groups pack query tokens; larger groups also pack Q heads sharing K/V.
+    /// Every loaded K/V tile serves all packed query rows within this context.
+    /// MMA operands/weights use T; online maxima, sums and accumulation use FP32.
+    ///
+    /// Running state for each valid query row, over processed keys:
+    /// ```text
+    /// maximum     = max(scores)
+    /// denominator = sum(exp(scores - maximum))
+    /// acc         = sum(exp(scores - maximum) * values)
+    /// result      = cast_T(acc / denominator)
+    /// ```
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) unsafe fn attention_prefill<
         T: ElementType,
@@ -467,32 +498,57 @@ pub(super) mod ops {
         kvheads: i32,
     ) {
         let pid = get_tile_block_id();
-        let local: Tile<i32, { [BQ] }> = iota(shape![BQ]);
-        let local = local + (pid.0 * BQ).broadcast(shape![BQ]);
-        // Pack GQA heads into the MMA row axis to reuse each K/V load across heads.
-        // GROUP=1 retains the ordinary query-only tile for small/non-GQA suffixes.
-        let heads = local % GROUP.broadcast(shape![BQ]) + (pid.1 * GROUP).broadcast(shape![BQ]);
-        let local = local / GROUP.broadcast(shape![BQ]);
-        let valid_q = lt_tile(local, query_count.broadcast(shape![BQ]));
-        let positions_q = local + absolute_start.broadcast(shape![BQ]);
-        let packed_q = local + query_start.broadcast(shape![BQ]);
-        let columns: Tile<i32, { [64] }> = iota(shape![64]);
+        // query_head_rows enumerates (token, head-in-group) pairs in this append.
+        // query_indices indexes its new tokens; query_heads identifies model Q heads.
+        // ```text
+        // query_head_rows = iota(BQ) + pid.0 * BQ
+        // query_indices   = query_head_rows / GROUP
+        // query_heads     = pid.1 * GROUP + query_head_rows % GROUP
+        //
+        // GROUP=7, pid=(0,0,0):
+        // query_head_rows : 0  1  2  3  4  5  6  7 ...
+        // query_indices   : 0  0  0  0  0  0  0  1 ...
+        // query_heads     : 0  1  2  3  4  5  6  0 ...
+        // ```
+        let query_head_rows: Tile<i32, { [BQ] }> = iota(shape![BQ]);
+        let query_head_rows = query_head_rows + (pid.0 * BQ).broadcast(shape![BQ]);
+        let query_heads =
+            query_head_rows % GROUP.broadcast(shape![BQ]) + (pid.1 * GROUP).broadcast(shape![BQ]);
+        let query_indices = query_head_rows / GROUP.broadcast(shape![BQ]);
+        let valid_q = lt_tile(query_indices, query_count.broadcast(shape![BQ]));
+        // Distinguish absolute history positions from rows in the packed batch tensors.
+        // ```text
+        // query_positions = absolute_start + query_indices
+        // query_rows      = query_start + query_indices
+        // ```
+        let query_positions = query_indices + absolute_start.broadcast(shape![BQ]);
+        let query_rows = query_indices + query_start.broadcast(shape![BQ]);
+        let head_columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
 
-        let q_offsets = (packed_q * q.shape()[1].broadcast(shape![BQ]))
+        // Flatten the logical query coordinates.
+        // ```text
+        // q_offsets = query_rows * q.shape()[1]
+        //             + query_heads * HEAD_DIM + head_columns
+        // ```
+        let q_offsets = (query_rows * q.shape()[1].broadcast(shape![BQ]))
             .reshape(shape![BQ, 1])
-            .broadcast(shape![BQ, 64])
-            + (heads * 64i32.broadcast(shape![BQ]))
+            .broadcast(shape![BQ, HEAD_DIM])
+            + (query_heads * HEAD_DIM.broadcast(shape![BQ]))
                 .reshape(shape![BQ, 1])
-                .broadcast(shape![BQ, 64])
-            + columns.reshape(shape![1, 64]).broadcast(shape![BQ, 64]);
-        let q_base: PointerTile<*const T, { [] }> = pointer_to_tile(q.as_ptr());
-        let q_base: PointerTile<*const T, { [1, 1] }> = q_base.reshape(shape![1, 1]);
-        let q_base: PointerTile<*const T, { [BQ, 64] }> = q_base.broadcast(shape![BQ, 64]);
-        let q_ptrs: PointerTile<*const T, { [BQ, 64] }> = q_base.offset_tile(q_offsets);
-        let q_mask = valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, 64]);
-        let zero_q_f32: Tile<f32, { [BQ, 64] }> = constant(0.0f32, shape![BQ, 64]);
-        let zero_q: Tile<T, { [BQ, 64] }> = convert_tile(zero_q_f32);
-        let (query, _token): (Tile<T, { [BQ, 64] }>, Token) = load_ptr_tko(
+                .broadcast(shape![BQ, HEAD_DIM])
+            + head_columns
+                .reshape(shape![1, HEAD_DIM])
+                .broadcast(shape![BQ, HEAD_DIM]);
+        let q_base = pointer_to_tile(q.as_ptr());
+        let q_base = q_base.reshape(shape![1, 1]);
+        let q_base = q_base.broadcast(shape![BQ, HEAD_DIM]);
+        let q_ptrs = q_base.offset_tile(q_offsets);
+        let q_mask = valid_q
+            .reshape(shape![BQ, 1])
+            .broadcast(shape![BQ, HEAD_DIM]);
+        let zero_q_f32: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
+        let zero_q: Tile<T, { [BQ, HEAD_DIM] }> = convert_tile(zero_q_f32);
+        let (query, _token): (Tile<T, { [BQ, HEAD_DIM] }>, Token) = load_ptr_tko(
             q_ptrs,
             ordering::Weak,
             None::<scope::TileBlock>,
@@ -504,32 +560,36 @@ pub(super) mod ops {
         let query = select(q_mask, query, zero_q);
         let mut maximum: Tile<f32, { [BQ, 1] }> = constant(f32::NEG_INFINITY, shape![BQ, 1]);
         let mut denominator: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
-        let mut acc: Tile<f32, { [BQ, 64] }> = constant(0.0f32, shape![BQ, 64]);
+        let mut acc: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
         let zero_scores: Tile<f32, { [BQ, BK] }> = constant(0.0f32, shape![BQ, BK]);
         let negative: Tile<f32, { [BQ, BK] }> = constant(f32::NEG_INFINITY, shape![BQ, BK]);
-        let zero_kv_f32: Tile<f32, { [BK, 64] }> = constant(0.0f32, shape![BK, 64]);
-        let zero_kv: Tile<T, { [BK, 64] }> = convert_tile(zero_kv_f32);
+        let zero_kv_f32: Tile<f32, { [BK, HEAD_DIM] }> = constant(0.0f32, shape![BK, HEAD_DIM]);
+        let zero_kv: Tile<T, { [BK, HEAD_DIM] }> = convert_tile(zero_kv_f32);
         let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
         let valid_rows = valid_q.reshape(shape![BQ, 1]);
-        let causal_q = (positions_q + 1i32.broadcast(shape![BQ]))
+        let head_dim: f32 = convert_scalar(HEAD_DIM);
+        let scale: Tile<f32, { [BQ, BK] }> =
+            rsqrt(head_dim.broadcast(shape![BQ, BK]), ftz::Disabled);
+        let causal_q = (query_positions + 1i32.broadcast(shape![BQ]))
             .reshape(shape![BQ, 1])
             .broadcast(shape![BQ, BK]);
         let kv_head = (pid.1 * GROUP) / (qheads / kvheads);
         let end = ((pid.0 + 1) * BQ + GROUP - 1) / GROUP;
         let end = if end < query_count { end } else { query_count };
         let visible_end = absolute_start + end;
-        let offsets_k: Tile<i32, { [BK] }> = iota(shape![BK]);
-        let table_base: PointerTile<*const i32, { [] }> = pointer_to_tile(table.as_ptr());
-        let table_base: PointerTile<*const i32, { [] }> =
-            table_base.offset(context_row * table.shape()[1]);
-        let table_base: PointerTile<*const i32, { [1] }> = table_base.reshape(shape![1]);
-        let table_base: PointerTile<*const i32, { [BK] }> = table_base.broadcast(shape![BK]);
-        let k_base: PointerTile<*const T, { [] }> = pointer_to_tile(k.as_ptr());
-        let v_base: PointerTile<*const T, { [] }> = pointer_to_tile(v.as_ptr());
+        let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
+        let table_base = pointer_to_tile(table.as_ptr());
+        let table_base = table_base.offset(context_row * table.shape()[1]);
+        let table_base = table_base.reshape(shape![1]);
+        let table_base = table_base.broadcast(shape![BK]);
+        let k_base = pointer_to_tile(k.as_ptr());
+        let v_base = pointer_to_tile(v.as_ptr());
+        // Reuse each key/value block across packed query rows; never materialize
+        // the full attention score matrix.
         for block in 0i32..((visible_end - history_start + BK - 1) / BK) {
-            let positions_k = offsets_k + (history_start + block * BK).broadcast(shape![BK]);
-            let valid_k = lt_tile(positions_k, visible_end.broadcast(shape![BK]));
-            let table_ptrs: PointerTile<*const i32, { [BK] }> = table_base.offset_tile(positions_k);
+            let key_positions = key_indices + (history_start + block * BK).broadcast(shape![BK]);
+            let valid_k = lt_tile(key_positions, visible_end.broadcast(shape![BK]));
+            let table_ptrs = table_base.offset_tile(key_positions);
             let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
                 table_ptrs,
                 ordering::Weak,
@@ -539,20 +599,29 @@ pub(super) mod ops {
                 None,
                 Latency::<1>,
             );
-            let offsets =
-                slots * (kvheads * 64).broadcast(shape![BK]) + (kv_head * 64).broadcast(shape![BK]);
-            let offsets = offsets.reshape(shape![BK, 1]).broadcast(shape![BK, 64])
-                + columns.reshape(shape![1, 64]).broadcast(shape![BK, 64]);
-            let k_base_2d: PointerTile<*const T, { [1, 1] }> = k_base.reshape(shape![1, 1]);
-            let k_base_2d: PointerTile<*const T, { [BK, 64] }> =
-                k_base_2d.broadcast(shape![BK, 64]);
-            let k_ptrs: PointerTile<*const T, { [BK, 64] }> = k_base_2d.offset_tile(offsets);
-            let v_base_2d: PointerTile<*const T, { [1, 1] }> = v_base.reshape(shape![1, 1]);
-            let v_base_2d: PointerTile<*const T, { [BK, 64] }> =
-                v_base_2d.broadcast(shape![BK, 64]);
-            let v_ptrs: PointerTile<*const T, { [BK, 64] }> = v_base_2d.offset_tile(offsets);
-            let kv_mask = valid_k.reshape(shape![BK, 1]).broadcast(shape![BK, 64]);
-            let (keys, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
+            // Resolve logical key positions to physical cache coordinates.
+            // ```text
+            // slots      = table[context_row, key_positions]
+            // kv_offsets = (slots * kvheads + kv_head) * HEAD_DIM + head_columns
+            // ```
+            let kv_offsets = slots * (kvheads * HEAD_DIM).broadcast(shape![BK])
+                + (kv_head * HEAD_DIM).broadcast(shape![BK]);
+            let kv_offsets = kv_offsets
+                .reshape(shape![BK, 1])
+                .broadcast(shape![BK, HEAD_DIM])
+                + head_columns
+                    .reshape(shape![1, HEAD_DIM])
+                    .broadcast(shape![BK, HEAD_DIM]);
+            let k_base_2d = k_base.reshape(shape![1, 1]);
+            let k_base_2d = k_base_2d.broadcast(shape![BK, HEAD_DIM]);
+            let k_ptrs = k_base_2d.offset_tile(kv_offsets);
+            let v_base_2d = v_base.reshape(shape![1, 1]);
+            let v_base_2d = v_base_2d.broadcast(shape![BK, HEAD_DIM]);
+            let v_ptrs = v_base_2d.offset_tile(kv_offsets);
+            let kv_mask = valid_k
+                .reshape(shape![BK, 1])
+                .broadcast(shape![BK, HEAD_DIM]);
+            let (keys, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
                 k_ptrs,
                 ordering::Weak,
                 None::<scope::TileBlock>,
@@ -562,26 +631,47 @@ pub(super) mod ops {
                 Latency::<1>,
             );
             let keys = select(kv_mask, keys, zero_kv);
+            // Block dot products.
+            // ```text
+            // scores = query * keys^T
+            // ```
             let scores: Tile<f32, { [BQ, BK] }> = mma(query, keys.transpose(), zero_scores);
             let causal = lt_tile(
-                positions_k.reshape(shape![1, BK]).broadcast(shape![BQ, BK]),
+                key_positions
+                    .reshape(shape![1, BK])
+                    .broadcast(shape![BQ, BK]),
                 causal_q,
             ) & valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, BK]);
-            let scores = select(
-                causal,
-                scores * 0.125f32.broadcast(shape![BQ, BK]),
-                negative,
-            );
+            // Scale and apply the row-specific causal mask.
+            // ```text
+            // scores = where(causal, scores * scale, -infinity)
+            // ```
+            let scores = select(causal, scores * scale, negative);
+            // Update the running row maximum.
+            // ```text
+            // block_max    = rowmax(scores)
+            // next_maximum = max(maximum, block_max)
+            // ```
             let block_max: Tile<f32, { [BQ] }> = reduce_max(scores, 1);
-            let next = max_tile(maximum, block_max.reshape(shape![BQ, 1]));
+            let next_maximum = max_tile(maximum, block_max.reshape(shape![BQ, 1]));
             // Padded query rows must not introduce -inf - -inf into the MMA operands.
-            let next = select(valid_rows, next, zero_rows);
-            let alpha = exp(maximum - next);
-            let probabilities = exp(scores - next.broadcast(shape![BQ, BK]));
-            let sum: Tile<f32, { [BQ] }> = reduce_sum(probabilities, 1);
-            denominator = denominator * alpha + sum.reshape(shape![BQ, 1]);
-            let p: Tile<T, { [BQ, BK] }> = convert_tile(probabilities);
-            let (values, _token): (Tile<T, { [BK, 64] }>, Token) = load_ptr_tko(
+            let next_maximum = select(valid_rows, next_maximum, zero_rows);
+            // Rebase earlier blocks and form unnormalized weights for this block.
+            // ```text
+            // alpha         = exp(maximum - next_maximum)
+            // block_weights = exp(scores - next_maximum)
+            // ```
+            let alpha = exp(maximum - next_maximum);
+            let block_weights = exp(scores - next_maximum.broadcast(shape![BQ, BK]));
+            let block_sum: Tile<f32, { [BQ] }> = reduce_sum(block_weights, 1);
+            // Accumulate the FP32 normalizer.
+            // ```text
+            // block_sum   = rowsum(block_weights)
+            // denominator = alpha * denominator + block_sum
+            // ```
+            denominator = denominator * alpha + block_sum.reshape(shape![BQ, 1]);
+            let mma_weights: Tile<T, { [BQ, BK] }> = convert_tile(block_weights);
+            let (values, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
                 v_ptrs,
                 ordering::Weak,
                 None::<scope::TileBlock>,
@@ -591,15 +681,29 @@ pub(super) mod ops {
                 Latency::<1>,
             );
             let values = select(kv_mask, values, zero_kv);
-            acc = mma(p, values, acc * alpha.broadcast(shape![BQ, 64]));
-            maximum = next;
+            // Accumulate the weighted values using MMA.
+            // ```text
+            // mma_weights = cast_T(block_weights)
+            // acc         = alpha * acc + mma_weights * values
+            // maximum     = next_maximum
+            // ```
+            acc = mma(
+                mma_weights,
+                values,
+                acc * alpha.broadcast(shape![BQ, HEAD_DIM]),
+            );
+            maximum = next_maximum;
         }
-        let result: Tile<T, { [BQ, 64] }> =
-            convert_tile(true_div(acc, denominator.broadcast(shape![BQ, 64])));
-        let out_base: PointerTile<*mut T, { [] }> = pointer_to_tile(out);
-        let out_base: PointerTile<*mut T, { [1, 1] }> = out_base.reshape(shape![1, 1]);
-        let out_base: PointerTile<*mut T, { [BQ, 64] }> = out_base.broadcast(shape![BQ, 64]);
-        let out_ptrs: PointerTile<*mut T, { [BQ, 64] }> = out_base.offset_tile(q_offsets);
+        // Normalize once after all key blocks.
+        // ```text
+        // result = cast_T(acc / denominator)
+        // ```
+        let result: Tile<T, { [BQ, HEAD_DIM] }> =
+            convert_tile(true_div(acc, denominator.broadcast(shape![BQ, HEAD_DIM])));
+        let out_base = pointer_to_tile(out);
+        let out_base = out_base.reshape(shape![1, 1]);
+        let out_base = out_base.broadcast(shape![BQ, HEAD_DIM]);
+        let out_ptrs = out_base.offset_tile(q_offsets);
         store_ptr_tko(
             out_ptrs,
             result,

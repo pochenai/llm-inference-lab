@@ -463,6 +463,13 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 - [x] Add KV-block attention, compare block sizes/occupancy targets, and validate ragged/causal/cache behavior against CPU and real-model references.
 - [x] Compare prefill linear tiles and attention occupancy at batch sizes 1, 2 and 4; retain measured improvements with CPU/checkpoint regressions and unchanged workspace capacity.
 - [ ] Improve long-context decode parallelism against the recorded release baseline.
+  The current attention kernel assigns one CTA per input token / Q head, processes
+  each `[BK, head_dim]` KV tile in parallel, and loops over history tiles with online
+  softmax. Inspect the compiler-generated warp mapping and reductions for efficiency;
+  source-level tiles do not establish FlashInfer's explicit `NUM_WARPS_KV` layout.
+  For small batches with long histories, measure whether splitting one query/head's
+  KV history across multiple CTAs and merging partial softmax states improves latency.
+  Keep intra-CTA warp partitioning distinct from this cross-CTA split-KV option.
 - Port Qwen CUDA Graph as the comparison-alignment follow-up; W6 already supports
   changing membership and chunked prefill using the packed executor.
 - Add selected intermediate-tensor checks when changing numerical kernels.

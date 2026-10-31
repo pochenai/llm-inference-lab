@@ -959,6 +959,21 @@ impl GqaAttention {
 
     /// Output storage is retained by the caller; this launch writes only this request's rows.
     /// Slot indirection and absolute causal positions support cached/chunked/ragged prefill.
+    /// Each launch binds one KVContext (one session history); its CTAs cover that
+    /// request's query tiles and head groups. Callers enqueue requests on the same
+    /// stream without waiting between launches; GPU execution follows stream order.
+    /// The requests have no attention dependency on each other.
+    /// ```text
+    /// One Transformer layer, batch [A, B]:
+    /// packed Q/K/V projection(A + B)
+    ///   -> store each request's K/V
+    ///   -> attention_prefill(A): CTAs for A's query tiles / head groups
+    ///   -> attention_prefill(B): CTAs for B's query tiles / head groups
+    ///   -> packed O projection / FFN(A + B)
+    /// ```
+    /// shortcut: per-request launches keep history addressing simple; if launch
+    /// overhead or cross-request scheduling matters, a ragged work table can map
+    /// each CTA to a request and query tile in one launch without changing KV storage.
     unsafe fn submit_prefill<T: DType>(
         &self,
         out: &mut Tensor<T>,
