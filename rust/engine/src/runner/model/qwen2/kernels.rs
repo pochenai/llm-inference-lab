@@ -500,7 +500,7 @@ pub(super) mod ops {
     ) {
         let pid = get_tile_block_id();
         // Map low CTA IDs to longer causal histories to reduce the execution tail.
-        // This is a scheduling heuristic; correctness never depends on CTA order. 
+        // This is a scheduling heuristic; correctness never depends on CTA order.
         // ~ 2% improvement.
         let query_tiles = (query_count * GROUP + BQ - 1) / BQ;
         let query_tile = query_tiles - 1 - pid.0;
@@ -583,6 +583,10 @@ pub(super) mod ops {
         let end = ((query_tile + 1) * BQ + GROUP - 1) / GROUP;
         let end = if end < query_count { end } else { query_count };
         let visible_end = absolute_start + end;
+        // Full KV blocks ending at/before the earliest query need no causal mask.
+        // Blocks are relative to history_start, including cached/chunked histories.
+        let first_query_position = absolute_start + query_tile * BQ / GROUP;
+        let unmasked_blocks = (first_query_position - history_start + 1) / BK;
         let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
         let table_base = pointer_to_tile(table.as_ptr());
         let table_base = table_base.offset(context_row * table.shape()[1]);
@@ -642,17 +646,28 @@ pub(super) mod ops {
             // scores = query * keys^T
             // ```
             let scores: Tile<f32, { [BQ, BK] }> = mma(query, keys.transpose(), zero_scores);
-            let causal = lt_tile(
-                key_positions
-                    .reshape(shape![1, BK])
-                    .broadcast(shape![BQ, BK]),
-                causal_q,
-            ) & valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, BK]);
-            // Scale and apply the row-specific causal mask.
+            // Earlier full blocks only need the padded-query guard; diagonal
+            // blocks retain row-specific causal masking. Pointer guards stay intact.
             // ```text
-            // scores = where(causal, scores * scale, -infinity)
+            // block < unmasked_blocks: every key_position <= first_query_position
+            // otherwise: scores = where(causal, scores * scale, -infinity)
             // ```
-            let scores = select(causal, scores * scale, negative);
+            // ~ 1% improvement
+            let scores = if block < unmasked_blocks {
+                select(
+                    valid_rows.broadcast(shape![BQ, BK]),
+                    scores * scale,
+                    negative,
+                )
+            } else {
+                let causal = lt_tile(
+                    key_positions
+                        .reshape(shape![1, BK])
+                        .broadcast(shape![BQ, BK]),
+                    causal_q,
+                ) & valid_rows.broadcast(shape![BQ, BK]);
+                select(causal, scores * scale, negative)
+            };
             // Update the running row maximum.
             // ```text
             // block_max    = rowmax(scores)
