@@ -29,6 +29,8 @@ pub(super) mod ops {
 
     /// Head-vector width, independent of the query/key tile sizes BQ/BK.
     const HEAD_DIM: i32 = 64;
+    /// Rounded f32 log2(e); cuTile 0.4 cannot lower the std constant path here.
+    const LOG2_E: f32 = 1.442_695;
 
     /// Integers per packed token: context row, absolute position, history start.
     pub(in crate::runner::model::qwen2) const TOKEN_METADATA_WIDTH: i32 = 3;
@@ -470,12 +472,17 @@ pub(super) mod ops {
     /// Single-head groups pack query tokens; larger groups also pack Q heads sharing K/V.
     /// Every loaded K/V tile serves all packed query rows within this context.
     /// MMA operands/weights use T; online maxima, sums and accumulation use FP32.
+    /// Internally, scores and maxima are scaled by log2(e) for exp2 with FTZ.
+    /// FTZ flushes subnormal exponential weights to zero.
+    /// Performance comments estimate attention-kernel latency reduction as the
+    /// prefill e2e reduction / 23% (historical B4 attention share), assuming all
+    /// other costs stay fixed. These are rough estimates, not isolated measurements.
     ///
     /// Running state for each valid query row, over processed keys:
     /// ```text
     /// maximum     = max(scores)
-    /// denominator = sum(exp(scores - maximum))
-    /// acc         = sum(exp(scores - maximum) * values)
+    /// denominator = sum(exp2(scores - maximum))
+    /// acc         = sum(exp2(scores - maximum) * values)
     /// result      = cast_T(acc / denominator)
     /// ```
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
@@ -501,7 +508,7 @@ pub(super) mod ops {
         let pid = get_tile_block_id();
         // Map low CTA IDs to longer causal histories to reduce the execution tail.
         // This is a scheduling heuristic; correctness never depends on CTA order.
-        // ~ 2% improvement.
+        // ~2-3% prefill e2e improvement; ~9-12% attention-kernel estimate.
         let query_tiles = (query_count * GROUP + BQ - 1) / BQ;
         let query_tile = query_tiles - 1 - pid.0;
         // query_head_rows enumerates (token, head-in-group) pairs in this append.
@@ -574,8 +581,11 @@ pub(super) mod ops {
         let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
         let valid_rows = valid_q.reshape(shape![BQ, 1]);
         let head_dim: f32 = convert_scalar(HEAD_DIM);
+        // exp(x) = exp2(x * log2(e)); fold the conversion into the score scale.
+        // ~2% prefill e2e improvement; ~8-9% attention-kernel estimate.
         let scale: Tile<f32, { [BQ, BK] }> =
-            rsqrt(head_dim.broadcast(shape![BQ, BK]), ftz::Disabled);
+            rsqrt(head_dim.broadcast(shape![BQ, BK]), ftz::Disabled)
+                * constant(LOG2_E, shape![BQ, BK]);
         let causal_q = (query_positions + 1i32.broadcast(shape![BQ]))
             .reshape(shape![BQ, 1])
             .broadcast(shape![BQ, BK]);
@@ -652,7 +662,7 @@ pub(super) mod ops {
             // block < unmasked_blocks: every key_position <= first_query_position
             // otherwise: scores = where(causal, scores * scale, -infinity)
             // ```
-            // ~ 1% improvement
+            // ~1% prefill e2e ( ~4-5% kernel only) improvement
             let scores = if block < unmasked_blocks {
                 select(
                     valid_rows.broadcast(shape![BQ, BK]),
@@ -679,11 +689,14 @@ pub(super) mod ops {
             let next_maximum = select(valid_rows, next_maximum, zero_rows);
             // Rebase earlier blocks and form unnormalized weights for this block.
             // ```text
-            // alpha         = exp(maximum - next_maximum)
-            // block_weights = exp(scores - next_maximum)
+            // alpha         = exp2(maximum - next_maximum)
+            // block_weights = exp2(scores - next_maximum)
             // ```
-            let alpha = exp(maximum - next_maximum);
-            let block_weights = exp(scores - next_maximum.broadcast(shape![BQ, BK]));
+            let alpha = exp2(maximum - next_maximum, ftz::Enabled);
+            let block_weights = exp2(
+                scores - next_maximum.broadcast(shape![BQ, BK]),
+                ftz::Enabled,
+            );
             let block_sum: Tile<f32, { [BQ] }> = reduce_sum(block_weights, 1);
             // Accumulate the FP32 normalizer.
             // ```text
