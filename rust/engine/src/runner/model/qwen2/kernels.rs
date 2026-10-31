@@ -538,8 +538,18 @@ pub(super) mod ops {
         let query_rows = query_indices + query_start.broadcast(shape![BQ]);
         let head_columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
 
-        // Flatten the logical query coordinates.
         // ```text
+        // Q [packed_tokens, 14 * 64]
+        //                  columns
+        //           0..63    64..127             832..895
+        //         +---------+---------+-------+----------+
+        // row 0 a | Q head 0| Q head 1|  ...  | Q head 13|
+        // row 1 b | Q head 0| Q head 1|  ...  | Q head 13|
+        // row 2 c | Q head 0| Q head 1|  ...  | Q head 13|
+        //         +---------+---------+-------+----------+
+        //                ^
+        //       [query_rows, query_heads * HEAD_DIM + head_columns]
+        //
         // q_offsets = query_rows * q.shape()[1]
         //             + query_heads * HEAD_DIM + head_columns
         // ```
@@ -561,6 +571,8 @@ pub(super) mod ops {
             .broadcast(shape![BQ, HEAD_DIM]);
         let zero_q_f32: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
         let zero_q: Tile<T, { [BQ, HEAD_DIM] }> = convert_tile(zero_q_f32);
+        // cuTile 0.4 scalar zero padding fails GPU JIT broadcasting to this 2D load.
+        // Omit padding here; the select below explicitly zeros masked query elements.
         let (query, _token): (Tile<T, { [BQ, HEAD_DIM] }>, Token) = load_ptr_tko(
             q_ptrs,
             ordering::Weak,
@@ -580,6 +592,7 @@ pub(super) mod ops {
         let zero_kv: Tile<T, { [BK, HEAD_DIM] }> = convert_tile(zero_kv_f32);
         let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
         let valid_rows = valid_q.reshape(shape![BQ, 1]);
+        let valid_scores = valid_rows.broadcast(shape![BQ, BK]);
         let head_dim: f32 = convert_scalar(HEAD_DIM);
         // exp(x) = exp2(x * log2(e)); fold the conversion into the score scale.
         // ~2% prefill e2e improvement; ~8-9% attention-kernel estimate.
@@ -595,6 +608,20 @@ pub(super) mod ops {
         let visible_end = absolute_start + end;
         // Full KV blocks ending at/before the earliest query need no causal mask.
         // Blocks are relative to history_start, including cached/chunked histories.
+        // ```text
+        // history_start=0, BK=64, first_query_position=100
+        //                         key_position ->
+        //                  block 0          block 1          block 2
+        //                  0......63        64.......127     128....191
+        // query 100        [ visible ]      [visible|mask]    [ skipped ]
+        // query 101        [ visible ]      [visible |mask]   [ skipped ]
+        // query 102        [ visible ]      [visible  |mask]   [ skipped ]
+        //                      ^                    ^
+        //               no causal mask       diagonal: key = query
+        //
+        // unmasked_blocks = (100 - 0 + 1) / 64 = 1
+        // block < 1: fully visible; block >= 1: check the causal boundary.
+        // ```
         let first_query_position = absolute_start + query_tile * BQ / GROUP;
         let unmasked_blocks = (first_query_position - history_start + 1) / BK;
         let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
@@ -603,12 +630,22 @@ pub(super) mod ops {
         let table_base = table_base.reshape(shape![1]);
         let table_base = table_base.broadcast(shape![BK]);
         let k_base = pointer_to_tile(k.as_ptr());
+        let k_base = k_base.reshape(shape![1, 1]);
+        let k_base = k_base.broadcast(shape![BK, HEAD_DIM]);
         let v_base = pointer_to_tile(v.as_ptr());
+        let v_base = v_base.reshape(shape![1, 1]);
+        let v_base = v_base.broadcast(shape![BK, HEAD_DIM]);
+        let kv_slot_stride = (kvheads * HEAD_DIM).broadcast(shape![BK]);
+        let kv_head_offset = (kv_head * HEAD_DIM).broadcast(shape![BK]);
+        let kv_columns = head_columns
+            .reshape(shape![1, HEAD_DIM])
+            .broadcast(shape![BK, HEAD_DIM]);
+        let visible_keys = visible_end.broadcast(shape![BK]);
         // Reuse each key/value block across packed query rows; never materialize
         // the full attention score matrix.
         for block in 0i32..((visible_end - history_start + BK - 1) / BK) {
             let key_positions = key_indices + (history_start + block * BK).broadcast(shape![BK]);
-            let valid_k = lt_tile(key_positions, visible_end.broadcast(shape![BK]));
+            let valid_k = lt_tile(key_positions, visible_keys);
             let table_ptrs = table_base.offset_tile(key_positions);
             let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
                 table_ptrs,
@@ -624,20 +661,13 @@ pub(super) mod ops {
             // slots      = table[context_row, key_positions]
             // kv_offsets = (slots * kvheads + kv_head) * HEAD_DIM + head_columns
             // ```
-            let kv_offsets = slots * (kvheads * HEAD_DIM).broadcast(shape![BK])
-                + (kv_head * HEAD_DIM).broadcast(shape![BK]);
+            let kv_offsets = slots * kv_slot_stride + kv_head_offset;
             let kv_offsets = kv_offsets
                 .reshape(shape![BK, 1])
                 .broadcast(shape![BK, HEAD_DIM])
-                + head_columns
-                    .reshape(shape![1, HEAD_DIM])
-                    .broadcast(shape![BK, HEAD_DIM]);
-            let k_base_2d = k_base.reshape(shape![1, 1]);
-            let k_base_2d = k_base_2d.broadcast(shape![BK, HEAD_DIM]);
-            let k_ptrs = k_base_2d.offset_tile(kv_offsets);
-            let v_base_2d = v_base.reshape(shape![1, 1]);
-            let v_base_2d = v_base_2d.broadcast(shape![BK, HEAD_DIM]);
-            let v_ptrs = v_base_2d.offset_tile(kv_offsets);
+                + kv_columns;
+            let k_ptrs = k_base.offset_tile(kv_offsets);
+            let v_ptrs = v_base.offset_tile(kv_offsets);
             let kv_mask = valid_k
                 .reshape(shape![BK, 1])
                 .broadcast(shape![BK, HEAD_DIM]);
@@ -664,18 +694,14 @@ pub(super) mod ops {
             // ```
             // ~1% prefill e2e ( ~4-5% kernel only) improvement
             let scores = if block < unmasked_blocks {
-                select(
-                    valid_rows.broadcast(shape![BQ, BK]),
-                    scores * scale,
-                    negative,
-                )
+                select(valid_scores, scores * scale, negative)
             } else {
                 let causal = lt_tile(
                     key_positions
                         .reshape(shape![1, BK])
                         .broadcast(shape![BQ, BK]),
                     causal_q,
-                ) & valid_rows.broadcast(shape![BQ, BK]);
+                ) & valid_scores;
                 select(causal, scores * scale, negative)
             };
             // Update the running row maximum.
