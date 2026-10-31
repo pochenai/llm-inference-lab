@@ -447,6 +447,7 @@ pub(super) mod ops {
     }
 
     /// Causal prefill attention for one context, over the visible key/value history.
+    /// https://developer.nvidia.com/blog/tuning-flash-attention-for-peak-performance-in-nvidia-cuda-tile/
     /// ```text
     /// kv_head = query_heads / (qheads / kvheads)
     /// causal  = valid_q && (history_start <= key_positions <= query_positions)
@@ -498,20 +499,25 @@ pub(super) mod ops {
         kvheads: i32,
     ) {
         let pid = get_tile_block_id();
+        // Map low CTA IDs to longer causal histories to reduce the execution tail.
+        // This is a scheduling heuristic; correctness never depends on CTA order. 
+        // ~ 2% improvement.
+        let query_tiles = (query_count * GROUP + BQ - 1) / BQ;
+        let query_tile = query_tiles - 1 - pid.0;
         // query_head_rows enumerates (token, head-in-group) pairs in this append.
         // query_indices indexes its new tokens; query_heads identifies model Q heads.
         // ```text
-        // query_head_rows = iota(BQ) + pid.0 * BQ
+        // query_head_rows = iota(BQ) + query_tile * BQ
         // query_indices   = query_head_rows / GROUP
         // query_heads     = pid.1 * GROUP + query_head_rows % GROUP
         //
-        // GROUP=7, pid=(0,0,0):
+        // GROUP=7, query_tile=0, pid.1=0:
         // query_head_rows : 0  1  2  3  4  5  6  7 ...
         // query_indices   : 0  0  0  0  0  0  0  1 ...
         // query_heads     : 0  1  2  3  4  5  6  0 ...
         // ```
         let query_head_rows: Tile<i32, { [BQ] }> = iota(shape![BQ]);
-        let query_head_rows = query_head_rows + (pid.0 * BQ).broadcast(shape![BQ]);
+        let query_head_rows = query_head_rows + (query_tile * BQ).broadcast(shape![BQ]);
         let query_heads =
             query_head_rows % GROUP.broadcast(shape![BQ]) + (pid.1 * GROUP).broadcast(shape![BQ]);
         let query_indices = query_head_rows / GROUP.broadcast(shape![BQ]);
@@ -574,7 +580,7 @@ pub(super) mod ops {
             .reshape(shape![BQ, 1])
             .broadcast(shape![BQ, BK]);
         let kv_head = (pid.1 * GROUP) / (qheads / kvheads);
-        let end = ((pid.0 + 1) * BQ + GROUP - 1) / GROUP;
+        let end = ((query_tile + 1) * BQ + GROUP - 1) / GROUP;
         let end = if end < query_count { end } else { query_count };
         let visible_end = absolute_start + end;
         let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
