@@ -740,7 +740,13 @@ pub(super) mod ops {
             // block_sum   = rowsum(block_weights)
             // denominator = alpha * denominator + block_sum
             // ```
-            denominator = denominator * alpha + block_sum.reshape(shape![BQ, 1]);
+            denominator = fma(
+                denominator,
+                alpha,
+                block_sum.reshape(shape![BQ, 1]),
+                rounding::NearestEven,
+                ftz::Disabled,
+            );
             let mma_weights: Tile<T, { [BQ, BK] }> = convert_tile(block_weights);
             // Accumulate the weighted values using MMA.
             // ```text
