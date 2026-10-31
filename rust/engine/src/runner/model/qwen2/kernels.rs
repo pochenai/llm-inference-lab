@@ -404,12 +404,9 @@ pub(super) mod ops {
         out.store(result);
     }
 
-    /// Gather BK physical KV slots per iteration, then update online softmax by block.
-    /// Mask the final block at each query's causal boundary; slots need not be contiguous.
-    /// Target four resident CTAs per SM on SM120 to reduce register pressure.
-    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 4,),))]
-    pub(super) unsafe fn attention<T: ElementType, const BK: i32>(
-        out: &mut Tensor<T, { [1, 64] }>,
+    /// Stream one disjoint KV segment; empty segments return (0, -inf, 0).
+    /// Keep raw FP32 (weighted V, maximum, denominator) until the final normalization.
+    unsafe fn attention_segment<T: ElementType, const BK: i32, const SPLITS: i32>(
         q: &Tensor<T, { [-1, -1] }>,
         k: &Tensor<T, { [-1, -1] }>,
         v: &Tensor<T, { [-1, -1] }>,
@@ -417,29 +414,35 @@ pub(super) mod ops {
         metadata: &Tensor<i32, { [-1] }>,
         qheads: i32,
         kvheads: i32,
+        query_index: i32,
+        query_head: i32,
+        split: i32,
+    ) -> (
+        Tile<f32, { [1, 64] }>,
+        Tile<f32, { [1, 1] }>,
+        Tile<f32, { [1, 1] }>,
     ) {
-        let pid = get_tile_block_id();
         let row: i32 = tile_to_scalar(
             metadata
                 .partition(shape![1])
-                .load([pid.0 * TOKEN_METADATA_WIDTH])
+                .load([query_index * TOKEN_METADATA_WIDTH])
                 .reshape(shape![]),
         );
         let position: i32 = tile_to_scalar(
             metadata
                 .partition(shape![1])
-                .load([pid.0 * TOKEN_METADATA_WIDTH + 1])
+                .load([query_index * TOKEN_METADATA_WIDTH + 1])
                 .reshape(shape![]),
         );
         let history_start: i32 = tile_to_scalar(
             metadata
                 .partition(shape![1])
-                .load([pid.0 * TOKEN_METADATA_WIDTH + 2])
+                .load([query_index * TOKEN_METADATA_WIDTH + 2])
                 .reshape(shape![]),
         );
-        let head = pid.1 / (qheads / kvheads);
+        let head = query_head / (qheads / kvheads);
         let query: Tile<f32, { [1, 64] }> =
-            convert_tile(q.partition(shape![1, 64]).load([pid.0, pid.1]));
+            convert_tile(q.partition(shape![1, 64]).load([query_index, query_head]));
         let query: Tile<f32, { [BK, 64] }> = query.broadcast(shape![BK, 64]);
         let mut maximum: Tile<f32, { [1, 1] }> = constant(f32::NEG_INFINITY, shape![1, 1]);
         let mut denominator: Tile<f32, { [1, 1] }> = constant(0.0f32, shape![1, 1]);
@@ -461,7 +464,11 @@ pub(super) mod ops {
         let vp = pointer_to_tile(v.as_ptr());
         let vp = vp.reshape(shape![1, 1]);
         let vp = vp.broadcast(shape![BK, 64]);
-        for block in 0i32..((position - history_start + BK) / BK) {
+        let total_blocks = (position - history_start + BK) / BK;
+        // Partition whole KV blocks evenly; adjacent splits meet without overlap.
+        let first_block = total_blocks * split / SPLITS;
+        let end_block = total_blocks * (split + 1) / SPLITS;
+        for block in first_block..end_block {
             let positions = local + (history_start + block * BK).broadcast(shape![BK]);
             let valid = lt_tile(positions, (position + 1).broadcast(shape![BK]));
             // Read only mapped, visible positions; masked lanes never dereference a slot.
@@ -526,8 +533,118 @@ pub(super) mod ops {
             denominator = denominator * alpha + block_sum.reshape(shape![1, 1]);
             maximum = next;
         }
+        (acc, maximum, denominator)
+    }
+
+    /// One CTA per query/head, retaining the original short-history path.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 4,),))]
+    pub(super) unsafe fn attention<T: ElementType, const BK: i32>(
+        out: &mut Tensor<T, { [1, 64] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        metadata: &Tensor<i32, { [-1] }>,
+        qheads: i32,
+        kvheads: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let (acc, _maximum, denominator) = attention_segment::<T, BK, 1>(
+            q, k, v, table, metadata, qheads, kvheads, pid.0, pid.1, 0,
+        );
+        let acc = acc.reshape(shape![1, 64]);
+        let denominator = denominator.reshape(shape![1, 1]);
         let result: Tile<T, { [1, 64] }> =
             convert_tile(true_div(acc, denominator.broadcast(shape![1, 64])));
+        out.store(result);
+    }
+
+    /// Parallel KV segments, with one CTA per (query/head, split).
+    /// https://github.com/NVIDIA/TileGym/blob/main/src/tilegym/ops/cutile/flash_decode.py
+    /// partials[(query * qheads + head) * SPLITS + split, :] = [weighted_V[64], maximum, denominator].
+    /// The 128-wide store masks its padding beyond the 66 valid packet elements.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 4,),))]
+    pub(super) unsafe fn attention_split_kv<T: ElementType, const BK: i32, const SPLITS: i32>(
+        partials: &mut Tensor<f32, { [1, 128] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        metadata: &Tensor<i32, { [-1] }>,
+        qheads: i32,
+        kvheads: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let (acc, maximum, denominator) = attention_segment::<T, BK, SPLITS>(
+            q,
+            k,
+            v,
+            table,
+            metadata,
+            qheads,
+            kvheads,
+            pid.0 / (qheads * SPLITS),
+            (pid.0 / SPLITS) % qheads,
+            pid.0 % SPLITS,
+        );
+        let acc = acc.reshape(shape![1, 64]);
+        let maximum = maximum.reshape(shape![1, 1]);
+        let denominator = denominator.reshape(shape![1, 1]);
+        let columns: Tile<i32, { [64] }> = iota(shape![64]);
+        let columns = columns.reshape(shape![1, 64]);
+        let first_column: Tile<i32, { [1, 64] }> = constant(0i32, shape![1, 64]);
+        let stats = select(
+            eq_tile(columns, first_column),
+            maximum.broadcast(shape![1, 64]),
+            denominator.broadcast(shape![1, 64]),
+        );
+        let packet: Tile<f32, { [1, 128] }> = cat(acc, stats, 1);
+        partials.store(packet);
+    }
+
+    /// Stable merge of raw FP32 split states; normalize and cast only once.
+    /// https://github.com/NVIDIA/TileGym/blob/main/src/tilegym/ops/cutile/splitk_reduce.py
+    /// ```text
+    /// global_max = max(split_max)
+    /// weights    = exp(split_max - global_max)
+    /// output     = sum(weights * split_weighted_V) / sum(weights * split_denominator)
+    /// ```
+    #[cutile::entry()]
+    pub(super) fn attention_merge_splits<T: ElementType, const SPLITS: i32>(
+        out: &mut Tensor<T, { [1, 64] }>,
+        partials: &Tensor<f32, { [-1, -1] }>,
+        qheads: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let index = pid.0 * qheads + pid.1;
+        let maxima = partials
+            .partition(shape![SPLITS, 1])
+            .load([index, 64])
+            .reshape(shape![SPLITS]);
+        let denominators = partials
+            .partition(shape![SPLITS, 1])
+            .load([index, 65])
+            .reshape(shape![SPLITS]);
+        let values = partials
+            .partition(shape![SPLITS, 64])
+            .load([index, 0])
+            .reshape(shape![SPLITS, 64]);
+        let maximum: Tile<f32, { [] }> = reduce_max(maxima, 0);
+        let maximum = maximum.reshape(shape![1]).broadcast(shape![SPLITS]);
+        // Split maxima use natural-log units; convert their difference before exp2.
+        let log2_e: Tile<f32, { [SPLITS] }> = constant(LOG2_E, shape![SPLITS]);
+        let weights = exp2((maxima - maximum) * log2_e, ftz::Enabled);
+        let numerator: Tile<f32, { [64] }> = reduce_sum(
+            values
+                * weights
+                    .reshape(shape![SPLITS, 1])
+                    .broadcast(shape![SPLITS, 64]),
+            0,
+        );
+        let numerator = numerator.reshape(shape![1, 64]);
+        let denominator: Tile<f32, { [] }> = reduce_sum(weights * denominators, 0);
+        let denominator = denominator.reshape(shape![1, 1]).broadcast(shape![1, 64]);
+        let result: Tile<T, { [1, 64] }> = convert_tile(true_div(numerator, denominator));
         out.store(result);
     }
 

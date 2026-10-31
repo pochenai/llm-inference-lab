@@ -17,6 +17,9 @@ use crate::ModelError;
 
 // Keep the usual prefill/decode pair; never cache a checkout still in flight.
 const MAX_IDLE_WORKSPACES: usize = 2;
+/// Bound decode scratch/JIT variants; every split stores 64 weighted values plus max/sum.
+pub(super) const MAX_KV_SPLITS: usize = 16;
+pub(super) const KV_PARTIAL_WIDTH: usize = 66;
 
 pub(super) struct Buffers<T: DType> {
     pub(super) x: Tensor<T>,
@@ -25,6 +28,8 @@ pub(super) struct Buffers<T: DType> {
     pub(super) q: Tensor<T>,
     pub(super) rotated_q: Tensor<T>,
     pub(super) attention: Tensor<T>,
+    /// FP32 states reused across layers; absent when a forward contains prefill chunks.
+    pub(super) decode_partials: Option<Tensor<f32>>,
     pub(super) k: Tensor<T>,
     pub(super) rotated_k: Tensor<T>,
     pub(super) v: Tensor<T>,
@@ -139,7 +144,8 @@ impl<T: DType> WorkspacePool<T> {
         let vocab = config.vocab_size;
         let blocks = vocab.div_ceil(256);
         let (all_floats, integers) = element_counts(rows, batch_size, config)?;
-        let floats = batch_size * (vocab + blocks);
+        let floats = batch_size * (vocab + blocks)
+            + decode_partial_elements(rows, batch_size, config).unwrap();
         let activations = all_floats - floats;
         let required = activations * size_of::<T>() + (floats + integers) * 4;
         let cached = {
@@ -262,6 +268,17 @@ impl<T: DType> WorkspacePool<T> {
                 &mut float_offset,
                 &[batch_size, blocks],
             ),
+            decode_partials: (rows == batch_size).then(|| {
+                handle(
+                    &lease,
+                    &workspace.floats,
+                    &mut float_offset,
+                    &[
+                        batch_size * config.num_attention_heads * MAX_KV_SPLITS,
+                        KV_PARTIAL_WIDTH,
+                    ],
+                )
+            }),
             indices: handle(
                 &lease,
                 &workspace.integers,
@@ -282,6 +299,17 @@ impl<T: DType> WorkspacePool<T> {
     }
 }
 
+/// No per-layer allocation: reserve bounded split states only for one-token/request steps.
+fn decode_partial_elements(rows: usize, batch_size: usize, config: &Qwen2Config) -> Option<usize> {
+    if rows == batch_size {
+        batch_size
+            .checked_mul(config.num_attention_heads)?
+            .checked_mul(MAX_KV_SPLITS * KV_PARTIAL_WIDTH)
+    } else {
+        Some(0)
+    }
+}
+
 /// Linear in packed suffix length; logits/argmax storage also scales with batch size.
 /// Decoder depth does not affect scratch capacity.
 fn element_counts(
@@ -299,6 +327,7 @@ fn element_counts(
     let floats = batch_size
         .checked_mul(config.hidden_size + config.vocab_size + blocks)
         .and_then(|tail| rows.checked_mul(per_row)?.checked_add(tail))
+        .and_then(|n| n.checked_add(decode_partial_elements(rows, batch_size, config)?))
         .filter(|&n| n <= i32::MAX as usize)
         .ok_or_else(invalid)?;
     let integers = batch_size
