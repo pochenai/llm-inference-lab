@@ -221,6 +221,89 @@ pub(super) mod ops {
         out.store(result);
     }
 
+    /// Group nearby M tiles to reuse X and weights in L2; writes use mapped coordinates.
+    /// https://developer.nvidia.com/blog/how-to-write-high-performance-matrix-multiply-in-nvidia-cuda-tile/
+    /// Storage uses T; MMA accumulates in FP32 and casts once to output O.
+    /// PyTorch checkpoint weights are [out,in]; transpose each tile in registers.
+    /// Optional projection bias is fused into the epilogue before the single store.
+    /// BM token rows reuse weights; BN covers output channels independently of heads.
+    /// 4K B2/B4 down projection: ~2.8-4.3% kernel GPU-time reduction (Nsight).
+    /// Swizzle policy overall: ~1.7-2.1% prefill e2e reduction; other linears vary.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn linear_swizzled<
+        T: ElementType,
+        O: ElementType,
+        const K: i32,
+        const HAS_BIAS: bool,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+        const MAP_SHAPE: [i32; 2],
+    >(
+        mut out: MappedPartitionMut<O, { [BM, BN] }, MAP_SHAPE>,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        bias: &Tensor<T, { [-1] }>,
+    ) {
+        for index in out.iter_indices() {
+            let (row, column) = index.components();
+            let mut acc: Tile<f32, { [BM, BN] }> =
+                project_tile::<T, K, BM, BN, BK>(x, w, row, column).reshape(shape![BM, BN]);
+            if HAS_BIAS {
+                let bias_tile: Tile<f32, { [BN] }> =
+                    convert_tile(bias.partition(shape![BN]).load([column]));
+                acc = acc + bias_tile.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
+            }
+            let result: Tile<O, { [BM, BN] }> = convert_tile(acc);
+            out.store(result, index);
+        }
+    }
+
+    /// Fuse gate/up projections and SwiGLU; reuse each X tile and store only the final result.
+    /// Mapped launches group nearby tiles; group size one also handles narrow projections.
+    /// Round gate, up and SiLU to T to match the separate kernels.
+    /// 4K B2/B4: ~3.0-3.2% combined-FFN GPU-time gain; ~1.1-1.8% incremental prefill e2e gain.
+    /// https://developer.nvidia.com/blog/accelerating-mamba-2-with-high-performance-forward-pass-kernels-in-nvidia-cuda-tile/
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn linear_gate_up_swiglu_swizzled<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+        const MAP_SHAPE: [i32; 2],
+    >(
+        mut out: MappedPartitionMut<T, { [BM, BN] }, MAP_SHAPE>,
+        x: &Tensor<T, { [-1, K] }>,
+        gate_w: &Tensor<T, { [-1, K] }>,
+        up_w: &Tensor<T, { [-1, K] }>,
+    ) {
+        for index in out.iter_indices() {
+            let (row, column) = index.components();
+            let px = x.partition(shape![BM, BK]);
+            let pg = gate_w.partition(shape![BN, BK]);
+            let pu = up_w.partition(shape![BN, BK]);
+            let mut gate: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+            let mut up: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+            for block in 0i32..((K + BK - 1) / BK) {
+                let input = px.load([row, block]);
+                gate = mma(input, pg.load([column, block]).transpose(), gate);
+                up = mma(input, pu.load([column, block]).transpose(), up);
+            }
+            let gate: Tile<T, { [BM, BN] }> = convert_tile(gate);
+            let gate: Tile<f32, { [BM, BN] }> = convert_tile(gate);
+            let up: Tile<T, { [BM, BN] }> = convert_tile(up);
+            let up: Tile<f32, { [BM, BN] }> = convert_tile(up);
+            let one: Tile<f32, { [BM, BN] }> = constant(1.0f32, shape![BM, BN]);
+            let zero: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+            let activated: Tile<T, { [BM, BN] }> =
+                convert_tile(true_div(gate, one + exp(zero - gate)));
+            let activated: Tile<f32, { [BM, BN] }> = convert_tile(activated);
+            let result: Tile<T, { [BM, BN] }> = convert_tile(activated * up);
+            out.store(result, index);
+        }
+    }
+
     /// Normalize every packed row, or gather each request's last row when GATHER=true.
     /// Example: A adds two tokens and B adds one, so x has three packed rows.
     /// ```text

@@ -72,6 +72,15 @@ use tokenizers::Tokenizer;
 const KV_TOKENS_PER_TILE: i32 = 32;
 /// Retain small-input parallelism before enabling bulk pointwise/fused epilogues.
 const MIN_BULK_TOKEN_ROWS: usize = 512;
+/// Group M tiles only for the large working-set bucket; smaller rows keep their original grid.
+/// https://developer.nvidia.com/blog/how-to-write-high-performance-matrix-multiply-in-nvidia-cuda-tile/
+/// 4K B2/B4: ~1.7-2.1% prefill e2e gain in interleaved native measurements.
+/// Separate Nsight: summed linear GPU time ~0.1% / 2.9% lower, respectively.
+const MIN_SWIZZLED_TOKEN_ROWS: usize = 8192;
+/// Full gate/up fusion pays off for the large activation working set.
+/// https://developer.nvidia.com/blog/accelerating-mamba-2-with-high-performance-forward-pass-kernels-in-nvidia-cuda-tile/
+/// 4K B2/B4: ~1.8% / 1.1% incremental prefill e2e gain; ~3.2% / 3.0% FFN GPU-time gain.
+const MIN_FUSED_FFN_TOKEN_ROWS: usize = 8192;
 // Keep narrow/decode work on the scalar path; tiled prefill reuses K/V across queries.
 const ATTENTION_PREFILL_TILE: [usize; 2] = [32, 64];
 const MIN_TILED_PREFILL_QUERIES: usize = 64;
@@ -84,6 +93,7 @@ struct LinearTile {
     rows: usize,
     columns: usize,
     reduction: usize,
+    group_rows: usize,
 }
 
 impl LinearTile {
@@ -93,12 +103,18 @@ impl LinearTile {
                 rows: 128,
                 columns: 128,
                 reduction: 64,
+                group_rows: if rows >= MIN_SWIZZLED_TOKEN_ROWS {
+                    8
+                } else {
+                    1
+                },
             }
         } else if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 128 {
             Self {
                 rows: 32,
                 columns: 128,
                 reduction: 64,
+                group_rows: 1,
             }
         } else {
             let tile = if rows >= LINEAR_PREFILL_TILE[0] {
@@ -110,6 +126,7 @@ impl LinearTile {
                 rows: tile[0],
                 columns: tile[1],
                 reduction: 32,
+                group_rows: 1,
             }
         }
     }
@@ -742,39 +759,49 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 false,
                 exec,
             )?;
-            self.linear(
-                c"qwen2.linear.gate",
-                &mut scratch.gate,
-                &scratch.norm,
-                layer.gate.clone(),
-                None,
-                exec,
-            )?;
-            if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
-                self.linear_swiglu(
+            if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_FUSED_FFN_TOKEN_ROWS {
+                self.linear_gate_up_swiglu_swizzled(
                     &mut scratch.activated,
                     &scratch.norm,
+                    layer.gate.clone(),
                     layer.up.clone(),
-                    &scratch.gate,
                     exec,
                 )?;
             } else {
                 self.linear(
-                    c"qwen2.linear.up",
-                    &mut scratch.up,
+                    c"qwen2.linear.gate",
+                    &mut scratch.gate,
                     &scratch.norm,
-                    layer.up.clone(),
+                    layer.gate.clone(),
                     None,
                     exec,
                 )?;
-                let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
-                kernels::swiglu(
-                    (&mut scratch.activated).partition([1, 256]),
-                    &scratch.gate,
-                    &scratch.up,
-                )
-                .generics(vec![T::DTYPE.to_string()])
-                .execute(exec)?;
+                if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
+                    self.linear_swiglu(
+                        &mut scratch.activated,
+                        &scratch.norm,
+                        layer.up.clone(),
+                        &scratch.gate,
+                        exec,
+                    )?;
+                } else {
+                    self.linear(
+                        c"qwen2.linear.up",
+                        &mut scratch.up,
+                        &scratch.norm,
+                        layer.up.clone(),
+                        None,
+                        exec,
+                    )?;
+                    let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
+                    kernels::swiglu(
+                        (&mut scratch.activated).partition([1, 256]),
+                        &scratch.gate,
+                        &scratch.up,
+                    )
+                    .generics(vec![T::DTYPE.to_string()])
+                    .execute(exec)?;
+                }
             }
             self.linear(
                 c"qwen2.linear.down",
@@ -845,17 +872,34 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         tracing::debug!(target: "engine::qwen2", event = "linear_dispatch", rows = x.shape()[0], columns = out.shape()[1],
             reduction = k, tile_rows = tile.rows, tile_columns = tile.columns, tile_reduction = tile.reduction,
             layout = "checkpoint");
-        kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
-            .generics(vec![
-                T::DTYPE.to_string(),
-                O::DTYPE.to_string(),
-                k.to_string(),
-                has_bias.to_string(),
-                tile.rows.to_string(),
-                tile.columns.to_string(),
-                tile.reduction.to_string(),
-            ])
+        let mut generics = vec![
+            T::DTYPE.to_string(),
+            O::DTYPE.to_string(),
+            k.to_string(),
+            has_bias.to_string(),
+            tile.rows.to_string(),
+            tile.columns.to_string(),
+            tile.reduction.to_string(),
+        ];
+        if tile.group_rows > 1 {
+            let blocks = (x.shape()[0] as usize).div_ceil(tile.rows)
+                * (out.shape()[1] as usize).div_ceil(tile.columns);
+            generics.extend([tile.group_rows.to_string(), "1".into()]);
+            kernels::linear_swizzled(
+                out.partition([tile.rows, tile.columns])
+                    .map([tile.group_rows, 1], blocks as u32),
+                x,
+                w,
+                bias,
+            )
+            .generics(generics)
+            .grid((blocks as u32, 1, 1))
             .execute(exec)?;
+        } else {
+            kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
+                .generics(generics)
+                .execute(exec)?;
+        }
         Ok(())
     }
 
@@ -879,6 +923,40 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 tile.reduction.to_string(),
             ])
             .execute(exec)?;
+        Ok(())
+    }
+
+    unsafe fn linear_gate_up_swiglu_swizzled(
+        &self,
+        out: &mut Tensor<T>,
+        x: &Tensor<T>,
+        gate: Weight<T>,
+        up: Weight<T>,
+        exec: &ExecutionContext,
+    ) -> Result<(), ModelError> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.gate_up_swiglu");
+        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        // Two accumulators use half-width N tiles to retain the original accumulator footprint.
+        let columns = tile.columns / 2;
+        let mut generics = vec![
+            T::DTYPE.to_string(),
+            x.shape()[1].to_string(),
+            tile.rows.to_string(),
+            columns.to_string(),
+            tile.reduction.to_string(),
+        ];
+        let blocks = ((x.shape()[0] as usize).div_ceil(tile.rows)
+            * (out.shape()[1] as usize).div_ceil(columns)) as u32;
+        generics.extend([tile.group_rows.to_string(), "1".into()]);
+        kernels::linear_gate_up_swiglu_swizzled(
+            out.partition([tile.rows, columns])
+                .map([tile.group_rows, 1], blocks),
+            x,
+            gate,
+            up,
+        )
+        .generics(generics)
+        .execute(exec)?;
         Ok(())
     }
 
@@ -1879,11 +1957,13 @@ mod tests {
                     rows: 4,
                     columns: 32,
                     reduction: 32,
+                    group_rows: 1,
                 },
                 LinearTile {
                     rows: 16,
                     columns: 64,
                     reduction: 32,
+                    group_rows: 1,
                 },
                 LinearTile::for_shape::<cutile::core::bf16>(128, 4864),
                 LinearTile::for_shape::<cutile::core::bf16>(4096, 4864),
@@ -2770,6 +2850,15 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn bf16_swizzle_bucket_preserves_small_narrow_and_fp32_grids() {
+        use cutile::core::bf16;
+        assert_eq!(LinearTile::for_shape::<bf16>(4096, 4864).group_rows, 1);
+        assert_eq!(LinearTile::for_shape::<bf16>(8192, 4864).group_rows, 8);
+        assert_eq!(LinearTile::for_shape::<bf16>(16384, 128).group_rows, 1);
+        assert_eq!(LinearTile::for_shape::<f32>(16384, 4864).group_rows, 1);
+    }
+
+    #[test]
     fn tiled_prefill_dispatch_uses_each_suffix_not_packed_batch_size() {
         use cutile::core::bf16;
         assert!(GqaAttention::use_tiled_prefill::<bf16>(&[0..67, 67..142]));
@@ -3160,6 +3249,195 @@ mod tests {
                     "output {index}: {} vs {expected}",
                     value.to_f32()
                 );
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bf16_swizzled_linear_matches_cpu_with_partial_groups() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let cache = ReadbackCache::default();
+        for rows in [137usize, 1301] {
+            let (columns, width) = (259usize, 96usize);
+            let input = Arc::new(
+                (0..rows * width)
+                    .map(|i| bf16::from_f32(((i * 17 % 31) as f32 - 15.0) / 32.0))
+                    .collect::<Vec<_>>(),
+            );
+            let weights = Arc::new(
+                (0..columns * width)
+                    .map(|i| bf16::from_f32(((i * 7 % 29) as f32 - 14.0) / 64.0))
+                    .collect::<Vec<_>>(),
+            );
+            let bias = Arc::new(
+                (0..columns)
+                    .map(|i| bf16::from_f32((i as f32 % 13.0 - 6.0) / 64.0))
+                    .collect::<Vec<_>>(),
+            );
+            let actual = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    unsafe {
+                        let x = api::copy_host_vec_to_device(&input)
+                            .execute(exec)?
+                            .reshape(&[rows, width])?;
+                        let w = api::copy_host_vec_to_device(&weights)
+                            .execute(exec)?
+                            .reshape(&[columns, width])?;
+                        let b = api::copy_host_vec_to_device(&bias).execute(exec)?;
+                        let mut out =
+                            api::full(bf16::from_f32(f32::NAN), &[rows, columns]).execute(exec)?;
+                        kernels::linear_swizzled(
+                            (&mut out)
+                                .partition([128, 128])
+                                .map([8, 1], (rows.div_ceil(128) * columns.div_ceil(128)) as u32),
+                            &x,
+                            &w,
+                            &b,
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            "bf16".into(),
+                            width.to_string(),
+                            "true".into(),
+                            "128".into(),
+                            "128".into(),
+                            "64".into(),
+                            "8".into(),
+                            "1".into(),
+                        ])
+                        .grid((
+                            rows.div_ceil(128) as u32 * columns.div_ceil(128) as u32,
+                            1,
+                            1,
+                        ))
+                        .execute(exec)?;
+                        Ok(cache.enqueue(out, exec)?)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            for (index, value) in actual.as_slice().iter().enumerate() {
+                let row = index / columns;
+                let column = index % columns;
+                let sum = (0..width)
+                    .map(|i| input[row * width + i].to_f32() * weights[column * width + i].to_f32())
+                    .sum::<f32>();
+                let expected = bf16::from_f32(sum + bias[column].to_f32()).to_f32();
+                assert_eq!(value.to_f32(), expected, "rows={rows}, output={index}");
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bf16_fused_gate_up_matches_composed_kernels_with_partial_tiles(
+    ) -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let (rows, columns, width) = (137usize, 259usize, 96usize);
+        let input = Arc::new(
+            (0..rows * width)
+                .map(|i| bf16::from_f32(((i * 17 % 31) as f32 - 15.0) / 32.0))
+                .collect::<Vec<_>>(),
+        );
+        let gate_weights = Arc::new(
+            (0..columns * width)
+                .map(|i| bf16::from_f32(((i * 11 % 37) as f32 - 18.0) / 64.0))
+                .collect::<Vec<_>>(),
+        );
+        let up_weights = Arc::new(
+            (0..columns * width)
+                .map(|i| bf16::from_f32(((i * 7 % 29) as f32 - 14.0) / 64.0))
+                .collect::<Vec<_>>(),
+        );
+        let cache = ReadbackCache::default();
+        for group_rows in [1usize, 8] {
+            let (tile_rows, tile_columns) = (128usize, 64usize);
+            let (actual, expected) = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    unsafe {
+                        let x = api::copy_host_vec_to_device(&input)
+                            .execute(exec)?
+                            .reshape(&[rows, width])?;
+                        let wg = api::copy_host_vec_to_device(&gate_weights)
+                            .execute(exec)?
+                            .reshape(&[columns, width])?;
+                        let wu = api::copy_host_vec_to_device(&up_weights)
+                            .execute(exec)?
+                            .reshape(&[columns, width])?;
+                        let bias = api::zeros::<bf16>(&[1]).execute(exec)?;
+                        let mut gate =
+                            api::full(bf16::from_f32(f32::NAN), &[rows, columns]).execute(exec)?;
+                        let mut expected =
+                            api::full(bf16::from_f32(f32::NAN), &[rows, columns]).execute(exec)?;
+                        let mut actual =
+                            api::full(bf16::from_f32(f32::NAN), &[rows, columns]).execute(exec)?;
+                        kernels::linear(
+                            (&mut gate).partition([tile_rows, tile_columns]),
+                            &x,
+                            &wg,
+                            &bias,
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            "bf16".into(),
+                            width.to_string(),
+                            "false".into(),
+                            tile_rows.to_string(),
+                            tile_columns.to_string(),
+                            "64".into(),
+                        ])
+                        .execute(exec)?;
+                        kernels::linear_swiglu(
+                            (&mut expected).partition([tile_rows, tile_columns]),
+                            &x,
+                            &wu,
+                            &gate,
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            width.to_string(),
+                            tile_rows.to_string(),
+                            tile_columns.to_string(),
+                            "64".into(),
+                        ])
+                        .execute(exec)?;
+                        kernels::linear_gate_up_swiglu_swizzled(
+                            (&mut actual).partition([tile_rows, tile_columns]).map(
+                                [group_rows, 1],
+                                (rows.div_ceil(tile_rows) * columns.div_ceil(tile_columns)) as u32,
+                            ),
+                            &x,
+                            &wg,
+                            &wu,
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            width.to_string(),
+                            tile_rows.to_string(),
+                            tile_columns.to_string(),
+                            "64".into(),
+                            group_rows.to_string(),
+                            "1".into(),
+                        ])
+                        .execute(exec)?;
+                        Ok((cache.enqueue(actual, exec)?, cache.enqueue(expected, exec)?))
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            for (index, (a, b)) in actual
+                .as_slice()
+                .iter()
+                .zip(expected.as_slice())
+                .enumerate()
+            {
+                assert!(a.to_f32().is_finite(), "unwritten element {index}");
+                assert_eq!(a.to_f32(), b.to_f32(), "rounding mismatch at {index}");
             }
         }
         Ok(())
