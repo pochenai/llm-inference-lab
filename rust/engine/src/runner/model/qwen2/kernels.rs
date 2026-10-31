@@ -681,6 +681,17 @@ pub(super) mod ops {
                 Latency::<1>,
             );
             let keys = select(kv_mask, keys, zero_kv);
+            // Make V available before QK/softmax to expose memory/compute overlap.
+            let (values, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
+                v_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(kv_mask),
+                None::<T>,
+                None,
+                Latency::<1>,
+            );
+            let values = select(kv_mask, values, zero_kv);
             // Block dot products.
             // ```text
             // scores = query * keys^T
@@ -731,16 +742,6 @@ pub(super) mod ops {
             // ```
             denominator = denominator * alpha + block_sum.reshape(shape![BQ, 1]);
             let mma_weights: Tile<T, { [BQ, BK] }> = convert_tile(block_weights);
-            let (values, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
-                v_ptrs,
-                ordering::Weak,
-                None::<scope::TileBlock>,
-                Some(kv_mask),
-                None::<T>,
-                None,
-                Latency::<1>,
-            );
-            let values = select(kv_mask, values, zero_kv);
             // Accumulate the weighted values using MMA.
             // ```text
             // mma_weights = cast_T(block_weights)
