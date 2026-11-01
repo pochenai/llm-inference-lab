@@ -32,6 +32,20 @@ factory defaults and extension signature types must stay reachable because they
 appear in public generic interfaces. The scalar `forward` and Runner `execute_session` convenience helpers are private
 and test-only; production execution uses CausalModel::enqueue_forward_and_return_completion and Runner::drive.
 
+## Routing extension
+
+Scheduler now supports multiple named destinations via `with_routing`, while
+`new`/`new_with_observers` preserve the single-Runner construction path.
+`RoutingState` owns bounded prefix hints/session placement; `RoutingRuntime`
+keeps a destination-to-request-ID reverse index for targeted disconnect cleanup. `RoutingPolicy` reads candidate metadata;
+`RequestForwarder` resolves endpoint identity and sends existing RunnerCommand
+messages. `Forwarding` supplies source-tagged RunnerReply/disconnect events.
+One routing loop serializes transitions; session acknowledgements are polled
+without blocking other requests. The gateway retains response/terminal delivery,
+including when the caller drops its stream. Engine-local prefix KV reuse remains
+unimplemented. See [routing state/actions/control](prefix_cache_routing.md) and
+[configuration](../rust/engine/README.md#multi-destination-routing).
+
 ## Architecture
 
 ```mermaid

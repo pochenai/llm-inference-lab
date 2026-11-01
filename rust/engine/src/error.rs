@@ -4,10 +4,14 @@ use crate::runner::{
     kv_pool::{KVContextError, KVPoolError},
     model::ModelError,
 };
+use crate::types::SessionId;
 
 #[derive(Clone, Debug)]
 pub enum EngineError {
     ChannelClosed,
+    /// Required session placement/history is missing or invalidated; a harness can restore
+    /// it from full history. A prompt delta alone cannot recreate the session.
+    SessionLost(SessionId),
     InvalidInput(String),
     Internal(String),
     Model(ModelError),
@@ -19,6 +23,9 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChannelClosed => write!(f, "engine channel closed"),
+            Self::SessionLost(id) => {
+                write!(f, "session {id} is unavailable; restore from full history")
+            }
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Internal(message) => write!(f, "engine internal error: {message}"),
             Self::Model(error) => error.fmt(f),

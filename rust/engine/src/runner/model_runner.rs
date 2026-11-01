@@ -472,7 +472,7 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             .sessions
             .get(&id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| EngineError::InvalidInput("unknown session".into()))?;
+            .ok_or(EngineError::SessionLost(id))?;
         let mut guard = entry
             .clone()
             .try_lock_owned()
@@ -546,14 +546,16 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
                     .sessions
                     .get(&id)
                     .map(|entry| entry.value().clone())
-                    .ok_or_else(|| EngineError::InvalidInput("unknown session".into()))?;
+                    .ok_or(EngineError::SessionLost(id))?;
                 let guard = entry
                     .try_lock_owned()
                     .map_err(|_| EngineError::InvalidInput("session is busy".into()))?;
                 if guard.is_none() {
-                    return Err(EngineError::InvalidInput(
-                        "session closed or invalidated".into(),
-                    ));
+                    // Gateway retires SessionLost placement, so remove this empty tombstone too.
+                    self.sessions.remove_if(&id, |_, current| {
+                        Arc::ptr_eq(current, OwnedMutexGuard::mutex(&guard))
+                    });
+                    return Err(EngineError::SessionLost(id));
                 }
                 Some(guard)
             }
@@ -2158,6 +2160,8 @@ mod tests {
                         result,
                         Err(EngineError::Model(ModelError::InvalidInput(_)))
                     ));
+                } else if index == 3 {
+                    assert!(matches!(result, Err(EngineError::SessionLost(999))));
                 } else {
                     assert!(matches!(result, Err(EngineError::InvalidInput(_))));
                 }
@@ -2170,6 +2174,23 @@ mod tests {
         );
         assert_eq!(runner.pool.metrics(), retained);
         runner.close_session(10)?;
+        assert_eq!(runner.pool.metrics(), initial);
+        runner.open_session(30)?;
+        let entry = runner.sessions.get(&30).unwrap().value().clone();
+        entry.lock().await.take();
+        assert!(matches!(
+            runner.execute_session(request(30, Some(30), "1")).await,
+            Err(EngineError::SessionLost(30))
+        ));
+        assert!(!runner.sessions.contains_key(&30));
+        assert!(matches!(
+            runner.close_session(30),
+            Err(EngineError::SessionLost(30))
+        ));
+        assert!(matches!(
+            runner.close_session(999),
+            Err(EngineError::SessionLost(999))
+        ));
         assert_eq!(runner.pool.metrics(), initial);
         Ok(())
     }
@@ -2584,7 +2605,7 @@ mod tests {
             scheduler
                 .execute(SessionRequest::new(Some(session_id), "6".into()))
                 .await,
-            Err(EngineError::InvalidInput(_))
+            Err(EngineError::SessionLost(id)) if id == session_id
         ));
         assert!(scheduler.close_session(session_id).await.is_err());
         cancel.cancel();

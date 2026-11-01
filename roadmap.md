@@ -661,7 +661,10 @@ alter logits and token trajectories; eager/Graph equality is not a quality study
 
 #### W9: radix prefix caching, shared ownership, and cache-aware routing
 
-Status: Next / Planned. W8 optimization and static comparison are complete.
+Status: In progress. Local multi-destination routing is implemented with bounded
+4 KiB prefix hints, random longest-match selection, session affinity and isolated
+forwarding/accounting. Engine-local exact prefix KV reuse is next; routing alone
+has not demonstrated prefill savings. W8 static comparison remains unchanged.
 
 **Focus**
 

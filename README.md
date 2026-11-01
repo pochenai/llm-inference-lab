@@ -29,7 +29,7 @@ throughput. Next is W9 radix prefix reuse, shared KV ownership and cache-aware r
 | 6 | Continuous batching, chunked prefill and submission-first overlap | ✅ Fixed-cohort overlap A/B and Nsight validated; mixed arrivals pending |
 | 7 | Native BF16 Qwen; separate quantization follow-up | ✅ BF16 implemented; quantization planned |
 | 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, M/N/K tile selection, HMMA QKV/down, fusion/swizzling, split-KV and CUDA Graph | ✅ Done; current-source prefill/decode SGLang comparison and Nsight/SASS validation |
-| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Next |
+| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | 🚧 Local multi-destination routing implemented; Engine prefix reuse next |
 | 10 | Modern model architectures | ⬜ Planned |
 | 11 | Multi-GPU execution | ⬜ Planned |
 | 12 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |

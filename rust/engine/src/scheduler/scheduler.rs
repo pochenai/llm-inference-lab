@@ -1,7 +1,12 @@
-mod observer;
-
-pub use observer::{MetricsObserver, RequestStats, SchedulerObserver};
-
+use super::{
+    forwarding::{Forwarding, LocalDestination, LocalForwarder, RequestForwarder},
+    observer::{RequestStats, SchedulerObserver},
+    routing::{
+        CacheNamespace, DestinationId, RandomPrefixPolicy, RoutingConfig, RoutingPolicy,
+        RoutingState,
+    },
+    runtime::RoutingRuntime,
+};
 use crate::{error::EngineError, types::*};
 use dashmap::DashMap;
 use futures::{stream, Stream, TryStreamExt};
@@ -20,14 +25,20 @@ use tokio::{
 
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-struct PendingRequest {
-    reply_tx: mpsc::UnboundedSender<Result<Option<LLMResponse>, EngineError>>,
+/// Invariant: reply/lifecycle metadata only; never retain the prompt, token history,
+/// or buffers whose capacity/backing allocation scales with the full input length.
+/// Full input belongs to the forwarding command; routing retains only capped prefixes.
+pub(super) struct PendingRequest {
+    pub(super) reply_tx: mpsc::UnboundedSender<Result<Option<LLMResponse>, EngineError>>,
     request_id: RequestId,
-    started: Instant,
-    first_text: Option<Duration>,
+    pub(super) started: Instant,
+    pub(super) first_text: Option<Duration>,
+    pub(super) destination: Option<DestinationId>,
 }
 
-type Requests = Arc<DashMap<RequestId, PendingRequest>>;
+/// Invariant: per-request bookkeeping must not retain full request inputs, directly
+/// or through shared slices/closures. The separate prefix index obeys RoutingConfig limits.
+pub(super) type Requests = Arc<DashMap<RequestId, PendingRequest>>;
 
 #[derive(Clone)]
 pub struct Scheduler {
@@ -58,38 +69,69 @@ impl Scheduler {
         batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
         observers: Vec<Arc<dyn SchedulerObserver>>,
     ) -> Self {
+        let forwarding = LocalForwarder::connect([LocalDestination::new(
+            DestinationId(0),
+            CacheNamespace(0),
+            runner_command_tx,
+            batch_reply_rx,
+        )])
+        .expect("one local destination is unique");
+        Self::with_routing(
+            cancel_token,
+            forwarding,
+            RoutingConfig::default(),
+            RandomPrefixPolicy,
+            observers,
+        )
+        .expect("default local routing configuration is valid")
+    }
+
+    /// Configure named destinations and forwarding independently of prefix selection.
+    /// The gateway retains reply delivery; Engine-local prefix reuse is not implied.
+    pub fn with_routing<F: RequestForwarder, P: RoutingPolicy>(
+        cancel_token: CancellationToken,
+        forwarding: Forwarding<F>,
+        config: RoutingConfig,
+        policy: P,
+        observers: Vec<Arc<dyn SchedulerObserver>>,
+    ) -> Result<Self, EngineError> {
+        let state = RoutingState::new(&forwarding.destinations, config)?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let requests = Arc::new(DashMap::new());
         let observers: Arc<[Arc<dyn SchedulerObserver>]> = observers.into();
         let task_tracker = TaskTracker::new();
-        let tasks = vec![
-            task_tracker
-                .spawn(Self::run_dispatch(
-                    command_rx,
-                    runner_command_tx,
-                    cancel_token.clone(),
-                ))
-                .abort_handle(),
-            task_tracker
-                .spawn(Self::run_recv_resp(
-                    batch_reply_rx,
-                    requests.clone(),
-                    cancel_token.clone(),
-                    observers.clone(),
-                ))
-                .abort_handle(),
-        ];
+        let lifetimes = forwarding
+            .destinations
+            .iter()
+            .map(|d| (d.id, cancel_token.child_token()))
+            .collect();
+        let task = task_tracker
+            .spawn(
+                RoutingRuntime {
+                    commands: command_rx,
+                    forwarding,
+                    state,
+                    requests_by_destination: Default::default(),
+                    policy,
+                    requests: requests.clone(),
+                    observers: observers.clone(),
+                    cancel: cancel_token.clone(),
+                    lifetimes,
+                }
+                .run(),
+            )
+            .abort_handle();
         task_tracker.close();
-        Self {
+        Ok(Self {
             command_tx,
             requests,
             observers,
             next_id: Arc::new(AtomicU64::new(0)),
             next_session_id: Arc::new(AtomicU64::new(0)),
             cancel_token,
-            tasks,
+            tasks: vec![task],
             task_tracker,
-        }
+        })
     }
 
     // Must be polled to stop tasks when the caller signals cancellation.
@@ -135,6 +177,7 @@ impl Scheduler {
             request_id,
             started: Instant::now(),
             first_text: None,
+            destination: None,
         };
         self.observers.request_received(request_id);
         self.requests.insert(request_id, pending);
@@ -204,7 +247,7 @@ impl Scheduler {
         }
     }
 
-    fn finish_request(
+    pub(super) fn finish_request(
         request: PendingRequest,
         generated_tokens: Option<usize>,
         result: Result<(), EngineError>,
@@ -221,7 +264,7 @@ impl Scheduler {
 
     /// Remove ownership before callbacks; plugins may re-enter admission without
     /// holding a DashMap shard lock. Only used after routing stops or admission fails.
-    fn fail_pending(requests: &Requests, observers: &impl SchedulerObserver) {
+    pub(super) fn fail_pending(requests: &Requests, observers: &impl SchedulerObserver) {
         let ids: Vec<_> = requests.iter().map(|entry| *entry.key()).collect();
         for id in ids {
             if let Some((_, request)) = requests.remove(&id) {
@@ -229,84 +272,12 @@ impl Scheduler {
             }
         }
     }
-
-    /// Forward admission order immediately; Runner forms GPU batches at step boundaries.
-    async fn run_dispatch(
-        mut command_rx: mpsc::UnboundedReceiver<RunnerCommand>,
-        runner_command_tx: mpsc::UnboundedSender<RunnerCommand>,
-        cancel_token: CancellationToken,
-    ) {
-        loop {
-            let command = tokio::select! {
-                biased;
-                _ = cancel_token.cancelled() => break,
-                _ = runner_command_tx.closed() => {
-                    cancel_token.cancel();
-                    break;
-                }
-                command = command_rx.recv() => match command {
-                    Some(command) => command,
-                    None => break,
-                },
-            };
-            if runner_command_tx.send(command).is_err() {
-                // Reply routing owns terminal callbacks and pending-request cleanup.
-                cancel_token.cancel();
-                break;
-            }
-        }
-    }
-
-    async fn run_recv_resp(
-        mut batch_reply_rx: mpsc::UnboundedReceiver<RunnerReply>,
-        requests: Requests,
-        cancel_token: CancellationToken,
-        observers: Arc<[Arc<dyn SchedulerObserver>]>,
-    ) {
-        loop {
-            let output = tokio::select! {
-                biased;
-                // Preserve queued completions when command-transport closure signals shutdown.
-                output = batch_reply_rx.recv() => match output { Some(output) => output, None => break },
-                _ = cancel_token.cancelled() => break,
-            };
-            match output {
-                RunnerReply::Delta(response) => {
-                    if let Some((id, mut request)) = requests.remove(&response.request_id) {
-                        let first_text =
-                            if !response.output.is_empty() && request.first_text.is_none() {
-                                let elapsed = request.started.elapsed();
-                                request.first_text = Some(elapsed);
-                                Some(elapsed)
-                            } else {
-                                None
-                            };
-                        // Own the entry while notifying; no routing-map lock spans callbacks.
-                        observers.text_delta(&response, first_text);
-                        let _ = request.reply_tx.send(Ok(Some(response)));
-                        requests.insert(id, request);
-                    }
-                }
-                RunnerReply::Finished {
-                    request_id,
-                    generated_tokens,
-                    result,
-                } => {
-                    if let Some((_, request)) = requests.remove(&request_id) {
-                        Self::finish_request(request, Some(generated_tokens), result, &observers);
-                    }
-                }
-            }
-        }
-        // Reject admissions racing with transport closure, then finish every pending request.
-        cancel_token.cancel();
-        Self::fail_pending(&requests, &observers);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::{DestinationCandidate, MetricsObserver};
 
     #[derive(Debug)]
     enum Observation {
@@ -519,7 +490,7 @@ mod tests {
     ) -> Result<(), EngineError> {
         for cause in ["cancel", "reply_closed", "dispatch_closed"] {
             let cancel = CancellationToken::new();
-            let (commands, rx) = mpsc::unbounded_channel();
+            let (commands, mut rx) = mpsc::unbounded_channel();
             let (replies, reply_rx) = mpsc::unbounded_channel();
             let log = Arc::new(ObserverLog::default());
             let scheduler = Scheduler::new_with_observers(
@@ -530,6 +501,7 @@ mod tests {
             );
             let stream = scheduler.execute_stream(SessionRequest::new(None, "pending".into()))?;
             futures::pin_mut!(stream);
+            assert!(matches!(rx.recv().await, Some(RunnerCommand::Execute(_))));
             replies
                 .send(RunnerReply::Delta(LLMResponse {
                     request_id: 0,
@@ -698,98 +670,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_completion_survives_transport_cancellation() {
-        let requests = Arc::new(DashMap::new());
-        let (reply_tx, mut response_rx) = mpsc::unbounded_channel();
-        requests.insert(
-            0,
-            PendingRequest {
-                reply_tx,
-                request_id: 0,
-                started: Instant::now(),
-                first_text: None,
-            },
-        );
-        let (replies, rx) = mpsc::unbounded_channel();
-        replies
-            .send(RunnerReply::Delta(LLMResponse {
-                request_id: 0,
-                output: "done".into(),
-            }))
-            .unwrap();
-        replies
-            .send(RunnerReply::Finished {
-                request_id: 0,
-                generated_tokens: 1,
-                result: Ok(()),
-            })
-            .unwrap();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        Scheduler::run_recv_resp(rx, requests.clone(), cancel, Vec::new().into()).await;
-        assert_eq!(
-            response_rx.try_recv().unwrap().unwrap().unwrap().output,
-            "done"
-        );
-        assert!(response_rx.try_recv().unwrap().unwrap().is_none());
-        assert!(requests.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_preserves_order_without_waiting_for_more_requests() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
-        let inputs = [
-            (Some(1), "a1"),
-            (Some(2), "b1"),
-            (None, "x"),
-            (None, "y"),
-            (Some(1), "a2"),
-            (Some(2), "b2"),
-            (None, "z"),
-            (Some(1), "a3"),
-            (None, "tail1"),
-            (None, "tail2"),
-            (None, "tail3"),
-            (None, "tail4"),
-            (None, "tail5"),
-        ];
-        for (id, &(session, input)) in inputs.iter().enumerate() {
-            tx.send(RunnerCommand::Execute(vec![SessionRequest::new(
-                session,
-                input.to_owned(),
-            )
-            .with_request_id(id as u64)]))
-                .unwrap();
-        }
-        let dispatch = Scheduler::run_dispatch(rx, batch_tx, CancellationToken::new());
-        tokio::pin!(dispatch);
-        assert!(futures::poll!(dispatch.as_mut()).is_pending());
-        assert_eq!(batch_rx.len(), inputs.len());
-        drop(tx);
-        dispatch.await;
-        let mut sizes = Vec::new();
-        let mut observed = Vec::new();
-        while let Some(RunnerCommand::Execute(batch)) = batch_rx.recv().await {
-            sizes.push(batch.len());
-            for request in batch {
-                observed.push((
-                    request.assigned_request_id(),
-                    request.session_id,
-                    request.input,
-                ));
-            }
-        }
-        assert_eq!(sizes, vec![1; inputs.len()]);
-        let expected: Vec<_> = inputs
-            .iter()
-            .enumerate()
-            .map(|(id, &(session, input))| (id as u64, session, input.to_owned()))
-            .collect();
-        assert_eq!(observed, expected);
-    }
-
-    #[tokio::test]
     async fn admission_assigns_fresh_ids_across_clones_and_resubmissions() -> Result<(), EngineError>
     {
         let cancel = CancellationToken::new();
@@ -800,7 +680,7 @@ mod tests {
             while let Some(RunnerCommand::Execute(batch)) = request_rx.recv().await {
                 for request in batch {
                     let id = request.assigned_request_id();
-                    assert_eq!(request.session_id, Some(7));
+                    assert_eq!(request.session_id, None);
                     reply_tx
                         .send(RunnerReply::Delta(LLMResponse {
                             request_id: id,
@@ -820,7 +700,7 @@ mod tests {
                 }
             }
         });
-        let request = SessionRequest::new(Some(7), "same payload".to_owned());
+        let request = SessionRequest::new(None, "same payload".to_owned());
         assert_eq!(request.request_id(), None);
         let clone = scheduler.clone();
         let (left, right) = tokio::join!(
@@ -845,62 +725,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_commands_preserve_transport_order() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
-        for (id, text) in [(1, "first"), (2, "second")] {
-            tx.send(RunnerCommand::Execute(vec![SessionRequest::new(
-                Some(7),
-                text.into(),
-            )
-            .with_request_id(id)]))
-                .unwrap();
-        }
-        let (reply, close_response) = oneshot::channel();
-        tx.send(RunnerCommand::CloseSession { id: 7, reply })
-            .unwrap();
-        let (reply, open_response) = oneshot::channel();
-        tx.send(RunnerCommand::OpenSession { id: 8, reply })
-            .unwrap();
-        tx.send(RunnerCommand::Execute(vec![SessionRequest::new(
-            Some(8),
-            "third".into(),
-        )
-        .with_request_id(3)]))
-            .unwrap();
-        drop(tx);
-        Scheduler::run_dispatch(rx, runner_tx, CancellationToken::new()).await;
-        let mut observed = Vec::new();
-        while let Some(command) = runner_rx.recv().await {
-            match command {
-                RunnerCommand::Execute(batch) => {
-                    assert_eq!(batch.len(), 1);
-                    observed.push(batch[0].input.clone());
-                }
-                RunnerCommand::CloseSession { id, reply } => {
-                    assert_eq!(id, 7);
-                    observed.push("close".into());
-                    reply.send(Ok(())).unwrap();
-                }
-                RunnerCommand::OpenSession { id, reply } => {
-                    assert_eq!(id, 8);
-                    observed.push("open".into());
-                    reply.send(Ok(())).unwrap();
-                }
-            }
-        }
-        assert_eq!(observed, ["first", "second", "close", "open", "third"]);
-        close_response.await.unwrap().unwrap();
-        open_response.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn session_management_unblocks_on_cancellation_or_runner_disconnect() {
         for opening in [true, false] {
             let cancel = CancellationToken::new();
             let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
             let (_reply_tx, reply_rx) = mpsc::unbounded_channel();
             let scheduler = Scheduler::new(cancel.child_token(), runner_tx, reply_rx);
+            if !opening {
+                let open = scheduler.open_session();
+                tokio::pin!(open);
+                tokio::select! {
+                    result = &mut open => panic!("unexpected early open: {result:?}"),
+                    command = runner_rx.recv() => {
+                        let RunnerCommand::OpenSession { reply, .. } = command.unwrap() else { panic!("open") };
+                        reply.send(Ok(())).unwrap();
+                    }
+                }
+                assert_eq!(open.await.unwrap(), 0);
+            }
             let operation = async {
                 if opening {
                     scheduler.open_session().await.map(|_| ())
@@ -978,5 +820,498 @@ mod tests {
             scheduler.close_session(0).await,
             Err(EngineError::ChannelClosed)
         ));
+    }
+
+    struct MockDestination {
+        endpoint: LocalDestination,
+        commands: mpsc::UnboundedReceiver<RunnerCommand>,
+        replies: mpsc::UnboundedSender<RunnerReply>,
+    }
+
+    fn mock_destination(id: u64, namespace: u64) -> MockDestination {
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (replies, reply_rx) = mpsc::unbounded_channel();
+        MockDestination {
+            endpoint: LocalDestination::new(
+                DestinationId(id),
+                CacheNamespace(namespace),
+                commands,
+                reply_rx,
+            ),
+            commands: rx,
+            replies,
+        }
+    }
+
+    fn echo_worker(
+        mut commands: mpsc::UnboundedReceiver<RunnerCommand>,
+        replies: mpsc::UnboundedSender<RunnerReply>,
+        destination: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut sessions = std::collections::HashSet::new();
+            while let Some(command) = commands.recv().await {
+                match command {
+                    RunnerCommand::Execute(batch) => {
+                        for request in batch {
+                            if let Some(session) = request.session_id {
+                                assert!(sessions.contains(&session));
+                            }
+                            let request_id = request.assigned_request_id();
+                            let _ = replies.send(RunnerReply::Delta(LLMResponse {
+                                request_id,
+                                output: format!("{destination}:{}", request.input),
+                            }));
+                            let _ = replies.send(RunnerReply::Finished {
+                                request_id,
+                                generated_tokens: 1,
+                                result: Ok(()),
+                            });
+                        }
+                    }
+                    RunnerCommand::OpenSession { id, reply } => {
+                        assert!(sessions.insert(id));
+                        let _ = reply.send(Ok(()));
+                    }
+                    RunnerCommand::CloseSession { id, reply } => {
+                        assert!(sessions.remove(&id));
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn routed_prefixes_keep_full_inputs_and_sessions_stick_to_their_owner(
+    ) -> Result<(), EngineError> {
+        let cancel = CancellationToken::new();
+        let mut endpoints = Vec::new();
+        let mut workers = Vec::new();
+        for (id, namespace) in [(1, 0), (2, 0), (3, 1)] {
+            let MockDestination {
+                endpoint,
+                commands,
+                replies,
+            } = mock_destination(id, namespace);
+            endpoints.push(endpoint);
+            workers.push(echo_worker(commands, replies, id));
+        }
+        let scheduler = Scheduler::with_routing(
+            cancel.child_token(),
+            LocalForwarder::connect(endpoints)?,
+            RoutingConfig::default(),
+            RandomPrefixPolicy,
+            vec![],
+        )?;
+        let input = format!("SYS:{}", "a".repeat(5000));
+        let first = scheduler
+            .execute(SessionRequest::new(None, input.clone()))
+            .await?;
+        assert!(first.output.starts_with("1:") || first.output.starts_with("2:"));
+        assert_eq!(&first.output[2..], input);
+        let next_input = format!("SYS:{}bbb", "a".repeat(5000));
+        let second = scheduler
+            .execute(SessionRequest::new(None, next_input.clone()))
+            .await?;
+        assert_eq!(&second.output[..2], &first.output[..2]);
+        assert_eq!(&second.output[2..], next_input);
+        let session = scheduler.open_session().await?;
+        let turn = scheduler
+            .execute(SessionRequest::new(Some(session), "first".into()))
+            .await?;
+        let followup = scheduler
+            .execute(SessionRequest::new(Some(session), "unrelated".into()))
+            .await?;
+        assert_eq!(&turn.output[..2], &followup.output[..2]);
+        scheduler.close_session(session).await?;
+        assert!(matches!(
+            scheduler
+                .execute(SessionRequest::new(Some(session), "late".into()))
+                .await,
+            Err(EngineError::SessionLost(id)) if id == session
+        ));
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        Ok(())
+    }
+
+    struct InspectPolicy {
+        observations: Arc<std::sync::Mutex<Vec<Vec<DestinationCandidate>>>>,
+        selections: AtomicU64,
+    }
+
+    impl RoutingPolicy for InspectPolicy {
+        fn select(&self, candidates: &[DestinationCandidate]) -> Option<DestinationCandidate> {
+            self.observations.lock().unwrap().push(candidates.to_vec());
+            let mut candidates = candidates.to_vec();
+            candidates.sort_by_key(|c| c.destination);
+            if candidates.is_empty() {
+                return None;
+            }
+            let candidate = candidates
+                [self.selections.fetch_add(1, Ordering::Relaxed) as usize % candidates.len()];
+            Some(candidate)
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_isolated_and_duplicate_or_wrong_source_replies_do_not_finish_peers(
+    ) -> Result<(), EngineError> {
+        let MockDestination {
+            endpoint: first,
+            commands: mut first_commands,
+            replies: first_replies,
+        } = mock_destination(1, 0);
+        let MockDestination {
+            endpoint: second,
+            commands: mut second_commands,
+            replies: second_replies,
+        } = mock_destination(2, 0);
+        let cancel = CancellationToken::new();
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::new(ObserverLog::default());
+        let scheduler = Scheduler::with_routing(
+            cancel.child_token(),
+            LocalForwarder::connect([first, second])?,
+            RoutingConfig::default(),
+            InspectPolicy {
+                observations: observations.clone(),
+                selections: AtomicU64::new(0),
+            },
+            vec![log.clone()],
+        )?;
+        let dropped_consumer =
+            scheduler.execute_stream(SessionRequest::new(None, "first".into()))?;
+        let peer = scheduler.execute_stream(SessionRequest::new(None, "second".into()))?;
+        futures::pin_mut!(peer);
+        let Some(RunnerCommand::Execute(first_batch)) = first_commands.recv().await else {
+            panic!("first command")
+        };
+        let Some(RunnerCommand::Execute(second_batch)) = second_commands.recv().await else {
+            panic!("second command")
+        };
+        let first_id = first_batch[0].assigned_request_id();
+        let peer_id = second_batch[0].assigned_request_id();
+        // Dropping delivery does not finish an admitted request.
+        drop(dropped_consumer);
+        assert_eq!(scheduler.requests.len(), 2);
+        assert!(observations.lock().unwrap()[1]
+            .iter()
+            .any(|c| c.destination == DestinationId(1)));
+        first_replies
+            .send(RunnerReply::Finished {
+                request_id: peer_id,
+                generated_tokens: 99,
+                result: Ok(()),
+            })
+            .unwrap();
+        drop(first_commands);
+        second_replies
+            .send(RunnerReply::Delta(LLMResponse {
+                request_id: peer_id,
+                output: "peer survived".into(),
+            }))
+            .unwrap();
+        second_replies
+            .send(RunnerReply::Finished {
+                request_id: peer_id,
+                generated_tokens: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        second_replies
+            .send(RunnerReply::Finished {
+                request_id: peer_id,
+                generated_tokens: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        assert_eq!(peer.try_next().await?.unwrap().output, "peer survived");
+        assert!(peer.try_next().await?.is_none());
+        // A following request is a routing-loop barrier after terminal processing.
+        let last = scheduler.execute_stream(SessionRequest::new(None, "last".into()))?;
+        futures::pin_mut!(last);
+        let Some(RunnerCommand::Execute(batch)) = second_commands.recv().await else {
+            panic!("survivor command")
+        };
+        let snapshot = observations.lock().unwrap().last().unwrap().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].destination, DestinationId(2));
+        let last_id = batch[0].assigned_request_id();
+        second_replies
+            .send(RunnerReply::Delta(LLMResponse {
+                request_id: last_id,
+                output: "ok".into(),
+            }))
+            .unwrap();
+        second_replies
+            .send(RunnerReply::Finished {
+                request_id: last_id,
+                generated_tokens: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        assert_eq!(last.try_next().await?.unwrap().output, "ok");
+        assert!(last.try_next().await?.is_none());
+        assert!(!scheduler.requests.contains_key(&first_id));
+        assert!(scheduler.requests.is_empty());
+        let finishes = log
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Observation::Finished { .. }))
+            .count();
+        assert_eq!(finishes, 3);
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        Ok(())
+    }
+
+    struct RejectFirst(LocalForwarder);
+
+    impl RequestForwarder for RejectFirst {
+        fn forward(
+            &self,
+            destination: DestinationId,
+            command: RunnerCommand,
+        ) -> Result<(), EngineError> {
+            if destination == DestinationId(1) {
+                Err(EngineError::ChannelClosed)
+            } else {
+                self.0.forward(destination, command)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_forwarder_send_failure_does_not_count_or_stop_other_destinations(
+    ) -> Result<(), EngineError> {
+        let MockDestination {
+            endpoint: first,
+            commands: _held_commands,
+            replies: _held_replies,
+        } = mock_destination(1, 0);
+        let MockDestination {
+            endpoint: second,
+            commands,
+            replies,
+        } = mock_destination(2, 0);
+        let Forwarding {
+            forwarder,
+            destinations,
+            events,
+        } = LocalForwarder::connect([first, second])?;
+        let forwarding = Forwarding::new(RejectFirst(forwarder), destinations, events);
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let scheduler = Scheduler::with_routing(
+            cancel.child_token(),
+            forwarding,
+            RoutingConfig::default(),
+            InspectPolicy {
+                observations: observations.clone(),
+                selections: AtomicU64::new(0),
+            },
+            vec![],
+        )?;
+        let worker = echo_worker(commands, replies, 2);
+        assert!(matches!(
+            scheduler
+                .execute(SessionRequest::new(None, "reject".into()))
+                .await,
+            Err(EngineError::ChannelClosed)
+        ));
+        assert_eq!(
+            scheduler
+                .execute(SessionRequest::new(None, "survive".into()))
+                .await?
+                .output,
+            "2:survive"
+        );
+        assert_eq!(
+            observations.lock().unwrap().last().unwrap()[0].destination,
+            DestinationId(2)
+        );
+        assert!(scheduler.requests.is_empty());
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        worker.await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_close_preserves_owner_and_disconnected_owner_unblocks_management(
+    ) -> Result<(), EngineError> {
+        let MockDestination {
+            endpoint: first,
+            mut commands,
+            replies: _replies,
+        } = mock_destination(1, 0);
+        let MockDestination {
+            endpoint: second,
+            commands: other_commands,
+            replies: other_replies,
+        } = mock_destination(2, 0);
+        let cancel = CancellationToken::new();
+        let scheduler = Scheduler::with_routing(
+            cancel.child_token(),
+            LocalForwarder::connect([first, second])?,
+            RoutingConfig::default(),
+            InspectPolicy {
+                observations: Default::default(),
+                selections: AtomicU64::new(0),
+            },
+            vec![],
+        )?;
+        let worker = echo_worker(other_commands, other_replies, 2);
+        let open = scheduler.open_session();
+        tokio::pin!(open);
+        tokio::select! {
+            result = &mut open => panic!("early open: {result:?}"),
+            command = commands.recv() => {
+                let Some(RunnerCommand::OpenSession { reply, .. }) = command else { panic!("open") };
+                reply.send(Ok(())).unwrap();
+            }
+        }
+        let id = open.await?;
+        let close = scheduler.close_session(id);
+        tokio::pin!(close);
+        tokio::select! {
+            result = &mut close => panic!("early close: {result:?}"),
+            command = commands.recv() => {
+                let Some(RunnerCommand::CloseSession { reply, .. }) = command else { panic!("close") };
+                reply.send(Err(EngineError::InvalidInput("busy".into()))).unwrap();
+            }
+        }
+        assert!(matches!(close.await, Err(EngineError::InvalidInput(_))));
+        let close = scheduler.close_session(id);
+        tokio::pin!(close);
+        let held_ack = tokio::select! {
+            result = &mut close => panic!("early close: {result:?}"),
+            command = commands.recv() => command.unwrap(),
+        };
+        drop(commands);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), close)
+                .await
+                .unwrap(),
+            Err(EngineError::ChannelClosed)
+        ));
+        drop(held_ack);
+        assert_eq!(
+            scheduler
+                .execute(SessionRequest::new(None, "alive".into()))
+                .await?
+                .output,
+            "2:alive"
+        );
+        assert!(scheduler
+            .execute(SessionRequest::new(Some(id), "lost owner".into()))
+            .await
+            .is_err());
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        worker.await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_terminal_result_is_drained_on_cancellation() -> Result<(), EngineError> {
+        let cancel = CancellationToken::new();
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (replies, reply_rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(cancel.child_token(), commands, reply_rx);
+        let output = scheduler.execute_stream(SessionRequest::new(None, "queued".into()))?;
+        futures::pin_mut!(output);
+        let Some(RunnerCommand::Execute(batch)) = rx.recv().await else {
+            panic!("execute")
+        };
+        let request_id = batch[0].assigned_request_id();
+        replies
+            .send(RunnerReply::Delta(LLMResponse {
+                request_id,
+                output: "complete".into(),
+            }))
+            .unwrap();
+        replies
+            .send(RunnerReply::Finished {
+                request_id,
+                generated_tokens: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        cancel.cancel();
+        scheduler.task_tracker.wait().await;
+        assert_eq!(output.try_next().await?.unwrap().output, "complete");
+        assert!(output.try_next().await?.is_none());
+        scheduler.wait_stopped().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_sessions_are_retired_on_execute_and_close_errors() -> Result<(), EngineError> {
+        let cancel = CancellationToken::new();
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (replies, reply_rx) = mpsc::unbounded_channel();
+        let executed = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicU64::new(0));
+        let (execute_count, close_count) = (executed.clone(), closed.clone());
+        let worker = tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    RunnerCommand::OpenSession { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    RunnerCommand::Execute(batch) => {
+                        for request in batch {
+                            execute_count.fetch_add(1, Ordering::Relaxed);
+                            let _ = replies.send(RunnerReply::Finished {
+                                request_id: request.assigned_request_id(),
+                                generated_tokens: 0,
+                                result: Err(EngineError::SessionLost(request.session_id.unwrap())),
+                            });
+                        }
+                    }
+                    RunnerCommand::CloseSession { id, reply } => {
+                        close_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(Err(EngineError::SessionLost(id)));
+                    }
+                }
+            }
+        });
+        let scheduler = Scheduler::new(cancel.child_token(), commands, reply_rx);
+        for i in 0..100 {
+            let id = scheduler.open_session().await?;
+            if i % 2 == 0 {
+                assert!(
+                    matches!(scheduler.execute(SessionRequest::new(Some(id), "delta".into())).await,
+                    Err(EngineError::SessionLost(session)) if session == id)
+                );
+            } else {
+                assert!(
+                    matches!(scheduler.close_session(id).await, Err(EngineError::SessionLost(session)) if session == id)
+                );
+            }
+            // Once lost, neither a retry nor close may reach the old endpoint again.
+            assert!(
+                matches!(scheduler.execute(SessionRequest::new(Some(id), "retry".into())).await,
+                Err(EngineError::SessionLost(session)) if session == id)
+            );
+            assert!(
+                matches!(scheduler.close_session(id).await, Err(EngineError::SessionLost(session)) if session == id)
+            );
+        }
+        assert_eq!(executed.load(Ordering::Relaxed), 50);
+        assert_eq!(closed.load(Ordering::Relaxed), 50);
+        assert!(scheduler.requests.is_empty());
+        cancel.cancel();
+        scheduler.wait_stopped().await;
+        worker.await.unwrap();
+        Ok(())
     }
 }
