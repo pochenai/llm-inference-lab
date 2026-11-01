@@ -145,19 +145,218 @@ pub(super) mod ops {
 
     /// Shared projection math; epilogues retain their own activation-dtype rounding.
     /// Callers reshape concrete results to their symbolic tile shape for cuTile 0.4.
-    fn project_tile<T: ElementType, const K: i32, const BM: i32, const BN: i32, const BK: i32>(
+    fn project_tile<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+        const SPLITS: i32,
+    >(
         x: &Tensor<T, { [-1, K] }>,
         w: &Tensor<T, { [-1, K] }>,
         row: i32,
         column: i32,
+        split: i32,
     ) -> Tile<f32, { [BM, BN] }> {
         let px = x.partition(shape![BM, BK]);
         let pw = w.partition(shape![BN, BK]);
         let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
-        for i in 0i32..((K + BK - 1) / BK) {
+        let blocks = (K + BK - 1) / BK;
+        for i in (blocks * split / SPLITS)..(blocks * (split + 1) / SPLITS) {
             acc = mma(px.load([row, i]), pw.load([column, i]).transpose(), acc);
         }
         acc
+    }
+
+    /// Project one output tile with the ordinary MMA/bias math and a masked scatter.
+    unsafe fn project_decode_tile<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+    >(
+        out: *mut T,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        bias: &Tensor<T, { [-1] }>,
+        row: i32,
+        column: i32,
+    ) {
+        let acc = project_tile::<T, K, BM, BN, BK, 1>(x, w, row, column, 0).reshape(shape![BM, BN]);
+        let bias: Tile<f32, { [BN] }> = convert_tile(bias.partition(shape![BN]).load([column]));
+        let result: Tile<T, { [BM, BN] }> =
+            convert_tile(acc + bias.reshape(shape![1, BN]).broadcast(shape![BM, BN]));
+        let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
+        let rows = rows + (row * BM).broadcast(shape![BM]);
+        let columns: Tile<i32, { [BN] }> = iota(shape![BN]);
+        let columns = columns + (column * BN).broadcast(shape![BN]);
+        let offsets = (rows * w.shape()[0].broadcast(shape![BM]))
+            .reshape(shape![BM, 1])
+            .broadcast(shape![BM, BN])
+            + columns.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
+        let mask = lt_tile(rows, x.shape()[0].broadcast(shape![BM]))
+            .reshape(shape![BM, 1])
+            .broadcast(shape![BM, BN])
+            & lt_tile(columns, w.shape()[0].broadcast(shape![BN]))
+                .reshape(shape![1, BN])
+                .broadcast(shape![BM, BN]);
+        let base = pointer_to_tile(out);
+        let base = base.reshape(shape![1, 1]);
+        let base = base.broadcast(shape![BM, BN]);
+        let dst = base.offset_tile(offsets);
+        store_ptr_tko(
+            dst,
+            result,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(mask),
+            None,
+            Latency::<1>,
+        );
+    }
+
+    /// One skinny QKV launch schedules all output tiles together without concatenating weights.
+    /// Qwen decode: 28 Q + 4 K + 4 V CTAs share one grid, instead of three underfilled grids.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn qkv_decode<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+    >(
+        q: *mut T,
+        k: *mut T,
+        v: *mut T,
+        x: &Tensor<T, { [-1, K] }>,
+        wq: &Tensor<T, { [-1, K] }>,
+        wk: &Tensor<T, { [-1, K] }>,
+        wv: &Tensor<T, { [-1, K] }>,
+        bq: &Tensor<T, { [-1] }>,
+        bk: &Tensor<T, { [-1] }>,
+        bv: &Tensor<T, { [-1] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let q_blocks = (wq.shape()[0] + BN - 1) / BN;
+        let k_blocks = (wk.shape()[0] + BN - 1) / BN;
+        // Keep branch-local indices bounded independently of the combined launch grid.
+        if pid.1 < q_blocks {
+            project_decode_tile::<T, K, BM, BN, BK>(q, x, wq, bq, pid.0, pid.1 % q_blocks);
+        } else if pid.1 < q_blocks + k_blocks {
+            project_decode_tile::<T, K, BM, BN, BK>(
+                k,
+                x,
+                wk,
+                bk,
+                pid.0,
+                (pid.1 - q_blocks) % k_blocks,
+            );
+        } else {
+            project_decode_tile::<T, K, BM, BN, BK>(
+                v,
+                x,
+                wv,
+                bv,
+                pid.0,
+                (pid.1 - q_blocks - k_blocks) % ((wv.shape()[0] + BN - 1) / BN),
+            );
+        }
+    }
+
+    /// Split a skinny projection's K reduction across CTAs; share the ordinary MMA tile.
+    /// ```text
+    /// grid = [ceil(M/BM), ceil(N/BN), SPLITS]
+    /// partials[split, row, column] = X[row, K_split] * W[column, K_split]^T
+    /// ```
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn linear_split_k<
+        T: ElementType,
+        const K: i32,
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+        const SPLITS: i32,
+    >(
+        partials: *mut f32,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let acc = project_tile::<T, K, BM, BN, BK, SPLITS>(x, w, pid.0, pid.1, pid.2)
+            .reshape(shape![BM, BN]);
+        let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
+        let rows = rows + (pid.0 * BM).broadcast(shape![BM]);
+        let columns: Tile<i32, { [BN] }> = iota(shape![BN]);
+        let columns = columns + (pid.1 * BN).broadcast(shape![BN]);
+        let offsets = ((pid.2 * x.shape()[0]).broadcast(shape![BM]) + rows)
+            * w.shape()[0].broadcast(shape![BM]);
+        let offsets = offsets.reshape(shape![BM, 1]).broadcast(shape![BM, BN])
+            + columns.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
+        let valid = lt_tile(rows, x.shape()[0].broadcast(shape![BM]))
+            .reshape(shape![BM, 1])
+            .broadcast(shape![BM, BN])
+            & lt_tile(columns, w.shape()[0].broadcast(shape![BN]))
+                .reshape(shape![1, BN])
+                .broadcast(shape![BM, BN]);
+        let base = pointer_to_tile(partials);
+        let base = base.reshape(shape![1, 1]);
+        let base = base.broadcast(shape![BM, BN]);
+        let dst = base.offset_tile(offsets);
+        store_ptr_tko(
+            dst,
+            acc,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(valid),
+            None,
+            Latency::<1>,
+        );
+    }
+
+    /// Sum FP32 projection partials, then cast once; no intermediate BF16 rounding.
+    #[cutile::entry()]
+    pub(super) unsafe fn linear_merge_split_k<T: ElementType, const SPLITS: i32, const BN: i32>(
+        out: &mut Tensor<T, { [1, BN] }>,
+        partials: &Tensor<f32, { [-1, -1] }>,
+        rows: i32,
+        columns: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let split_ids: Tile<i32, { [SPLITS] }> = iota(shape![SPLITS]);
+        let channels: Tile<i32, { [BN] }> = iota(shape![BN]);
+        let channels = channels + (pid.1 * BN).broadcast(shape![BN]);
+        let offsets = (split_ids * rows.broadcast(shape![SPLITS])
+            + pid.0.broadcast(shape![SPLITS]))
+            * columns.broadcast(shape![SPLITS]);
+        let offsets = offsets
+            .reshape(shape![SPLITS, 1])
+            .broadcast(shape![SPLITS, BN])
+            + channels
+                .reshape(shape![1, BN])
+                .broadcast(shape![SPLITS, BN]);
+        let mask = lt_tile(channels, columns.broadcast(shape![BN]))
+            .reshape(shape![1, BN])
+            .broadcast(shape![SPLITS, BN]);
+        let base = pointer_to_tile(partials.as_ptr());
+        let base = base.reshape(shape![1, 1]);
+        let base = base.broadcast(shape![SPLITS, BN]);
+        let src = base.offset_tile(offsets);
+        let (values, _token): (Tile<f32, { [SPLITS, BN] }>, Token) = load_ptr_tko(
+            src,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(mask),
+            None::<f32>,
+            None,
+            Latency::<1>,
+        );
+        let zero: Tile<f32, { [SPLITS, BN] }> = constant(0.0f32, shape![SPLITS, BN]);
+        let values = select(mask, values, zero);
+        let result: Tile<f32, { [BN] }> = reduce_sum(values, 0);
+        let result: Tile<T, { [1, BN] }> = convert_tile(result.reshape(shape![1, BN]));
+        out.store(result);
     }
 
     /// Storage uses T; MMA accumulates in FP32 and casts once to output O.
@@ -181,7 +380,7 @@ pub(super) mod ops {
     ) {
         let pid = get_tile_block_id();
         let mut acc: Tile<f32, { [BM, BN] }> =
-            project_tile::<T, K, BM, BN, BK>(x, w, pid.0, pid.1).reshape(shape![BM, BN]);
+            project_tile::<T, K, BM, BN, BK, 1>(x, w, pid.0, pid.1, 0).reshape(shape![BM, BN]);
         if HAS_BIAS {
             let bias_tile: Tile<f32, { [BN] }> =
                 convert_tile(bias.partition(shape![BN]).load([pid.1]));
@@ -208,7 +407,7 @@ pub(super) mod ops {
     ) {
         let pid = get_tile_block_id();
         let acc: Tile<f32, { [BM, BN] }> =
-            project_tile::<T, K, BM, BN, BK>(x, w, pid.0, pid.1).reshape(shape![BM, BN]);
+            project_tile::<T, K, BM, BN, BK, 1>(x, w, pid.0, pid.1, 0).reshape(shape![BM, BN]);
         let up: Tile<T, { [BM, BN] }> = convert_tile(acc);
         let up: Tile<f32, { [BM, BN] }> = convert_tile(up);
         let g: Tile<f32, { [BM, BN] }> =
@@ -248,7 +447,7 @@ pub(super) mod ops {
         for index in out.iter_indices() {
             let (row, column) = index.components();
             let mut acc: Tile<f32, { [BM, BN] }> =
-                project_tile::<T, K, BM, BN, BK>(x, w, row, column).reshape(shape![BM, BN]);
+                project_tile::<T, K, BM, BN, BK, 1>(x, w, row, column, 0).reshape(shape![BM, BN]);
             if HAS_BIAS {
                 let bias_tile: Tile<f32, { [BN] }> =
                     convert_tile(bias.partition(shape![BN]).load([column]));
@@ -715,6 +914,320 @@ pub(super) mod ops {
         out.store(result);
     }
 
+    /// Shared prefill/decode tile: QK MMA, online exp2 softmax, then probability/V MMA.
+    /// Returns unnormalized FP32 values, base-two maxima and denominators for split merging.
+    unsafe fn attention_tile<T: ElementType, const BQ: i32, const BK: i32>(
+        query: Tile<T, { [BQ, HEAD_DIM] }>,
+        query_positions: Tile<i32, { [BQ] }>,
+        valid_q: Tile<bool, { [BQ] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        context_row: i32,
+        kv_head: i32,
+        kvheads: i32,
+        history_start: i32,
+        visible_end: i32,
+        first_block: i32,
+        end_block: i32,
+        unmasked_blocks: i32,
+    ) -> (
+        Tile<f32, { [BQ, HEAD_DIM] }>,
+        Tile<f32, { [BQ, 1] }>,
+        Tile<f32, { [BQ, 1] }>,
+    ) {
+        let head_columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
+        let mut maximum: Tile<f32, { [BQ, 1] }> = constant(f32::NEG_INFINITY, shape![BQ, 1]);
+        let mut denominator: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
+        let mut acc: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
+        let zero_scores: Tile<f32, { [BQ, BK] }> = constant(0.0f32, shape![BQ, BK]);
+        let negative: Tile<f32, { [BQ, BK] }> = constant(f32::NEG_INFINITY, shape![BQ, BK]);
+        let zero_kv_f32: Tile<f32, { [BK, HEAD_DIM] }> = constant(0.0f32, shape![BK, HEAD_DIM]);
+        let zero_kv: Tile<T, { [BK, HEAD_DIM] }> = convert_tile(zero_kv_f32);
+        let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
+        let valid_rows = valid_q.reshape(shape![BQ, 1]);
+        let valid_scores = valid_rows.broadcast(shape![BQ, BK]);
+        let head_dim: f32 = convert_scalar(HEAD_DIM);
+        // exp(x) = exp2(x * log2(e)); fold the conversion into the score scale.
+        // ~2% prefill e2e improvement; ~8-9% attention-kernel estimate.
+        let scale: Tile<f32, { [BQ, BK] }> =
+            rsqrt(head_dim.broadcast(shape![BQ, BK]), ftz::Disabled)
+                * constant(LOG2_E, shape![BQ, BK]);
+        let causal_q = (query_positions + 1i32.broadcast(shape![BQ]))
+            .reshape(shape![BQ, 1])
+            .broadcast(shape![BQ, BK]);
+        let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
+        let table_base = pointer_to_tile(table.as_ptr());
+        let table_base = table_base.offset(context_row * table.shape()[1]);
+        let table_base = table_base.reshape(shape![1]);
+        let table_base = table_base.broadcast(shape![BK]);
+        let k_base = pointer_to_tile(k.as_ptr());
+        let k_base = k_base.reshape(shape![1, 1]);
+        let k_base = k_base.broadcast(shape![BK, HEAD_DIM]);
+        let v_base = pointer_to_tile(v.as_ptr());
+        let v_base = v_base.reshape(shape![1, 1]);
+        let v_base = v_base.broadcast(shape![BK, HEAD_DIM]);
+        let kv_slot_stride = (kvheads * HEAD_DIM).broadcast(shape![BK]);
+        let kv_head_offset = (kv_head * HEAD_DIM).broadcast(shape![BK]);
+        let kv_columns = head_columns
+            .reshape(shape![1, HEAD_DIM])
+            .broadcast(shape![BK, HEAD_DIM]);
+        let visible_keys = visible_end.broadcast(shape![BK]);
+        // Reuse each key/value block across packed query rows; never materialize
+        // the full attention score matrix.
+        for block in first_block..end_block {
+            let key_positions = key_indices + (history_start + block * BK).broadcast(shape![BK]);
+            let valid_k = lt_tile(key_positions, visible_keys);
+            let table_ptrs = table_base.offset_tile(key_positions);
+            let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
+                table_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid_k),
+                Some(0i32),
+                None,
+                Latency::<1>,
+            );
+            // Resolve logical key positions to physical cache coordinates.
+            // ```text
+            // slots      = table[context_row, key_positions]
+            // kv_offsets = (slots * kvheads + kv_head) * HEAD_DIM + head_columns
+            // ```
+            let kv_offsets = slots * kv_slot_stride + kv_head_offset;
+            let kv_offsets = kv_offsets
+                .reshape(shape![BK, 1])
+                .broadcast(shape![BK, HEAD_DIM])
+                + kv_columns;
+            let k_ptrs = k_base.offset_tile(kv_offsets);
+            let v_ptrs = v_base.offset_tile(kv_offsets);
+            let kv_mask = valid_k
+                .reshape(shape![BK, 1])
+                .broadcast(shape![BK, HEAD_DIM]);
+            let (keys, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
+                k_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(kv_mask),
+                None::<T>,
+                None,
+                Latency::<1>,
+            );
+            let keys = select(kv_mask, keys, zero_kv);
+            // Make V available before QK/softmax to expose memory/compute overlap.
+            let (values, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
+                v_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(kv_mask),
+                None::<T>,
+                None,
+                Latency::<1>,
+            );
+            let values = select(kv_mask, values, zero_kv);
+            // Block dot products.
+            // ```text
+            // scores = query * keys^T
+            // ```
+            let scores: Tile<f32, { [BQ, BK] }> = mma(query, keys.transpose(), zero_scores);
+            // Earlier full blocks only need the padded-query guard; diagonal
+            // blocks retain row-specific causal masking. Pointer guards stay intact.
+            // ```text
+            // block < unmasked_blocks: every key_position <= first_query_position
+            // otherwise: scores = where(causal, scores * scale, -infinity)
+            // ```
+            // ~1% prefill e2e ( ~4-5% kernel only) improvement
+            let scores = if block < unmasked_blocks {
+                select(valid_scores, scores * scale, negative)
+            } else {
+                let causal = lt_tile(
+                    key_positions
+                        .reshape(shape![1, BK])
+                        .broadcast(shape![BQ, BK]),
+                    causal_q,
+                ) & valid_scores;
+                select(causal, scores * scale, negative)
+            };
+            // Update the running row maximum.
+            // ```text
+            // block_max    = rowmax(scores)
+            // next_maximum = max(maximum, block_max)
+            // ```
+            let block_max: Tile<f32, { [BQ] }> = reduce_max(scores, 1);
+            let next_maximum = max_tile(maximum, block_max.reshape(shape![BQ, 1]));
+            // Padded query rows must not introduce -inf - -inf into the MMA operands.
+            let next_maximum = select(valid_rows, next_maximum, zero_rows);
+            // Rebase earlier blocks and form unnormalized weights for this block.
+            // ```text
+            // alpha         = exp2(maximum - next_maximum)
+            // block_weights = exp2(scores - next_maximum)
+            // ```
+            let alpha = exp2(maximum - next_maximum, ftz::Enabled);
+            let block_weights = exp2(
+                scores - next_maximum.broadcast(shape![BQ, BK]),
+                ftz::Enabled,
+            );
+            let block_sum: Tile<f32, { [BQ] }> = reduce_sum(block_weights, 1);
+            // Accumulate the FP32 normalizer.
+            // ```text
+            // block_sum   = rowsum(block_weights)
+            // denominator = alpha * denominator + block_sum
+            // ```
+            denominator = fma(
+                denominator,
+                alpha,
+                block_sum.reshape(shape![BQ, 1]),
+                rounding::NearestEven,
+                ftz::Disabled,
+            );
+            let mma_weights: Tile<T, { [BQ, BK] }> = convert_tile(block_weights);
+            // Accumulate the weighted values using MMA.
+            // ```text
+            // mma_weights = cast_T(block_weights)
+            // acc         = alpha * acc + mma_weights * values
+            // maximum     = next_maximum
+            // ```
+            acc = mma(
+                mma_weights,
+                values,
+                acc * alpha.broadcast(shape![BQ, HEAD_DIM]),
+            );
+            maximum = next_maximum;
+        }
+        (acc, maximum, denominator)
+    }
+
+    /// Pack Q heads sharing one KV head; reuse the prefill MMA/softmax tile for each split.
+    /// ```text
+    /// grid = [packed query row, KV head, split]
+    /// Q [GROUP, HEAD_DIM] * K^T [HEAD_DIM, BK] -> scores [GROUP, BK]
+    /// probabilities [GROUP, BK] * V [BK, HEAD_DIM] -> partial values [GROUP, HEAD_DIM]
+    /// ```
+    /// Padded Q rows never access output storage. Packets retain the scalar path's
+    /// natural-log maximum so both paths share the same stable split merge.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn attention_decode_mma<
+        T: ElementType,
+        const BQ: i32,
+        const BK: i32,
+        const GROUP: i32,
+        const SPLITS: i32,
+        const PARTIAL_WIDTH: i32,
+    >(
+        partials: *mut f32,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        metadata: &Tensor<i32, { [-1] }>,
+        qheads: i32,
+        kvheads: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let query_row = pid.0;
+        let kv_head = pid.1;
+        let split = pid.2;
+        let row = metadata
+            .partition(shape![1])
+            .load([query_row * TOKEN_METADATA_WIDTH]);
+        let context_row: i32 = tile_to_scalar(row.reshape(shape![]));
+        let position = metadata
+            .partition(shape![1])
+            .load([query_row * TOKEN_METADATA_WIDTH + 1]);
+        let position: i32 = tile_to_scalar(position.reshape(shape![]));
+        let start = metadata
+            .partition(shape![1])
+            .load([query_row * TOKEN_METADATA_WIDTH + 2]);
+        let history_start: i32 = tile_to_scalar(start.reshape(shape![]));
+        let heads: Tile<i32, { [BQ] }> = iota(shape![BQ]);
+        let valid_q = lt_tile(heads, GROUP.broadcast(shape![BQ]));
+        let query_heads = heads + (kv_head * GROUP).broadcast(shape![BQ]);
+        let columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
+        let q_offsets = ((query_row * q.shape()[1]).broadcast(shape![BQ])
+            + query_heads * HEAD_DIM.broadcast(shape![BQ]))
+        .reshape(shape![BQ, 1])
+        .broadcast(shape![BQ, HEAD_DIM])
+            + columns
+                .reshape(shape![1, HEAD_DIM])
+                .broadcast(shape![BQ, HEAD_DIM]);
+        let q_base = pointer_to_tile(q.as_ptr());
+        let q_base = q_base.reshape(shape![1, 1]);
+        let q_base = q_base.broadcast(shape![BQ, HEAD_DIM]);
+        let q_mask = valid_q
+            .reshape(shape![BQ, 1])
+            .broadcast(shape![BQ, HEAD_DIM]);
+        let q_ptrs = q_base.offset_tile(q_offsets);
+        let (query, _token): (Tile<T, { [BQ, HEAD_DIM] }>, Token) = load_ptr_tko(
+            q_ptrs,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(q_mask),
+            None::<T>,
+            None,
+            Latency::<1>,
+        );
+        let zero: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
+        let zero: Tile<T, { [BQ, HEAD_DIM] }> = convert_tile(zero);
+        let query = select(q_mask, query, zero);
+        let positions = position.broadcast(shape![BQ]);
+        let total_blocks = (position - history_start + BK) / BK;
+        let (acc, maximum, denominator) = attention_tile::<T, BQ, BK>(
+            query,
+            positions,
+            valid_q,
+            k,
+            v,
+            table,
+            context_row,
+            kv_head,
+            kvheads,
+            history_start,
+            position + 1,
+            total_blocks * split / SPLITS,
+            total_blocks * (split + 1) / SPLITS,
+            (position - history_start + 1) / BK,
+        );
+        let acc = acc.reshape(shape![BQ, HEAD_DIM]);
+        let maximum = maximum.reshape(shape![BQ, 1]);
+        let denominator = denominator.reshape(shape![BQ, 1]);
+        let log2_e: Tile<f32, { [BQ, 1] }> = constant(LOG2_E, shape![BQ, 1]);
+        let maximum = true_div(maximum, log2_e);
+        let columns: Tile<i32, { [128] }> = iota(shape![128]);
+        let stat_columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
+        let stat_columns = stat_columns
+            .reshape(shape![1, HEAD_DIM])
+            .broadcast(shape![BQ, HEAD_DIM]);
+        let zero_columns: Tile<i32, { [BQ, HEAD_DIM] }> = constant(0i32, shape![BQ, HEAD_DIM]);
+        let stats = select(
+            eq_tile(stat_columns, zero_columns),
+            maximum.broadcast(shape![BQ, HEAD_DIM]),
+            denominator.broadcast(shape![BQ, HEAD_DIM]),
+        );
+        let packet: Tile<f32, { [BQ, 128] }> = cat(acc, stats, 1);
+        let offsets = (((query_row * qheads).broadcast(shape![BQ]) + query_heads)
+            * SPLITS.broadcast(shape![BQ])
+            + split.broadcast(shape![BQ]))
+            * PARTIAL_WIDTH.broadcast(shape![BQ]);
+        let offsets = offsets.reshape(shape![BQ, 1]).broadcast(shape![BQ, 128])
+            + columns.reshape(shape![1, 128]).broadcast(shape![BQ, 128]);
+        let mask = valid_q.reshape(shape![BQ, 1]).broadcast(shape![BQ, 128])
+            & lt_tile(columns, PARTIAL_WIDTH.broadcast(shape![128]))
+                .reshape(shape![1, 128])
+                .broadcast(shape![BQ, 128]);
+        let base = pointer_to_tile(partials);
+        let base = base.reshape(shape![1, 1]);
+        let base = base.broadcast(shape![BQ, 128]);
+        let out_ptrs = base.offset_tile(offsets);
+        store_ptr_tko(
+            out_ptrs,
+            packet,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            Some(mask),
+            None,
+            Latency::<1>,
+        );
+    }
+
     /// Causal prefill attention for one context, over the visible key/value history.
     /// https://developer.nvidia.com/blog/tuning-flash-attention-for-peak-performance-in-nvidia-cuda-tile/
     /// ```text
@@ -850,25 +1363,6 @@ pub(super) mod ops {
             Latency::<1>,
         );
         let query = select(q_mask, query, zero_q);
-        let mut maximum: Tile<f32, { [BQ, 1] }> = constant(f32::NEG_INFINITY, shape![BQ, 1]);
-        let mut denominator: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
-        let mut acc: Tile<f32, { [BQ, HEAD_DIM] }> = constant(0.0f32, shape![BQ, HEAD_DIM]);
-        let zero_scores: Tile<f32, { [BQ, BK] }> = constant(0.0f32, shape![BQ, BK]);
-        let negative: Tile<f32, { [BQ, BK] }> = constant(f32::NEG_INFINITY, shape![BQ, BK]);
-        let zero_kv_f32: Tile<f32, { [BK, HEAD_DIM] }> = constant(0.0f32, shape![BK, HEAD_DIM]);
-        let zero_kv: Tile<T, { [BK, HEAD_DIM] }> = convert_tile(zero_kv_f32);
-        let zero_rows: Tile<f32, { [BQ, 1] }> = constant(0.0f32, shape![BQ, 1]);
-        let valid_rows = valid_q.reshape(shape![BQ, 1]);
-        let valid_scores = valid_rows.broadcast(shape![BQ, BK]);
-        let head_dim: f32 = convert_scalar(HEAD_DIM);
-        // exp(x) = exp2(x * log2(e)); fold the conversion into the score scale.
-        // ~2% prefill e2e improvement; ~8-9% attention-kernel estimate.
-        let scale: Tile<f32, { [BQ, BK] }> =
-            rsqrt(head_dim.broadcast(shape![BQ, BK]), ftz::Disabled)
-                * constant(LOG2_E, shape![BQ, BK]);
-        let causal_q = (query_positions + 1i32.broadcast(shape![BQ]))
-            .reshape(shape![BQ, 1])
-            .broadcast(shape![BQ, BK]);
         let kv_head = (pid.1 * GROUP) / (qheads / kvheads);
         let end = ((query_tile + 1) * BQ + GROUP - 1) / GROUP;
         let end = if end < query_count { end } else { query_count };
@@ -891,143 +1385,24 @@ pub(super) mod ops {
         // ```
         let first_query_position = absolute_start + query_tile * BQ / GROUP;
         let unmasked_blocks = (first_query_position - history_start + 1) / BK;
-        let key_indices: Tile<i32, { [BK] }> = iota(shape![BK]);
-        let table_base = pointer_to_tile(table.as_ptr());
-        let table_base = table_base.offset(context_row * table.shape()[1]);
-        let table_base = table_base.reshape(shape![1]);
-        let table_base = table_base.broadcast(shape![BK]);
-        let k_base = pointer_to_tile(k.as_ptr());
-        let k_base = k_base.reshape(shape![1, 1]);
-        let k_base = k_base.broadcast(shape![BK, HEAD_DIM]);
-        let v_base = pointer_to_tile(v.as_ptr());
-        let v_base = v_base.reshape(shape![1, 1]);
-        let v_base = v_base.broadcast(shape![BK, HEAD_DIM]);
-        let kv_slot_stride = (kvheads * HEAD_DIM).broadcast(shape![BK]);
-        let kv_head_offset = (kv_head * HEAD_DIM).broadcast(shape![BK]);
-        let kv_columns = head_columns
-            .reshape(shape![1, HEAD_DIM])
-            .broadcast(shape![BK, HEAD_DIM]);
-        let visible_keys = visible_end.broadcast(shape![BK]);
-        // Reuse each key/value block across packed query rows; never materialize
-        // the full attention score matrix.
-        for block in 0i32..((visible_end - history_start + BK - 1) / BK) {
-            let key_positions = key_indices + (history_start + block * BK).broadcast(shape![BK]);
-            let valid_k = lt_tile(key_positions, visible_keys);
-            let table_ptrs = table_base.offset_tile(key_positions);
-            let (slots, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
-                table_ptrs,
-                ordering::Weak,
-                None::<scope::TileBlock>,
-                Some(valid_k),
-                Some(0i32),
-                None,
-                Latency::<1>,
-            );
-            // Resolve logical key positions to physical cache coordinates.
-            // ```text
-            // slots      = table[context_row, key_positions]
-            // kv_offsets = (slots * kvheads + kv_head) * HEAD_DIM + head_columns
-            // ```
-            let kv_offsets = slots * kv_slot_stride + kv_head_offset;
-            let kv_offsets = kv_offsets
-                .reshape(shape![BK, 1])
-                .broadcast(shape![BK, HEAD_DIM])
-                + kv_columns;
-            let k_ptrs = k_base.offset_tile(kv_offsets);
-            let v_ptrs = v_base.offset_tile(kv_offsets);
-            let kv_mask = valid_k
-                .reshape(shape![BK, 1])
-                .broadcast(shape![BK, HEAD_DIM]);
-            let (keys, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
-                k_ptrs,
-                ordering::Weak,
-                None::<scope::TileBlock>,
-                Some(kv_mask),
-                None::<T>,
-                None,
-                Latency::<1>,
-            );
-            let keys = select(kv_mask, keys, zero_kv);
-            // Make V available before QK/softmax to expose memory/compute overlap.
-            let (values, _token): (Tile<T, { [BK, HEAD_DIM] }>, Token) = load_ptr_tko(
-                v_ptrs,
-                ordering::Weak,
-                None::<scope::TileBlock>,
-                Some(kv_mask),
-                None::<T>,
-                None,
-                Latency::<1>,
-            );
-            let values = select(kv_mask, values, zero_kv);
-            // Block dot products.
-            // ```text
-            // scores = query * keys^T
-            // ```
-            let scores: Tile<f32, { [BQ, BK] }> = mma(query, keys.transpose(), zero_scores);
-            // Earlier full blocks only need the padded-query guard; diagonal
-            // blocks retain row-specific causal masking. Pointer guards stay intact.
-            // ```text
-            // block < unmasked_blocks: every key_position <= first_query_position
-            // otherwise: scores = where(causal, scores * scale, -infinity)
-            // ```
-            // ~1% prefill e2e ( ~4-5% kernel only) improvement
-            let scores = if block < unmasked_blocks {
-                select(valid_scores, scores * scale, negative)
-            } else {
-                let causal = lt_tile(
-                    key_positions
-                        .reshape(shape![1, BK])
-                        .broadcast(shape![BQ, BK]),
-                    causal_q,
-                ) & valid_scores;
-                select(causal, scores * scale, negative)
-            };
-            // Update the running row maximum.
-            // ```text
-            // block_max    = rowmax(scores)
-            // next_maximum = max(maximum, block_max)
-            // ```
-            let block_max: Tile<f32, { [BQ] }> = reduce_max(scores, 1);
-            let next_maximum = max_tile(maximum, block_max.reshape(shape![BQ, 1]));
-            // Padded query rows must not introduce -inf - -inf into the MMA operands.
-            let next_maximum = select(valid_rows, next_maximum, zero_rows);
-            // Rebase earlier blocks and form unnormalized weights for this block.
-            // ```text
-            // alpha         = exp2(maximum - next_maximum)
-            // block_weights = exp2(scores - next_maximum)
-            // ```
-            let alpha = exp2(maximum - next_maximum, ftz::Enabled);
-            let block_weights = exp2(
-                scores - next_maximum.broadcast(shape![BQ, BK]),
-                ftz::Enabled,
-            );
-            let block_sum: Tile<f32, { [BQ] }> = reduce_sum(block_weights, 1);
-            // Accumulate the FP32 normalizer.
-            // ```text
-            // block_sum   = rowsum(block_weights)
-            // denominator = alpha * denominator + block_sum
-            // ```
-            denominator = fma(
-                denominator,
-                alpha,
-                block_sum.reshape(shape![BQ, 1]),
-                rounding::NearestEven,
-                ftz::Disabled,
-            );
-            let mma_weights: Tile<T, { [BQ, BK] }> = convert_tile(block_weights);
-            // Accumulate the weighted values using MMA.
-            // ```text
-            // mma_weights = cast_T(block_weights)
-            // acc         = alpha * acc + mma_weights * values
-            // maximum     = next_maximum
-            // ```
-            acc = mma(
-                mma_weights,
-                values,
-                acc * alpha.broadcast(shape![BQ, HEAD_DIM]),
-            );
-            maximum = next_maximum;
-        }
+        let (acc, _maximum, denominator) = attention_tile::<T, BQ, BK>(
+            query,
+            query_positions,
+            valid_q,
+            k,
+            v,
+            table,
+            context_row,
+            kv_head,
+            kvheads,
+            history_start,
+            visible_end,
+            0,
+            (visible_end - history_start + BK - 1) / BK,
+            unmasked_blocks,
+        );
+        let acc = acc.reshape(shape![BQ, HEAD_DIM]);
+        let denominator = denominator.reshape(shape![BQ, 1]);
         // Normalize once after all key blocks.
         // ```text
         // result = cast_T(acc / denominator)

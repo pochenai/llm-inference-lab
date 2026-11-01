@@ -685,14 +685,16 @@ establish serving throughput or cross-engine generated-ID equivalence.
 ### Prefill attention routing and operator profiling
 
 BF16 suffixes with at least 64 queries per context use multi-query MMA attention;
-small/mixed suffixes and FP32 retain scalar attention; one-token/request decode
-uses adaptive split-KV for sufficiently long histories. The tiled path shares
+small/mixed suffixes and FP32 retain scalar attention. Pure one-token/request
+BF16 decode with supported GQA groups reuses the prefill MMA/online-softmax tile
+for sufficiently long histories, with bounded split-KV and the shared FP32 merge.
+Short histories keep scalar attention. The tiled path shares
 K/V across queries, preserves token-slot indirection and cached/ragged causal offsets,
 and keeps online softmax/accumulation in FP32. No extra global score buffer is used.
 The initial 4K comparison improves prefill about 5.9x at B1/2/4 while leaving linear
 tiles unchanged; see the local [eager tuning report](../profiling/qwen2/bf16-eager-tuning/RESULTS.md).
 
-NVTX ranges name embedding, metadata, projection roles (`qwen2.linear.q/k/v/o/gate/up/down/lm_head`),
+NVTX ranges name embedding, metadata, projection roles (`qwen2.linear.q/k/v/qkv/o/gate/up/down/lm_head`),
 RMSNorm, RoPE, KV store, scalar/tiled attention, residual add, SwiGLU and argmax.
 They are thread-local synchronous submission scopes, never GPU timers or ranges
 across await. Use launch correlation / projected GPU intervals for attribution.
@@ -704,7 +706,10 @@ nsys --capture-range=cudaProfilerApi --capture-range-end=stop. Prewarm the same 
 
 Large BF16 linear matrices use a finite `LinearTile` bucket (at least 128 packed
 rows: 32x128, K-reduction 64). Smaller shapes and FP32 retain prior tiles, including
-decode/LM-head matrices. Linear rows are independent and may cross request boundaries;
+decode/LM-head matrices. Small BF16 forwards schedule Q/K/V in one launch without
+concatenating weights or allocating new outputs. Skinny decode down projections
+use bounded split-K and reuse the attention partial buffer in stream order.
+Linear rows are independent and may cross request boundaries;
 attention routing still checks each context separately. Masked K tails use ceiling
 iteration. This isolated blocking change reduces 4K prefill by about another 32-33%
 after attention MMA; the [tuning report](../profiling/qwen2/bf16-eager-tuning/RESULTS.md)

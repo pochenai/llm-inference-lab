@@ -48,7 +48,7 @@ use super::{
     graph::{DecodeCache, DecodeGraph, DecodeGraphCache, DecodeGraphKey},
     kernels,
     metrics::{Instruments, WorkspaceMetrics},
-    workspace::{Buffers, WorkspacePool, MAX_KV_SPLITS},
+    workspace::{Buffers, WorkspacePool, KV_PARTIAL_WIDTH, MAX_DECODE_SPLITS},
 };
 use crate::runner::{
     kv_pool::{KVContext, NaiveKVPool, NaiveKVPoolConfig, NaiveReadView},
@@ -84,11 +84,13 @@ const MIN_SWIZZLED_TOKEN_ROWS: usize = 8192;
 /// https://developer.nvidia.com/blog/accelerating-mamba-2-with-high-performance-forward-pass-kernels-in-nvidia-cuda-tile/
 /// 4K B2/B4: ~1.8% / 1.1% incremental prefill e2e gain; ~3.2% / 3.0% FFN GPU-time gain.
 const MIN_FUSED_FFN_TOKEN_ROWS: usize = 8192;
-// Keep narrow/decode work on the scalar path; tiled prefill reuses K/V across queries.
+// Prefill and decode share MMA math, with independent tile choices and dispatch thresholds.
 const ATTENTION_PREFILL_TILE: [usize; 2] = [32, 64];
+const ATTENTION_DECODE_MMA_TILE: [usize; 2] = [16, 64];
 const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
+const LINEAR_MERGE_COLUMNS: usize = 128;
 
 /// Finite M/N buckets retain parallelism for skinny, small and FP32 matrices.
 #[derive(Clone, Copy, Debug)]
@@ -132,6 +134,18 @@ impl LinearTile {
                 group_rows: 1,
             }
         }
+    }
+    /// Bound K partitions by work per CTA and available SM parallelism.
+    fn decode_splits(&self, rows: usize, columns: usize, k: usize, sm_count: usize) -> usize {
+        const MIN_BLOCKS_PER_SPLIT: usize = 4;
+        const TARGET_CTAS_PER_SM: usize = 4;
+        let limit = (k.div_ceil(self.reduction) / MIN_BLOCKS_PER_SPLIT).clamp(1, MAX_DECODE_SPLITS);
+        let by_length = 1usize << limit.ilog2();
+        let blocks = rows.div_ceil(self.rows) * columns.div_ceil(self.columns);
+        let by_parallelism = (sm_count * TARGET_CTAS_PER_SM)
+            .div_ceil(blocks)
+            .next_power_of_two();
+        by_length.min(by_parallelism)
     }
 }
 
@@ -435,7 +449,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         let count = batch.len();
         let splits = self
             .attention
-            .decode_splits(count, batch.iter().map(|i| i.sequence_len()).max().unwrap());
+            .decode_splits::<T>(count, batch.iter().map(|i| i.sequence_len()).max().unwrap());
         let key = DecodeGraphKey {
             table: Arc::as_ptr(&table) as usize,
             batch: count,
@@ -631,36 +645,16 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 )),
             )?;
             if splits > 1 {
-                let partials = scratch.decode_partials.as_mut().unwrap();
-                recorder.record(
-                    kernels::attention_split_kv(
-                        partials.partition_prefix([1, 128]),
-                        &scratch.rotated_q,
-                        k.clone(),
-                        v.clone(),
-                        cache.table.clone(),
-                        metadata,
-                        self.attention.q_heads as i32,
-                        self.attention.kv_heads as i32,
-                    )
-                    .generics(vec![
-                        T::DTYPE.to_string(),
-                        KV_TOKENS_PER_TILE.to_string(),
-                        splits.to_string(),
-                    ])
-                    .grid((
-                        (scratch.x.shape()[0] as usize * self.attention.q_heads * splits) as u32,
-                        1,
-                        1,
-                    )),
-                )?;
-                recorder.record(
-                    kernels::attention_merge_splits(
-                        (&mut scratch.attention).partition([1, 64]),
-                        &*partials,
-                        self.attention.q_heads as i32,
-                    )
-                    .generics(vec![T::DTYPE.to_string(), splits.to_string()]),
+                self.attention.record_split_decode(
+                    &mut scratch.attention,
+                    &scratch.rotated_q,
+                    k.clone(),
+                    v.clone(),
+                    cache.table.clone(),
+                    metadata,
+                    scratch.decode_partials.as_mut().unwrap(),
+                    splits,
+                    recorder,
                 )?;
             } else {
                 recorder.record(
@@ -916,7 +910,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             })
             .collect();
         let decode_splits = if rows == batch.len() {
-            self.attention.decode_splits(
+            self.attention.decode_splits::<T>(
                 rows,
                 batch
                     .iter()
@@ -1118,30 +1112,68 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             false,
             recorder,
         )?;
-        self.linear(
-            c"qwen2.linear.q",
-            &mut scratch.q,
-            &scratch.norm,
-            layer.q.clone(),
-            Some(layer.q_bias.clone()),
-            recorder,
-        )?;
-        self.linear(
-            c"qwen2.linear.k",
-            &mut scratch.k,
-            &scratch.norm,
-            layer.k.clone(),
-            Some(layer.k_bias.clone()),
-            recorder,
-        )?;
-        self.linear(
-            c"qwen2.linear.v",
-            &mut scratch.v,
-            &scratch.norm,
-            layer.v.clone(),
-            Some(layer.v_bias.clone()),
-            recorder,
-        )?;
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && (scratch.x.shape()[0] as usize) < LINEAR_PREFILL_TILE[0]
+        {
+            let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.qkv");
+            let tile = LinearTile::for_shape::<T>(
+                scratch.x.shape()[0] as usize,
+                scratch.q.shape()[1] as usize,
+            );
+            let columns = (scratch.q.shape()[1] as usize).div_ceil(tile.columns)
+                + 2 * (scratch.k.shape()[1] as usize).div_ceil(tile.columns);
+            recorder.record(
+                kernels::qkv_decode(
+                    scratch.q.device_pointer(),
+                    scratch.k.device_pointer(),
+                    scratch.v.device_pointer(),
+                    &scratch.norm,
+                    layer.q.clone(),
+                    layer.k.clone(),
+                    layer.v.clone(),
+                    layer.q_bias.clone(),
+                    layer.k_bias.clone(),
+                    layer.v_bias.clone(),
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    scratch.norm.shape()[1].to_string(),
+                    tile.rows.to_string(),
+                    tile.columns.to_string(),
+                    tile.reduction.to_string(),
+                ])
+                .grid((
+                    (scratch.x.shape()[0] as usize).div_ceil(tile.rows) as u32,
+                    columns as u32,
+                    1,
+                )),
+            )?;
+        } else {
+            self.linear(
+                c"qwen2.linear.q",
+                &mut scratch.q,
+                &scratch.norm,
+                layer.q.clone(),
+                Some(layer.q_bias.clone()),
+                recorder,
+            )?;
+            self.linear(
+                c"qwen2.linear.k",
+                &mut scratch.k,
+                &scratch.norm,
+                layer.k.clone(),
+                Some(layer.k_bias.clone()),
+                recorder,
+            )?;
+            self.linear(
+                c"qwen2.linear.v",
+                &mut scratch.v,
+                &scratch.norm,
+                layer.v.clone(),
+                Some(layer.v_bias.clone()),
+                recorder,
+            )?;
+        }
         self.rope(&mut scratch.rotated_q, &scratch.q, metadata, recorder)?;
         self.rope(&mut scratch.rotated_k, &scratch.k, metadata, recorder)?;
         Ok(())
@@ -1218,12 +1250,11 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                 )?;
             }
         }
-        self.linear(
-            c"qwen2.linear.down",
+        self.project_down(
             &mut scratch.q,
             &scratch.activated,
             layer.down.clone(),
-            None,
+            scratch.decode_partials.as_mut(),
             recorder,
         )?;
         add(&mut scratch.x, &scratch.residual, &scratch.q, recorder)?;
@@ -1318,6 +1349,68 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                     .generics(generics),
             )?;
         }
+        Ok(())
+    }
+
+    /// Split long skinny reductions; reuse scratch after attention merge on the same stream.
+    unsafe fn project_down(
+        &self,
+        out: &mut Tensor<T>,
+        x: &Tensor<T>,
+        weight: Weight<T>,
+        partials: Option<&mut Tensor<f32>>,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        let rows = x.shape()[0] as usize;
+        let columns = out.shape()[1] as usize;
+        let k = x.shape()[1] as usize;
+        let tile = LinearTile::for_shape::<T>(rows, columns);
+        let splits = if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && rows < LINEAR_PREFILL_TILE[0]
+            && partials.is_some()
+        {
+            tile.decode_splits(rows, columns, k, self.attention.sm_count)
+        } else {
+            1
+        };
+        if splits == 1 {
+            return self.linear(c"qwen2.linear.down", out, x, weight, None, recorder);
+        }
+        let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.down");
+        let partials = partials.unwrap();
+        // One projection value per hidden channel fits the existing 66-value/head packets.
+        debug_assert!(
+            rows * columns * splits <= partials.shape().iter().map(|&n| n as usize).product()
+        );
+        recorder.record(
+            kernels::linear_split_k(partials.device_pointer(), x, weight)
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    k.to_string(),
+                    tile.rows.to_string(),
+                    tile.columns.to_string(),
+                    tile.reduction.to_string(),
+                    splits.to_string(),
+                ])
+                .grid((
+                    rows.div_ceil(tile.rows) as u32,
+                    columns.div_ceil(tile.columns) as u32,
+                    splits as u32,
+                )),
+        )?;
+        recorder.record(
+            kernels::linear_merge_split_k(
+                out.partition([1, LINEAR_MERGE_COLUMNS]),
+                &*partials,
+                rows as i32,
+                columns as i32,
+            )
+            .generics(vec![
+                T::DTYPE.to_string(),
+                splits.to_string(),
+                LINEAR_MERGE_COLUMNS.to_string(),
+            ]),
+        )?;
         Ok(())
     }
 
@@ -1449,18 +1542,26 @@ struct GqaAttention {
 }
 
 impl GqaAttention {
-    /// Target four CTA waves; budget at least 256 visible KV tokens per split on average.
+    /// Target four CTAs per SM; budget at least 256 visible KV tokens per split on average.
     /// Power-of-two buckets bound JIT variants/scratch; sufficiently parallel batches stay unsplit.
     /// https://github.com/NVIDIA/TileGym/blob/main/src/tilegym/ops/cutile/flash_decode.py
-    fn decode_splits(&self, rows: usize, history: usize) -> usize {
+    fn decode_splits<T: DType>(&self, rows: usize, history: usize) -> usize {
         const MIN_SPLIT_TOKENS: usize = 256;
         const TARGET_CTAS_PER_SM: usize = 4;
-        let limit = (history / MIN_SPLIT_TOKENS).clamp(1, MAX_KV_SPLITS);
+        let limit = (history / MIN_SPLIT_TOKENS).clamp(1, MAX_DECODE_SPLITS);
         let by_length = 1usize << limit.ilog2();
+        // A grouped CTA covers all Q heads sharing this KV head.
+        let heads = if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && (2..=ATTENTION_DECODE_MMA_TILE[0]).contains(&(self.q_heads / self.kv_heads))
+        {
+            self.kv_heads
+        } else {
+            self.q_heads
+        };
         let by_parallelism = (self.sm_count * TARGET_CTAS_PER_SM)
-            .div_ceil(rows * self.q_heads)
+            .div_ceil(rows * heads)
             .next_power_of_two();
-        by_length.min(by_parallelism).min(MAX_KV_SPLITS)
+        by_length.min(by_parallelism).min(MAX_DECODE_SPLITS)
     }
 
     /// Reuse one compact FP32 scratch prefix across layers, ordered on exec's stream.
@@ -1478,27 +1579,87 @@ impl GqaAttention {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.attention");
         view.retain(exec)?;
         let (k, v, table) = view.tensors();
-        let blocks = q.shape()[0] as usize * self.q_heads * splits;
-        kernels::attention_split_kv(
-            partials.partition_prefix([1, 128]),
+        self.record_split_decode(
+            out,
             q,
             k.clone(),
             v.clone(),
             table.clone(),
             metadata,
-            self.q_heads as i32,
-            self.kv_heads as i32,
+            partials,
+            splits,
+            &GpuKernelRecorder::Eager(exec),
         )
-        .generics(vec![
-            T::DTYPE.to_string(),
-            KV_TOKENS_PER_TILE.to_string(),
-            splits.to_string(),
-        ])
-        .grid((blocks as u32, 1, 1))
-        .execute(exec)?;
-        kernels::attention_merge_splits(out.partition([1, 64]), &*partials, self.q_heads as i32)
-            .generics(vec![T::DTYPE.to_string(), splits.to_string()])
-            .execute(exec)?;
+    }
+
+    /// The same decode launches are recorded eagerly or captured with fixed addresses.
+    unsafe fn record_split_decode<T: DType>(
+        &self,
+        out: &mut Tensor<T>,
+        q: &Tensor<T>,
+        k: Arc<Tensor<T>>,
+        v: Arc<Tensor<T>>,
+        table: Arc<Tensor<i32>>,
+        metadata: &Tensor<i32>,
+        partials: &mut Tensor<f32>,
+        splits: usize,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        let group = self.q_heads / self.kv_heads;
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && (2..=ATTENTION_DECODE_MMA_TILE[0]).contains(&group)
+        {
+            // Fixed tiles keep Graph variants bounded; padded heads never write packets.
+            recorder.record(
+                kernels::attention_decode_mma(
+                    partials.device_pointer(),
+                    q,
+                    k,
+                    v,
+                    table,
+                    metadata,
+                    self.q_heads as i32,
+                    self.kv_heads as i32,
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    ATTENTION_DECODE_MMA_TILE[0].to_string(),
+                    ATTENTION_DECODE_MMA_TILE[1].to_string(),
+                    group.to_string(),
+                    splits.to_string(),
+                    KV_PARTIAL_WIDTH.to_string(),
+                ])
+                .grid((q.shape()[0] as u32, self.kv_heads as u32, splits as u32)),
+            )?;
+        } else {
+            let blocks = q.shape()[0] as usize * self.q_heads * splits;
+            recorder.record(
+                kernels::attention_split_kv(
+                    partials.partition_prefix([1, 128]),
+                    q,
+                    k,
+                    v,
+                    table,
+                    metadata,
+                    self.q_heads as i32,
+                    self.kv_heads as i32,
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    KV_TOKENS_PER_TILE.to_string(),
+                    splits.to_string(),
+                ])
+                .grid((blocks as u32, 1, 1)),
+            )?;
+        }
+        recorder.record(
+            kernels::attention_merge_splits(
+                out.partition([1, 64]),
+                &*partials,
+                self.q_heads as i32,
+            )
+            .generics(vec![T::DTYPE.to_string(), splits.to_string()]),
+        )?;
         Ok(())
     }
 
@@ -2548,7 +2709,22 @@ mod tests {
             (16, 32768, 1),
             (1, 32768, 16),
         ] {
-            assert_eq!(attention.decode_splits(rows, history), splits);
+            assert_eq!(attention.decode_splits::<f32>(rows, history), splits);
+        }
+        // Grouped BF16 CTAs cover a KV head, rather than one Q head.
+        for (rows, history, splits) in [
+            (1, 511, 1),
+            (1, 512, 2),
+            (1, 4096, 16),
+            (2, 4096, 16),
+            (4, 4096, 16),
+            (16, 4096, 8),
+            (64, 4096, 2),
+        ] {
+            assert_eq!(
+                attention.decode_splits::<cutile::core::bf16>(rows, history),
+                splits
+            );
         }
     }
 
@@ -2558,7 +2734,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bf16_split_kv_matches_independent_cpu_attention() -> Result<(), ModelError> {
+    async fn bf16_grouped_mma_split_kv_matches_independent_cpu_attention() -> Result<(), ModelError>
+    {
         use cutile::core::bf16;
         check_split_kv_attention::<bf16>(bf16::from_f32, bf16::to_f32, 2e-3).await
     }
@@ -2647,58 +2824,80 @@ mod tests {
                     .await??;
                     contexts[0].commit_append()?;
                     let output = with_context(|exec| {
-                value((|| -> Result<_, ModelError> {
-                    // Reserve B first; A's continuation cannot be contiguous with its prefix.
-                    contexts[1].prepare_append(lengths[1], exec)?;
-                    contexts[0].prepare_append(lengths[0] - 7, exec)?;
-                    for (r, context) in contexts.iter_mut().enumerate() {
-                        unsafe {
-                            let k = api::copy_host_vec_to_device(&keys[r])
-                                .execute(exec)?
-                                .reshape(&[lengths[r], 128])?;
-                            let v = api::copy_host_vec_to_device(&values[r])
-                                .execute(exec)?
-                                .reshape(&[lengths[r], 128])?;
-                            let positions = context.pending_range().unwrap();
-                            context.store(
-                                0,
-                                k.slice(&[positions.clone()])?,
-                                v.slice(&[positions])?,
-                                exec,
-                            )?;
-                        }
-                    }
-                    let views = contexts
-                        .iter()
-                        .enumerate()
-                        .map(|(r, context)| {
-                            pool.read_view(context.state(), 0, history_starts[r]..lengths[r])
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    // SAFETY: all producers/readers and D2H share exec, with leases retained.
-                    unsafe {
-                        let q = Arc::new(
-                            api::copy_host_vec_to_device(&queries)
-                                .execute(exec)?
-                                .reshape(&[5, width])?,
-                        );
-                        let out = if splits == 1 {
-                            attention.forward(q, &views, &query_ranges, exec)?
-                        } else {
-                            let mut out = api::full(encode(f32::NAN), &[5, width]).execute(exec)?;
-                            let mut partials = api::full(f32::NAN,
-                                &[5 * group * 2 * MAX_KV_SPLITS, crate::runner::model::qwen2::workspace::KV_PARTIAL_WIDTH])
-                                .execute(exec)?;
-                            let metadata = attention.prepare_metadata(5, &views, &query_ranges, exec)?;
-                            attention.submit_split_decode(&mut out, &q, &views[0], &metadata, &mut partials, splits, exec)?;
-                            Arc::new(out)
-                        };
-                        Ok(readbacks.enqueue(out, exec)?)
-                    }
-                })())
-            })
-            .schedule(&policy)?
-            .await??;
+                        value((|| -> Result<_, ModelError> {
+                            // Reserve B first; A's continuation cannot be contiguous with its prefix.
+                            contexts[1].prepare_append(lengths[1], exec)?;
+                            contexts[0].prepare_append(lengths[0] - 7, exec)?;
+                            for (r, context) in contexts.iter_mut().enumerate() {
+                                unsafe {
+                                    let k = api::copy_host_vec_to_device(&keys[r])
+                                        .execute(exec)?
+                                        .reshape(&[lengths[r], 128])?;
+                                    let v = api::copy_host_vec_to_device(&values[r])
+                                        .execute(exec)?
+                                        .reshape(&[lengths[r], 128])?;
+                                    let positions = context.pending_range().unwrap();
+                                    context.store(
+                                        0,
+                                        k.slice(&[positions.clone()])?,
+                                        v.slice(&[positions])?,
+                                        exec,
+                                    )?;
+                                }
+                            }
+                            let views = contexts
+                                .iter()
+                                .enumerate()
+                                .map(|(r, context)| {
+                                    pool.read_view(
+                                        context.state(),
+                                        0,
+                                        history_starts[r]..lengths[r],
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            // SAFETY: all producers/readers and D2H share exec, with leases retained.
+                            unsafe {
+                                let q = Arc::new(
+                                    api::copy_host_vec_to_device(&queries)
+                                        .execute(exec)?
+                                        .reshape(&[5, width])?,
+                                );
+                                let out = if splits == 1
+                                    && T::DTYPE != cutile::cuda_core::DTypeId::BF16
+                                {
+                                    attention.forward(q, &views, &query_ranges, exec)?
+                                } else {
+                                    let mut out =
+                                        api::full(encode(f32::NAN), &[5, width]).execute(exec)?;
+                                    let mut partials = api::full(
+                                        f32::NAN,
+                                        &[5 * group * 2 * MAX_DECODE_SPLITS, KV_PARTIAL_WIDTH],
+                                    )
+                                    .execute(exec)?;
+                                    let metadata = attention.prepare_metadata(
+                                        5,
+                                        &views,
+                                        &query_ranges,
+                                        exec,
+                                    )?;
+                                    attention.submit_split_decode(
+                                        &mut out,
+                                        &q,
+                                        &views[0],
+                                        &metadata,
+                                        &mut partials,
+                                        splits,
+                                        exec,
+                                    )?;
+                                    Arc::new(out)
+                                };
+                                Ok(readbacks.enqueue(out, exec)?)
+                            }
+                        })())
+                    })
+                    .schedule(&policy)?
+                    .await??;
                     for context in &mut contexts {
                         context.commit_append()?;
                     }
@@ -2888,6 +3087,253 @@ mod tests {
         }
         assert_eq!(pool.metrics(), initial);
         assert_eq!(model.workspace_metrics().in_use_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bf16_packed_qkv_matches_cpu_with_partial_tiles() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let cache = ReadbackCache::default();
+        for (rows, width, q_columns, kv_columns) in [
+            (1, 96, 90, 65),
+            (3, 96, 90, 65),
+            (3, 96, 129, 65),
+            (4, 896, 896, 128),
+            (5, 96, 90, 65),
+        ] {
+            let columns = [q_columns, kv_columns, kv_columns];
+            let x: Arc<Vec<bf16>> = Arc::new(
+                (0..rows * width)
+                    .map(|i| bf16::from_f32(((i * 17 % 31) as f32 - 15.0) / 32.0))
+                    .collect(),
+            );
+            let weights: Vec<Arc<Vec<bf16>>> = columns
+                .iter()
+                .enumerate()
+                .map(|(part, &n)| {
+                    Arc::new(
+                        (0..n * width)
+                            .map(|i| {
+                                bf16::from_f32(
+                                    ((i * 7 + part * 11) % 29) as f32 / 64.0 - 14.0 / 64.0,
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let biases: Vec<Arc<Vec<bf16>>> = columns
+                .iter()
+                .enumerate()
+                .map(|(part, &n)| {
+                    Arc::new(
+                        (0..n)
+                            .map(|i| bf16::from_f32((i + part * 7) as f32 / 128.0))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let actual = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    // SAFETY: output scatters and readbacks share exec; all buffers remain leased.
+                    unsafe {
+                        let input = api::copy_host_vec_to_device(&x)
+                            .execute(exec)?
+                            .reshape(&[rows, width])?;
+                        let mut w = Vec::new();
+                        let mut bias = Vec::new();
+                        let mut out = Vec::new();
+                        for part in 0..3 {
+                            w.push(
+                                api::copy_host_vec_to_device(&weights[part])
+                                    .execute(exec)?
+                                    .reshape(&[columns[part], width])?,
+                            );
+                            bias.push(api::copy_host_vec_to_device(&biases[part]).execute(exec)?);
+                            out.push(
+                                api::full(bf16::from_f32(f32::NAN), &[rows, columns[part]])
+                                    .execute(exec)?,
+                            );
+                        }
+                        kernels::qkv_decode(
+                            out[0].device_pointer(),
+                            out[1].device_pointer(),
+                            out[2].device_pointer(),
+                            &input,
+                            &w[0],
+                            &w[1],
+                            &w[2],
+                            &bias[0],
+                            &bias[1],
+                            &bias[2],
+                        )
+                        .generics(vec![
+                            "bf16".into(),
+                            width.to_string(),
+                            "4".into(),
+                            "32".into(),
+                            "32".into(),
+                        ])
+                        .grid((
+                            rows.div_ceil(4) as u32,
+                            columns.iter().map(|n| n.div_ceil(32)).sum::<usize>() as u32,
+                            1,
+                        ))
+                        .execute(exec)?;
+                        Ok(out
+                            .into_iter()
+                            .map(|out| cache.enqueue(out, exec))
+                            .collect::<Result<Vec<_>, _>>()?)
+                    }
+                })())
+            })
+            .schedule(&policy)?
+            .await??;
+            for (part, actual) in actual.iter().enumerate() {
+                for (index, value) in actual.as_slice().iter().enumerate() {
+                    let row = index / columns[part];
+                    let column = index % columns[part];
+                    let sum = (0..width)
+                        .map(|k| {
+                            x[row * width + k].to_f32() * weights[part][column * width + k].to_f32()
+                        })
+                        .sum::<f32>();
+                    let expected = bf16::from_f32(sum + biases[part][column].to_f32()).to_f32();
+                    assert_eq!(
+                        value.to_f32(),
+                        expected,
+                        "part={part}, rows={rows}, index={index}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bf16_small_m_linear_matches_cpu_with_partial_tiles() -> Result<(), ModelError> {
+        use cutile::core::bf16;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let cache = ReadbackCache::default();
+        // Exact binary fractions make the independent CPU sum insensitive to reduction order.
+        for (rows, width, columns) in [(1, 96, 129), (2, 896, 128), (4, 4864, 129), (5, 896, 129)] {
+            let x: Arc<Vec<bf16>> = Arc::new(
+                (0..rows * width)
+                    .map(|i| bf16::from_f32(((i * 17 % 31) as f32 - 15.0) / 32.0))
+                    .collect(),
+            );
+            let w: Arc<Vec<bf16>> = Arc::new(
+                (0..columns * width)
+                    .map(|i| bf16::from_f32(((i * 7 % 29) as f32 - 14.0) / 64.0))
+                    .collect(),
+            );
+            let bias: Arc<Vec<bf16>> = Arc::new(
+                (0..columns)
+                    .map(|i| bf16::from_f32(i as f32 / 128.0))
+                    .collect(),
+            );
+            for (reduction, splits) in [
+                (32, 1),
+                (64, 1),
+                (128, 1),
+                (32, 2),
+                (32, 4),
+                (32, 8),
+                (32, 16),
+            ] {
+                let output = with_context(|exec| {
+                    value((|| -> Result<_, ModelError> {
+                        // SAFETY: inputs, output and readback share the same ordered submission.
+                        unsafe {
+                            let input = api::copy_host_vec_to_device(&x)
+                                .execute(exec)?
+                                .reshape(&[rows, width])?;
+                            let weight = api::copy_host_vec_to_device(&w)
+                                .execute(exec)?
+                                .reshape(&[columns, width])?;
+                            let bias = api::copy_host_vec_to_device(&bias).execute(exec)?;
+                            let out = if splits == 1 {
+                                kernels::linear(
+                                    api::full(f32::NAN, &[rows, columns])
+                                        .execute(exec)?
+                                        .partition([4, 32]),
+                                    input,
+                                    weight,
+                                    bias,
+                                )
+                                .generics(vec![
+                                    "bf16".into(),
+                                    "f32".into(),
+                                    width.to_string(),
+                                    "true".into(),
+                                    "4".into(),
+                                    "32".into(),
+                                    reduction.to_string(),
+                                ])
+                                .map(|(out, ..)| out)
+                                .unpartition()
+                                .execute(exec)?
+                            } else {
+                                let mut out =
+                                    api::full(f32::NAN, &[rows, columns]).execute(exec)?;
+                                let partials =
+                                    api::full(f32::NAN, &[rows * splits, columns]).execute(exec)?;
+                                kernels::linear_split_k(partials.device_pointer(), &input, weight)
+                                    .generics(vec![
+                                        "bf16".into(),
+                                        width.to_string(),
+                                        "4".into(),
+                                        "32".into(),
+                                        reduction.to_string(),
+                                        splits.to_string(),
+                                    ])
+                                    .grid((
+                                        rows.div_ceil(4) as u32,
+                                        columns.div_ceil(32) as u32,
+                                        splits as u32,
+                                    ))
+                                    .execute(exec)?;
+                                kernels::linear_merge_split_k(
+                                    (&mut out).partition([1, LINEAR_MERGE_COLUMNS]),
+                                    &partials,
+                                    rows as i32,
+                                    columns as i32,
+                                )
+                                .generics(vec![
+                                    "f32".into(),
+                                    splits.to_string(),
+                                    LINEAR_MERGE_COLUMNS.to_string(),
+                                ])
+                                .execute(exec)?;
+                                out
+                            };
+                            Ok(cache.enqueue(out, exec)?)
+                        }
+                    })())
+                })
+                .schedule(&policy)?
+                .await??;
+                for (index, &actual) in output.as_slice().iter().enumerate() {
+                    let row = index / columns;
+                    let column = index % columns;
+                    let expected = (0..width)
+                        .map(|k| x[row * width + k].to_f32() * w[column * width + k].to_f32())
+                        .sum::<f32>()
+                        + if splits == 1 {
+                            bias[column].to_f32()
+                        } else {
+                            0.0
+                        };
+                    assert_eq!(
+                        actual, expected,
+                        "BK={reduction}, splits={splits}, M={rows}, K={width}, index={index}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3451,7 +3897,7 @@ mod tests {
             let mut baseline = KVContext::new(pool.clone())?;
             let mut split = KVContext::new(pool.clone())?;
             for step in 0..64 {
-                model.attention.sm_count = 1; // One wave already covers this head count: disable splitting.
+                model.attention.sm_count = 0; // Force the unsplit reference independently of head packing.
                 let (base_token, base_logits) = model
                     .step_with_logits(&history, &mut baseline, policy.clone())
                     .await?;
@@ -3900,6 +4346,13 @@ mod tests {
         assert_eq!(LinearTile::for_shape::<bf16>(8192, 4864).group_rows, 8);
         assert_eq!(LinearTile::for_shape::<bf16>(16384, 128).group_rows, 1);
         assert_eq!(LinearTile::for_shape::<f32>(16384, 4864).group_rows, 1);
+        let skinny = LinearTile::for_shape::<bf16>(4, 896);
+        assert_eq!(skinny.decode_splits(4, 896, 4864, 36), 8);
+        assert_eq!(skinny.decode_splits(4, 896, 96, 36), 1);
+        assert_eq!(
+            LinearTile::for_shape::<bf16>(4, 4864).decode_splits(4, 4864, 896, 36),
+            1
+        );
     }
 
     #[test]

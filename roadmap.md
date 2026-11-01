@@ -104,7 +104,8 @@ quality equivalence. Adaptive split-KV decode and optional Qwen CUDA Graph repla
 2. Completed: profile and optimize BF16 long prefill against SGLang eager at B1/2/4.
    Completed: matched Rust/SGLang eager and Graph comparison. Graph improves our
    own decode by16–25%, but 4K Graph remains13%/37%/58% slower than SGLang at
-   B1/B2/B4. Retain eager/Graph controls and profile GQA decode/small-M linear next.
+   B1/B2/B4 in the initial comparison. Grouped decode MMA, packed QKV and skinny
+   down-projection split-K are now implemented; retain the controls and compare their new measurements separately.
 3. Implemented: native BF16 Qwen execution (pulled forward into W7). Keep FP32 as the
    numerical reference; validate BF16 tolerances and accumulation rather than
    requiring every generated token to match FP32 bit-for-bit.
@@ -465,18 +466,14 @@ Qwen graph replay, prefix sharing and quantized execution remain open.
 - [x] Profile the release packed GPU path for short/long prefill and decode at batch sizes 1 and 4; separate wall time, kernel time, host submission and readback.
 - [x] Add KV-block attention, compare block sizes/occupancy targets, and validate ragged/causal/cache behavior against CPU and real-model references.
 - [x] Compare prefill linear tiles and attention occupancy at batch sizes 1, 2 and 4; retain measured improvements with CPU/checkpoint regressions and unchanged workspace capacity.
-- [ ] Improve long-context decode parallelism against the recorded release baseline.
-  The current attention kernel assigns one CTA per input token / Q head, processes
-  each `[BK, head_dim]` KV tile in parallel, and loops over history tiles with online
-  softmax. Inspect the compiler-generated warp mapping and reductions for efficiency;
-  source-level tiles do not establish FlashInfer's explicit `NUM_WARPS_KV` layout.
-  For small batches with long histories, measure whether splitting one query/head's
-  KV history across multiple CTAs and merging partial softmax states improves latency.
-  Keep intra-CTA warp partitioning distinct from this cross-CTA split-KV option.
-- Port Qwen CUDA Graph as the comparison-alignment follow-up; W6 already supports
-  changing membership and chunked prefill using the packed executor.
-- Add selected intermediate-tensor checks when changing numerical kernels.
-- Validate graph replay and prefix reuse as each feature is added; evaluate quantized quality/performance in W7.
+- [x] Improve long-context decode parallelism against the recorded release baseline.
+  W8 shares the prefill GQA/MMA tile with long BF16 decode and merges bounded
+  split-KV states; short histories and FP32 retain scalar paths. Continue inspecting
+  compiler-generated warp mapping and reductions: source-level tiles do not establish
+  FlashInfer's explicit `NUM_WARPS_KV` layout. Keep intra-CTA warp partitioning
+  distinct from cross-CTA splitting, and measure each change separately.
+- [x] Port optional Qwen CUDA Graph as the comparison-alignment follow-up in W8;
+  W6 already supports changing membership and chunked prefill using the packed executor.
 
 #### W6: step-level generation, continuous batching, and chunked prefill
 
@@ -591,10 +588,12 @@ This unit starts at `52f19b0d734c1526a3e5be9ee23df6d00f152829`.
 - [x] Optional Graph matches eager logits/tokens on identical real BF16 histories;
   Gate tests cover in-flight instance ownership, and session release restores KV capacity.
 - [x] Complete matched eager/Graph SGLang comparison and record per-case gaps honestly.
-  Short B1 Graph is about1.7% slower; 4K B1/B2/B4 are13%/37%/58% slower than SGLang Graph.
+  The initial Graph comparison is retained as a baseline; grouped GQA decode MMA,
+  packed QKV and skinny down-projection split-K reduce the remaining GPU gap.
   Nsight verifies63 Graph launches,413 nodes/launch and one final D2H per measured cohort.
-- [ ] Reduce remaining GPU gaps through measured GQA decode packing/MMA and small-M
-  linear/GEMV work; do not assume additional CPU scheduling can remove kernel time.
+- [x] Reuse GQA packing/MMA for long decode; pack small-M QKV and split skinny
+  down-projection K work. B2/B4 linear latency remains a profiling follow-up;
+  do not assume additional CPU scheduling can remove kernel time.
 - [ ] Evaluate mixed arrivals and held-out generation quality before claiming serving
   throughput or text-quality equivalence. BF16/fast-math argmax changes remain explicit.
 

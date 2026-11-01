@@ -57,6 +57,11 @@ causal K-loop specialization, early V loads, FMA, exp2/FTZ and adaptive split-KV
 decode. Shape-based tile-size selection groups input sizes into buckets and selects a tile configuration for each bucket;
 CTA traversal swizzling remaps tile indices to improve cache reuse.
 Kernel tile reuse is distinct from W9's cross-request prefix reuse.
+Long BF16 decode reuses the prefill GQA/MMA and online-softmax computation, with
+bounded split-KV packets and the same FP32 merge. Small BF16 forwards pack Q/K/V
+into one launch; skinny decode down projections use split-K and reuse attention
+scratch after its merge on the same stream.
+
 
 Qwen's optional decode Graph uses the same Transformer stages as eager. Fixed
 scratch/input buffers and dynamic GPU metadata allow request reordering and
@@ -76,14 +81,25 @@ order. GPU feedback avoids per-step token readback; final D2H/text decoding and
 serving queueing are outside these static-model timers. Eager and Graph results
 are reported separately, with raw samples and frozen binaries under the ignored
 local `rust/profiling/qwen2/` directory. Numerical/lifecycle checks accompany the
-measurements; BF16 reduction/fast-math changes can alter borderline argmaxes.
+measurements; BF16 reduction/fast-math choices can alter logits and argmax selections.
 
-The matched three-process matrix shows decode Graph lowers our own latency by
+The initial matched three-process matrix shows decode Graph lowers our own latency by
 about 16–25%. At 4K, Rust/SGLang Graph decode is 4.76/4.22 ms (B1), 5.40/3.95 ms
 (B2) and 6.68/4.22 ms (B4). Short B1 is close (about 1.7% slower); Graph is not generally
 faster than SGLang. The remaining GPU work motivates GQA decode packing/MMA and
-small-M linear/GEMV experiments. These are static measurements, not serving results.
+small-M linear/GEMV experiments. Those optimizations are now implemented; the initial
+figures above precede them. See the local [decode tuning report](rust/profiling/qwen2/decode-tuning-20261101/RESULTS.md)
+for isolated experiments and the new matched comparison. These are static measurements, not serving results.
 See the local [Graph comparison report](rust/profiling/qwen2/cuda-graph-20261101/RESULTS.md).
+
+After decode tuning, the new three-process Graph comparison reduces our own
+32-token decode latency by 6–8% and 4K-history decode by 16–31%. At 4K,
+Rust/SGLang Graph decode is 4.03/4.50 ms (B1), 4.34/4.05 ms (B2) and 4.82/4.22 ms
+(B4): B1 is faster, while B2/B4 gaps remain. These figures use fresh KV, warmed
+Release binaries and fixed 64 outputs. CPU oracles and eager/Graph equality pass;
+cross-algorithm BF16 argmax differences and the Transformers diagnostic remain
+explicit in the tuning report. Held-out quality and serving throughput are unmeasured.
+
 
 Graph cache counters report captures, replays, cached instances and retained
 workspace bytes. This permanent storage is included in workspace in-use bytes;

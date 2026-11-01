@@ -17,8 +17,9 @@ use crate::ModelError;
 
 // Keep the usual prefill/decode pair; never cache a checkout still in flight.
 const MAX_IDLE_WORKSPACES: usize = 2;
-/// Bound decode scratch/JIT variants; every split stores 64 weighted values plus max/sum.
-pub(super) const MAX_KV_SPLITS: usize = 16;
+/// Bound attention/projection split variants in shared decode scratch.
+/// Attention packets hold 64 weighted values plus max/sum.
+pub(super) const MAX_DECODE_SPLITS: usize = 16;
 pub(super) const KV_PARTIAL_WIDTH: usize = 66;
 
 pub(super) struct Buffers<T: DType> {
@@ -29,7 +30,8 @@ pub(super) struct Buffers<T: DType> {
     pub(super) q: Tensor<T>,
     pub(super) rotated_q: Tensor<T>,
     pub(super) attention: Tensor<T>,
-    /// FP32 states reused across layers; absent when a forward contains prefill chunks.
+    /// FP32 attention states, then skinny projection partials, reused in stream order.
+    /// Absent when a forward contains prefill chunks.
     pub(super) decode_partials: Option<Tensor<f32>>,
     pub(super) k: Tensor<T>,
     pub(super) rotated_k: Tensor<T>,
@@ -276,7 +278,7 @@ impl<T: DType> WorkspacePool<T> {
                     &workspace.floats,
                     &mut float_offset,
                     &[
-                        batch_size * config.num_attention_heads * MAX_KV_SPLITS,
+                        batch_size * config.num_attention_heads * MAX_DECODE_SPLITS,
                         KV_PARTIAL_WIDTH,
                     ],
                 )
@@ -306,7 +308,7 @@ fn decode_partial_elements(rows: usize, batch_size: usize, config: &Qwen2Config)
     if rows == batch_size {
         batch_size
             .checked_mul(config.num_attention_heads)?
-            .checked_mul(MAX_KV_SPLITS * KV_PARTIAL_WIDTH)
+            .checked_mul(MAX_DECODE_SPLITS * KV_PARTIAL_WIDTH)
     } else {
         Some(0)
     }
