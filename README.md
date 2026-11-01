@@ -17,7 +17,8 @@ and optional Qwen decode CUDA Graphs. Multi-row BF16 projection tuning uses
 Tensor Core-compatible tile shapes; generated SASS confirms the QKV HMMA path.
 Measurements distinguish eager and Graph
 modes; neither static-model latency nor fixed-cohort overlap establishes serving
-throughput. Next is W9 radix prefix reuse, shared KV ownership and cache-aware routing.
+throughput. W9 prefix reuse, shared KV ownership, LRU eviction and local cache-aware
+routing are implemented; Runner-level cache benchmarking is the next experiment.
 
 | Week / unit | Brief content | Status |
 | --- | --- | --- |
@@ -29,7 +30,7 @@ throughput. Next is W9 radix prefix reuse, shared KV ownership and cache-aware r
 | 6 | Continuous batching, chunked prefill and submission-first overlap | ✅ Fixed-cohort overlap A/B and Nsight validated; mixed arrivals pending |
 | 7 | Native BF16 Qwen; separate quantization follow-up | ✅ BF16 implemented; quantization planned |
 | 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, M/N/K tile selection, HMMA QKV/down, fusion/swizzling, split-KV and CUDA Graph | ✅ Done; current-source prefill/decode SGLang comparison and Nsight/SASS validation |
-| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | 🚧 Local routing and opt-in Qwen prefix KV reuse implemented; eviction/evaluation pending |
+| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ✅ Done; local routing, shared prefix KV and LRU eviction implemented |
 | 10 | Modern model architectures | ⬜ Planned |
 | 11 | Multi-GPU execution | ⬜ Planned |
 | 12 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |
@@ -115,8 +116,7 @@ candidates. That targeted percentage is separate from the final matrix above.
 BF16 reduction/tile changes may alter logits and generated IDs; CPU/operator,
 lifecycle and exact real-model eager/Graph checks accompany the implementation.
 
-Next: W9 radix prefix matching, shared computed-KV ownership/reclamation and
-cache-aware routing. True quantization remains a separate W7 follow-up.
+Next: Runner-level prefix-cache benchmarks and matched SGLang comparison. True quantization remains a separate W7 follow-up.
 
 
 Graph cache counters report captures, replays, cached instances and retained

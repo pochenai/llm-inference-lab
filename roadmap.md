@@ -89,11 +89,11 @@ The final current-source benchmark tables are recorded under
 [prefill](rust/profiling/qwen2/bf16-eager-tuning/SUMMARY.md) experiments retain
 historical baselines and one-change attribution, not replacement cells for the final matrix.
 
-### Next work after W8
+### Next work after W9
 
-1. Continue W9: exact local prefix reuse and shared KV ownership are implemented.
-   Measure cold/hot saved work, then add automatic eviction and evaluate multi-owner
-   routing using the existing Runner/KVPool boundary.
+1. W9 implementation is complete: exact local prefix reuse, shared ownership, LRU
+   eviction and local cache-aware routing. Next add a Runner-level prefix-cache
+   benchmark and compare controlled cold/hot workloads with SGLang.
 2. Keep W6 mixed-arrival/budget evaluation and W7 true quantization as separate
    follow-ups. Native BF16 is complete; INT8/INT4/FP8 quantization is not.
 3. Preserve eager/Graph and serial/overlap controls. Re-run the pinned static matrix
@@ -247,7 +247,7 @@ prerequisite week.
 | W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
 | W7 | Native BF16 Qwen, then a separate quantization path | BF16 implemented; true quantization acceptance remains separate |
 | W8 | Qwen kernel and execution optimization, beginning at 52f19b0 — Done | Prefill/decode tuning, HMMA-compatible QKV/down tiles, optional decode Graph, full matched eager/Graph SGLang matrix and separate Nsight/SASS validation |
-| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — In progress | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
+| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Done | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
@@ -257,7 +257,7 @@ prerequisite week.
 Current checkpoint: the Qwen FP32/BF16 engine supports packed ragged batches,
 continuous batching, chunked prefill, submission-first overlap and optional decode
 Graph replay. W8 kernel/execution optimization and matched static comparison are
-complete. W9 local prefix sharing is implemented; automatic eviction, mixed-owner
+complete. W9 local prefix sharing and LRU eviction are implemented; mixed-owner
 serving evaluation, true
 quantization and held-out quality remain separate. See the [engine guide](rust/engine/README.md)
 for commands and metric contracts.
@@ -663,11 +663,11 @@ alter logits and token trajectories; eager/Graph equality is not a quality study
 
 #### W9: radix prefix caching, shared ownership, and cache-aware routing
 
-Status: In progress. Local multi-destination routing is implemented with bounded
+Status: Done (implementation). Local multi-destination routing is implemented with bounded
 4 KiB prefix hints, random longest-match selection, session affinity and isolated
 forwarding/accounting. Engine-local exact token-prefix reuse now supports rowless
-node-owned KV segments, stable-ID splits, path protection and opt-in Qwen execution. Automatic
-eviction and mixed-owner serving evaluation remain pending; routing hints alone
+node-owned KV segments, stable-ID splits, path protection, opt-in Qwen execution and
+unpinned-leaf LRU eviction. Cold/hot and mixed-owner serving evaluation remain pending; routing hints alone
 do not prove prefill savings. W8 static comparison remains unchanged.
 
 **Focus**
@@ -682,12 +682,15 @@ do not prove prefill savings. W8 static comparison remains unchanged.
 1. Local SGLang radix cache and scheduler integration; [SGLang paper](https://arxiv.org/abs/2312.07104).
 2. [vLLM prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching/) and its [usage examples](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/).
 
-**Acceptance**
+**Validation and follow-up evaluation**
+
+Implementation is complete; unchecked items below are benchmark/evaluation follow-ups,
+not claims of demonstrated serving throughput or distributed deployment.
 
 - [ ] Compare cold/hot cache and unrelated/shared prefixes with identical token histories and model settings; verify exact computed-token savings and outputs.
 - [x] Opt-in Qwen prefix reuse matches uncached logits/tokens, including exact/partial/no-hit prefixes, chunking, serial/overlap and decode Graphs.
 - [x] Rowless cached prefixes survive session close; child contexts append independent slots; final Runner/cache release restores capacity. Tight-capacity Runner tests prove reuse is required for admission.
-- [ ] Add automatic eviction and verify it cannot reclaim referenced or in-flight KV. Publication currently stops at its conservative token budget.
+- [x] Unpinned-leaf LRU eviction reclaims slots under publication/admission pressure; active and gated in-flight paths remain protected. Cache limits and context-row exhaustion stay separate.
 - [ ] A small controlled multi-owner routing experiment chooses the appropriate cached owner and handles misses/stale hints; label any mock routing as simulation.
 - [ ] Distinguish hit rate, prefill work saved, latency, and throughput rather than treating them as interchangeable.
 

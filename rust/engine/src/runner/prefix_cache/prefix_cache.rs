@@ -11,8 +11,7 @@ use std::{
 pub struct PrefixCacheConfig {
     /// Maximum tokens indexed from each committed history; default 4096.
     pub max_prefix_tokens: NonZeroUsize,
-    /// Unique KV tokens owned by tree edges. When full, stop publishing new tokens;
-    /// existing paths can still split/match. Automatic eviction is deferred.
+    /// Unique tree-owned KV token budget; evict unpinned LRU leaves when needed.
     pub max_cached_tokens: NonZeroUsize,
 }
 
@@ -104,7 +103,8 @@ impl<P: KVPool + 'static> PrefixCache<P> {
         let limit = tokens
             .len()
             .min(kv.ready_len())
-            .min(self.config.max_prefix_tokens.get());
+            .min(self.config.max_prefix_tokens.get())
+            .min(self.config.max_cached_tokens.get());
         if limit == 0 {
             return Ok(());
         }
@@ -112,6 +112,16 @@ impl<P: KVPool + 'static> PrefixCache<P> {
             let mut tree = self.tree.lock().unwrap();
             let found = tree.match_prefix(&tokens[..limit]);
             let missing = limit - found.matched_len;
+            let shortage = tree
+                .cached_tokens()
+                .saturating_add(missing)
+                .saturating_sub(self.config.max_cached_tokens.get());
+            if shortage > 0 {
+                // Keep the match alive while pruning; the tree mutex covers the final re-pin.
+                tree.pin(found.node);
+                tree.evict_until(|freed| freed >= shortage);
+                tree.unpin(found.node);
+            }
             let mut node = found.node;
             let mut len = found.matched_len;
             let mut added = 0;
@@ -156,6 +166,18 @@ impl<P: KVPool + 'static> PrefixCache<P> {
         Ok(())
     }
 
+    /// Reclaim cached KV for admission; pins protect the selected hit and GPU work.
+    /// Rows belong to contexts, so evicting prefixes cannot resolve row exhaustion.
+    pub(in crate::runner) fn evict_for_capacity(&self, tokens: usize, rows: usize) {
+        if self.pool.can_append(tokens, rows) || !self.pool.can_append(0, rows) {
+            return;
+        }
+        self.tree
+            .lock()
+            .unwrap()
+            .evict_until(|_| self.pool.can_append(tokens, rows));
+    }
+
     /// Wrap a path already pinned under the tree mutex; construct/drop guards outside it.
     fn pinned_match(&self, node: NodeId, token_len: usize) -> Arc<PrefixMatch<P::PrefixState>> {
         Arc::new(PrefixMatch {
@@ -197,6 +219,68 @@ mod tests {
         device_operation::{value, with_context, DeviceOp},
     };
     use std::{hint::black_box, time::Instant};
+
+    #[tokio::test]
+    async fn eviction_reclaims_pool_slots_for_publication_and_admission() -> anyhow::Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::<f32>::new(
+            NaiveKVPoolConfig {
+                num_slots: 6,
+                max_rows: 2,
+                max_seq_len: 8,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let idle = pool.metrics();
+        let cache = PrefixCache::new(
+            PrefixCacheConfig {
+                max_prefix_tokens: NonZeroUsize::new(3).unwrap(),
+                max_cached_tokens: NonZeroUsize::new(3).unwrap(),
+            },
+            pool.clone(),
+        );
+        let mut source = KVContext::new(pool.clone())?;
+        with_context(|exec| value(source.prepare_append(3, exec)))
+            .schedule(&policy)?
+            .await??;
+        source.commit_append()?;
+        cache.publish(&[1, 2, 3], &mut source)?;
+        source.release();
+        let hit = cache.find(&[1, 2, 3, 4]).unwrap();
+        let retained = pool.metrics();
+        let mut cold = KVContext::new(pool.clone())?;
+        with_context(|exec| value(cold.prepare_append(3, exec)))
+            .schedule(&policy)?
+            .await??;
+        cold.commit_append()?;
+        cache.publish(&[7, 8, 9], &mut cold)?;
+        assert!(cache.find(&[7, 8, 9, 0]).is_none());
+        assert_eq!(cache.tree.lock().unwrap().cached_tokens(), 3);
+        drop(hit);
+        cache.publish(&[7, 8, 9], &mut cold)?;
+        cold.release();
+        assert!(cache.find(&[1, 2, 3, 4]).is_none());
+        assert_eq!(pool.metrics(), retained);
+        let replacement = cache.find(&[7, 8, 9, 0]).unwrap();
+        cache.evict_for_capacity(6, 1);
+        assert!(!pool.can_append(6, 1));
+        drop(replacement);
+        // Prefix eviction cannot supply context rows, so do not discard hits for that case.
+        let row_a = KVContext::new(pool.clone())?;
+        let row_b = KVContext::new(pool.clone())?;
+        cache.evict_for_capacity(6, 1);
+        assert_eq!(cache.tree.lock().unwrap().cached_tokens(), 3);
+        drop((row_a, row_b));
+        cache.evict_for_capacity(6, 1);
+        assert!(pool.can_append(6, 1));
+        assert_eq!(pool.metrics(), idle);
+        assert!(cache.find(&[7, 8, 9, 0]).is_none());
+        Ok(())
+    }
 
     /// Run manually with cargo test --release -p engine --lib prefix_cache_cpu_probe -- --ignored --nocapture.
     /// GPU setup is excluded; measurements include CPU allocations/locks and zero GPU submissions.

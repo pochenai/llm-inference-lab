@@ -814,7 +814,7 @@ impl<P: KVPool> KVContext<P> {
 Failed prepare may already have reserved/submitted part of its work. Pending is
 set before submission, and failure invalidates that context until release. The
 interface includes immutable prefix retention/reuse. Abort/truncate, explicit
-session fork and automatic cache eviction remain deferred.
+session fork remain deferred. Cache eviction operates on unpinned tree leaves.
 
 ## Engine-local radix prefix cache
 
@@ -829,6 +829,7 @@ struct RadixTree<K, V> { /* arena nodes, parent IDs, compressed labels */ }
 struct CacheEntry<S> {
     slots: S,           // Unique ownership of this edge's KV slots.
     lock_ref: usize,    // Active protected paths through this node, not slot refs.
+    last_access: Instant, // LRU recency, inherited when splitting an edge.
 }
 struct CacheTree<S> {
     index: RadixTree<u32, CacheEntry<S>>,
@@ -917,15 +918,26 @@ hidden state/logits. Context writes remain restricted to pending through KVConte
 direct backend callers must preserve this append-only contract.
 
 The budget counts unique tokens owned by tree edges, not full path lengths per
-request. When full, new KV publication stops; existing paths can still match,
-split and deduplicate. Automatic eviction and a public cache-clear command remain
-deferred. Pool capacity must include retained cache plus active suffixes/cold
-requests. Gateway hints remain advisory rather than a synchronized KV inventory.
+request. Publication evicts unpinned LRU leaves to fit the token budget, temporarily
+pinning the matched path so its IDs survive pruning. Publication is capped by both
+per-prefix and total-cache limits; if other protected paths leave insufficient room,
+keep the existing hit and skip the new suffix. Admission also evicts when available
+physical slots cannot cover the reserved request budget. The selected hit is already
+pinned by find. Row exhaustion cannot be fixed by removing rowless cache entries.
+
+CacheTree::evict_until builds a min-heap of unpinned leaves ordered by last_access.
+After removing a leaf, its parent joins the heap if it becomes an unpinned non-root
+leaf. Payload Drop returns physical slots before capacity is rechecked. Whole edges
+are removed, so eviction may exceed the requested token count. Pinned paths, including
+in-flight GPU leases, are never candidates. An initial arena scan and O(L) heap
+storage keep this first implementation simple; each removal costs O(log L), where
+L is the candidate count. No background TTL, idle-session eviction or public clear
+command is added. Gateway hints remain advisory and may outlive evicted engine KV.
 
 Node protection is O(compressed path depth), including a linear worst case.
 Slot-ID copies, duplicate-slot return and mapping upload still process token arrays;
 this change does not make the whole request path O(1). SGLang reference:
-`radix_cache.py::inc_lock_ref/dec_lock_ref/_split_node`, local revision
+`radix_cache.py::evict/inc_lock_ref/dec_lock_ref/_split_node`, local revision
 `0263fdacb223e92035ebc947f098ba724ee5634f`.
 
 ## 提交与执行完成契约
@@ -1093,9 +1105,9 @@ uses block tables rather than per-token slots; shared partial tails may need COW
 FlashAttention and paging are separate choices and require a compatible kernel /
 view pair. This does not imply arbitrary kernels can consume arbitrary layouts.
 
-Explicit session fork, truncate/abort recovery and automatic eviction remain
-future work. Exact local prefix matching/publication and shared slots are implemented. `release_state`
-closes a context; `evict` would remove retained prefix-cache entries, so closing a
+Explicit session fork and truncate/abort recovery remain future work. Exact local
+prefix matching/publication, shared slots and LRU eviction are implemented. `release_state`
+closes a context; eviction removes retained prefix-cache entries, so closing a
 session does not require eviction. Publish only completed KV, and do not recycle
 shared or in-flight storage. GPU migration and cross-worker KV transfers are deferred.
 

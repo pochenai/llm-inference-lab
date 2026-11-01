@@ -614,7 +614,7 @@ impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
     /// slot_table[row, token_position] -> slot -> layers[layer].K/V[slot].
     /// This only claims the mapping row; prepare_append assigns physical KV slots
     /// incrementally. The final GPU lease releases the row/private suffix and unpins
-    /// the cached path. Cached slots remain owned by the tree until it is destroyed.
+    /// the cached path. Cached slots remain tree-owned until unpinned eviction or tree destruction.
     fn alloc_state(&self) -> Result<Self::ContextState> {
         let row = self
             .allocation

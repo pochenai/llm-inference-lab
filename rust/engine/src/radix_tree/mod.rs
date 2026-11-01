@@ -40,7 +40,7 @@ impl<T> SplitPrefix for Vec<T> {
 }
 
 /// An ID belongs to its originating tree. Splits preserve the original suffix ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(usize);
 
 pub const ROOT: NodeId = NodeId(0);
@@ -103,6 +103,33 @@ impl<K: Clone + Eq + Hash, V: SplitPrefix> RadixTree<K, V> {
     /// Walk from node to root, including both endpoints, without allocating a path.
     pub fn ancestors(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(Some(node), |&id| self.parent(id))
+    }
+
+    /// Iterate live non-root leaves without reconstructing their keys.
+    pub fn leaves(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.iter().enumerate().filter_map(|(id, node)| {
+            node.as_ref()
+                .filter(|node| id != ROOT.0 && node.children.is_empty())
+                .map(|_| NodeId(id))
+        })
+    }
+
+    pub fn is_leaf(&self, node: NodeId) -> bool {
+        self.node(node).children.is_empty()
+    }
+
+    /// Remove a non-root leaf and return its payload; other node IDs stay stable.
+    pub fn remove_leaf(&mut self, id: NodeId) -> Option<V> {
+        if id == ROOT || !self.is_leaf(id) {
+            return None;
+        }
+        let node = self.nodes[id.0].take().unwrap();
+        self.node_mut(node.parent.unwrap())
+            .children
+            .remove(&node.label[0]);
+        self.key_elements -= node.label.len();
+        self.free.push(id);
+        node.value
     }
 
     /// Materialize a boundary inside an edge when necessary. No match returns ROOT.
@@ -210,6 +237,24 @@ impl<K: Clone + Eq + Hash, V: SplitPrefix> RadixTree<K, V> {
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    #[test]
+    fn remove_leaf_preserves_parents_accounting_and_reuses_ids() {
+        let mut tree = RadixTree::default();
+        let suffix = tree.append(ROOT, &[1, 2, 3], vec![1, 2, 3]);
+        let parent = tree.match_prefix(&[1]).node;
+        assert!(tree.remove_leaf(ROOT).is_none());
+        assert!(tree.remove_leaf(parent).is_none());
+        assert_eq!(tree.leaves().collect::<Vec<_>>(), vec![suffix]);
+        assert_eq!(tree.remove_leaf(suffix), Some(vec![2, 3]));
+        assert_eq!(tree.key_elements(), 1);
+        assert!(tree.is_leaf(parent));
+        assert_eq!(tree.remove_leaf(parent), Some(vec![1]));
+        assert_eq!(tree.key_elements(), 0);
+        assert_eq!(tree.node_count(), 1);
+        assert_eq!(tree.append(ROOT, &[9], vec![9]), parent);
+        assert_eq!(tree.match_prefix(&[9]).matched_len, 1);
+    }
 
     #[test]
     fn descending_splits_keep_linear_label_and_value_capacity() {

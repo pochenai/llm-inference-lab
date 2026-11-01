@@ -2546,6 +2546,10 @@ mod tests {
         let short = cache.find(&[1, 9]).unwrap();
         assert_eq!(short.token_len(), 1);
         drop(short);
+        // Reclaim every eligible edge while the gated submission still protects its path.
+        cache.evict_for_capacity(usize::MAX, 0);
+        assert!(pool.metrics().layers.assigned_bytes > 0);
+        assert!(pool.metrics().index.assigned_bytes > 0);
         drop(cache);
         drop(gate);
         work.as_mut().await??;
@@ -2590,7 +2594,7 @@ mod tests {
             let pool = NaiveKVPool::new(config, &policy).await?;
             let idle = pool.metrics();
             let mut expected = Vec::new();
-            for prompt in [vec![1, 2, 3], vec![1, 2, 9]] {
+            for prompt in [vec![1, 2, 3], vec![1, 2, 9], vec![7, 8, 9]] {
                 let mut kv = KVContext::new(pool.clone())?;
                 let mut history = prompt;
                 let start = history.len();
@@ -2666,6 +2670,20 @@ mod tests {
             );
             scheduler.close_session(second).await?;
             assert_eq!(pool.metrics().index.assigned_bytes, 0);
+            // A cold 4-slot turn cannot fit beside the retained 3-slot cache in this
+            // 5-slot pool. Admission must evict, then publish/reuse the replacement.
+            assert_eq!(
+                scheduler.execute(request(None, "7 8 9")).await?.output,
+                expected[2]
+            );
+            assert_eq!(
+                scheduler.execute(request(None, "7 8 9")).await?.output,
+                expected[2]
+            );
+            assert_eq!(
+                scheduler.execute(request(None, "1 2 3")).await?.output,
+                expected[0]
+            );
             cancel.cancel();
             scheduler.wait_stopped().await;
             task.await?;

@@ -628,6 +628,12 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             .and_then(|cache| cache.find(request.input.get_ids()));
         let reused_tokens = cached.as_ref().map_or(0, |prefix| prefix.token_len());
         let admission_ready = ready_len.max(reused_tokens);
+        if let Some(cache) = &self.prefix_cache {
+            cache.evict_for_capacity(
+                reserved_tokens.saturating_add(end - admission_ready),
+                usize::from(guard.is_none()),
+            );
+        }
         if !self.pool.can_append(
             reserved_tokens.saturating_add(end - admission_ready),
             usize::from(guard.is_none()),

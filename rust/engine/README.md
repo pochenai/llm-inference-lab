@@ -96,7 +96,8 @@ for admission; there is no separate fixed GPU batch-size limit in Scheduler.
 Packed suffixes share embedding, QKV projection, and MLP computation. One attention
 launch uses per-query history metadata; K/V stores use borrowed packed slices.
 Pool metrics report assigned/free bytes separately from allocated backing bytes.
-Fork, truncate, prefix reuse/publication, eviction, and paged storage are deferred.
+Prefix reuse/publication and LRU eviction are opt-in below; fork, truncate and
+paged storage remain deferred.
 
 Tests compare dense CPU attention against full prefill, chunked prefill, and
 single-token appends; check direct GPU KV readback, concurrent context isolation,
@@ -204,8 +205,8 @@ SessionLost execution/close replies retire stale placement, so recovery does not
 accumulate dead session routes. Busy errors preserve placement.
 
 This is advisory request-history routing, not an engine-confirmed cache inventory.
-Opt-in Engine-local prefix reuse below provides actual KV savings; automatic
-eviction and cache inventory synchronization remain deferred. See [the architecture](../../design/prefix_cache_routing.md)
+Opt-in Engine-local prefix reuse below provides actual KV savings and local LRU
+eviction; cache inventory synchronization remains deferred. See [the architecture](../../design/prefix_cache_routing.md)
 for ownership and lifecycle contracts. CPU-only routing/transport tests run with:
 
 ```bash
@@ -239,13 +240,18 @@ cargo run --manifest-path rust/Cargo.toml --offline --locked --release -p engine
 The example compares independent outputs and checks all KV is released after
 Runner shutdown. Trace events `prefix_published`/`prefix_reused` report token counts;
 metrics counters are `engine_prefix_cache_hits_total`,
-`engine_prefix_cache_reused_tokens_total` and `engine_prefix_cache_published_tokens_total`.
+`engine_prefix_cache_reused_tokens_total`, `engine_prefix_cache_published_tokens_total`
+and `engine_prefix_cache_evicted_tokens_total`.
 
 Defaults: 4,096 tokens per indexed prefix and 4,096 unique tree-owned KV tokens.
 Node pins update counts along the parent path, while slot-ID copying/upload still
-scales with token count. A full budget skips new KV publication; automatic eviction and a public cache-clear command are deferred.
-Size the pool for retained cache plus active suffixes/cold requests; it may otherwise
-return capacity exhaustion. No cache is enabled by default, preserving cold benchmarks.
+scales with token count. Budget pressure at publication and slot pressure at
+admission evict unpinned LRU leaves, then newly eligible parents. This follows
+[SGLang's leaf eviction](https://github.com/sgl-project/sglang/blob/0263fdacb223e92035ebc947f098ba724ee5634f/python/sglang/srt/mem_cache/radix_cache.py#L551-L578).
+Active/idle-session and in-flight GPU path pins prevent reclamation. Whole-edge
+eviction may free more tokens than requested; all-pinned caches can still exhaust
+capacity or skip new publication. It cannot free context rows. Public clear/TTL
+and automatic idle-session release remain deferred. No cache is enabled by default, preserving cold benchmarks.
 Node ownership, in-flight split/release validation and paired CPU measurements are
 recorded in the local [node-prefix report](../profiling/qwen2/node-prefix-20261101/RESULTS.md).
 
