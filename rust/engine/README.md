@@ -312,6 +312,14 @@ The [2026-11-01 matched results](../profiling/qwen2/prefix-cache-comparison-2026
 are recorded in [the roadmap](../../roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01),
 including cross-engine text differences and the distinct prefill/generation conclusions.
 
+For a warmed Nsight capture, use `--profile --cache-state warm --iterations 1`
+with `--capture-range=cudaProfilerApi --capture-range-end=stop`. The Rust source
+header has a full command; the SGLang adapter requires a single-case fixture and
+uses its native GPU-worker profiler control. Use Graph-level traces for submission/
+execution spans and separate node-level traces for attribution. These are diagnostic
+captures, not replacement latency samples. The [64-output decode analysis](../profiling/qwen2/prefix-cache-decode-analysis-20261101/RESULTS.md)
+checks queue-ahead timing, useful Graph counts and argmax/fusion costs.
+
 Local optimized-checkpoint smoke runs cover BF16 overlap/Graph, FP32 serial, zero
 prefix and 4K/2K input/prefix; [raw verification](../profiling/qwen2/prefix-cache-runner-20261101/RESULTS.md)
 retains commands, samples and binary/source hashes. This is not an SGLang comparison.

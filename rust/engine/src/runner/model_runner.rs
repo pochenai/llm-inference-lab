@@ -296,6 +296,7 @@ impl RequestTokenGenerationState<'_> {
         match self.decoder.step(token) {
             Ok(Some(output)) => {
                 self.emitted = true;
+                nvtx_sys::mark_ascii(c"runner.delta.emit");
                 let _ = replies.send(RunnerReply::Delta(LLMResponse { request_id, output }));
             }
             Ok(None) => {}
@@ -373,6 +374,7 @@ impl<P: KVPool> ActiveRequest<'_, P> {
             Some(error) => Err(error.into()),
             None => {
                 if !self.generation.emitted {
+                    nvtx_sys::mark_ascii(c"runner.delta.emit");
                     let _ = replies.send(RunnerReply::Delta(LLMResponse {
                         request_id: self.request_id,
                         output: String::new(),

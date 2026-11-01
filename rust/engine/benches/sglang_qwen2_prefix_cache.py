@@ -11,6 +11,10 @@ seed only the shared prefix for warm samples, retain model/JIT/Graph state.
 Batch-tokenizer ingress sends one native batch packet before scheduling; no
 SGLang model, cache or scheduler implementation is patched. Library logs go to
 stderr and benchmark JSONL goes to stdout. Setup/flush/seeding are not timed.
+For Nsight capture-range=cudaProfilerApi, pass --profile --cache-state warm
+--iterations 1 with a single-case fixture. Native Engine.start_profile activities
+CUDA_PROFILER starts capture on the GPU worker after the prefix seed; no PyTorch
+profiler is layered over Nsight. Graph/node trace timings are diagnostic only.
 """
 
 from __future__ import annotations
@@ -85,12 +89,15 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--cache-state", choices=["cold", "warm", "both"], default="both")
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     assert min(args.num_slots, args.warmup, args.iterations) > 0
     version = importlib.metadata.version("sglang")
     assert version == "0.5.9", f"Recheck adapter for SGLang {version}"
     fixtures: list[dict[str, Any]] = json.loads(args.fixtures.read_text())
     assert fixtures
+    assert not args.profile or (len(fixtures) == 1 and args.cache_state != "both" and args.iterations == 1), "profile one measured case/state"
     with library_output():
         import sglang
         from transformers import AutoTokenizer
@@ -127,14 +134,27 @@ def main() -> None:
             assert tokenizer.encode(shared, add_special_tokens=True) == prefix
             expected: list[str] | None = None
             for iteration in range(args.warmup + args.iterations):
-                for state in (["cold", "warm"] if iteration % 2 == 0 else ["warm", "cold"]):
+                states = (["cold", "warm"] if iteration % 2 == 0 else ["warm", "cold"]) if args.cache_state == "both" else [args.cache_state]
+                for state in states:
                     with library_output():
                         flushed = engine.flush_cache()
                     assert flushed.success, "KV flush failed"
                     if state == "warm" and prefix:
                         seeded = cohort(engine, [shared], 1)
                         assert seeded["cached_tokens"] == [0]
-                    sample = cohort(engine, texts, case["output_tokens"])
+                    profiling = args.profile and iteration >= args.warmup
+                    if profiling:
+                        with library_output():
+                            engine.start_profile(activities=["CUDA_PROFILER"], with_stack=False, record_shapes=False)
+                        import torch
+                        profile_range = torch.cuda.nvtx.range_start("prefix_cache." + state)
+                    try:
+                        sample = cohort(engine, texts, case["output_tokens"])
+                    finally:
+                        if profiling:
+                            torch.cuda.nvtx.range_end(profile_range)
+                            with library_output():
+                                engine.stop_profile()
                     cached = len(prefix) if state == "warm" else 0
                     assert sample["cached_tokens"] == [cached] * len(texts), sample
                     assert sample["prompt_tokens"] == [case["tokens"]] * len(texts), sample

@@ -773,6 +773,57 @@ and [comparison driver](rust/engine/benches/qwen2_prefix_cache_compare.py).
 Cold/hot sustained arrivals, eviction-pressure behavior and multi-worker routing
 remain independent evaluations.
 
+#### 64-output follow-up: decode Graph cost, not a missing overlap
+
+Benchmark/results were committed as `f8b7384`. Decomposing the same native samples
+shows Rust first text is earlier, but the post-first-text interval per remaining
+token is 3.914/3.604/3.860 ms for B1/B2/B4 versus SGLang 3.830/3.470/3.621 ms.
+These intervals include generation and delivery, not just GPU kernels; phase
+medians do not necessarily add to the total median.
+
+Separate warmed Nsight captures show 63 useful decode Graphs in each cohort.
+Rust submits all 62 following Graphs before the previous GPU Graph finishes;
+there are no stream/event synchronize calls in its decoded Graph interval.
+Graph gaps are about 97–101 µs for Rust versus 170–179 µs for SGLang, including
+outside-Graph work. The measured GPU Graph body is about 3.904 vs 3.686 ms at B1,
+and 3.791 vs 3.537 ms at B4. Rust includes argmax in its Graph; SGLang samples
+outside it. These are diagnostic single-capture times, not replacement benchmarks.
+
+The clearest local gap is B4 argmax: ~64.7 µs/step in Rust versus ~6.4 µs in
+PyTorch. Rust's 256-element partial reduction launches 2376 CTAs versus 76 for
+PyTorch's observed vectorized reduction. Small-M FFN and pointwise fusion also
+matter: Rust captures 389 kernels/Graph versus SGLang 268 (B1) / 316 (B4), with
+separate Gate/Up, residual-add/norm and Q/K RoPE. B4 Gate/Up is ~1145 vs 1058 µs,
+and attention+merge ~553 vs 493 µs per step in node-level attribution.
+
+SGLang additionally executes one unused lookahead Graph that finishes after its
+public stream ends; that Graph is excluded from the 63-useful-step normalization.
+Thus stream-finish latency and GPU quiescence are distinct boundaries. The tiny
+total ranking should not be read as identical GPU work or saturated throughput.
+
+Next candidates, not implemented here: enlarge/vectorize argmax reduction work per
+CTA while preserving tie/invalid-input behavior, then test decode-specific FFN and
+pointwise fusion and per-batch attention/Down policies. No model kernel or scheduling
+policy changed in this investigation. See [the full analysis, SQL and traces](rust/profiling/qwen2/prefix-cache-decode-analysis-20261101/RESULTS.md).
+
+Stream-delivery check: separate warmed release captures instrument Runner emit,
+Scheduler receive and actual benchmark consumer polling. Runner→Scheduler median
+latency is 4.0/8.6 µs for B1/B4, but Scheduler→consumer is 237.7/377.6 µs
+(p95 333.9/535.9 µs). All consumer and Scheduler markers share the same thread;
+62/64 and 248/256 delivery waits contain the next CUDA Graph launch on that thread.
+The benchmark's current-thread Tokio runtime therefore delays intermediate
+consumer polling during the next submission. Scheduler first-text metrics precede
+actual consumer receipt and must not be treated as equivalent client TTFT.
+This is not a delay accumulated once per token: final Scheduler finish→stream
+drain is only 4.5 µs at B1 and median 6.1 µs at B4. Original unprofiled native
+samples also bound terminal drain overhead to ≤12.9 µs across B1/B2/B4.
+Profiling markers perturb these small intervals; no scheduling change was made.
+See [stream delivery evidence and reproducible analysis](rust/profiling/qwen2/stream-delivery-confirmation-20261101/RESULTS.md).
+The prefix-cache Rust benchmark now uses two Tokio workers so stream consumption
+can proceed during Runner submission. The comparison tables above retain their
+original current-thread measurements; subsequent tuning uses the new runtime on
+both sides of each Rust A/B experiment.
+
 ### Phase C: modern model architectures (W10)
 
 #### W10：MLA、MoE 与混合状态模型

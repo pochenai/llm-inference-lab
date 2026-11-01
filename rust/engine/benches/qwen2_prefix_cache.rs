@@ -13,12 +13,18 @@
 //! or deliberate eviction-pressure workload is measured. First text is not GPU TTFT.
 //! JSONL includes raw warmup samples; summaries exclude them. The local debugging
 //! recorder is enabled in both states and drained outside the measured interval.
+//! Capture one warmed cohort (BENCH_PATH is printed by cargo bench --no-run):
+//! ```bash
+//! nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=graph --output=TRACE BENCH_PATH --model-dir MODEL_DIR --tokens 4096 --prefix-tokens 2048 --batch-size 4 --output-tokens 64 --cuda-graph --cache-state warm --warmup 2 --iterations 1 --profile
+//! ```
+//! Use --cuda-graph-trace=node separately for kernel attribution, not latency claims.
 
 use std::{
+    ffi::CString,
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{ensure, Result};
@@ -36,8 +42,8 @@ use engine::{
         model_runner::RunnerBuilder,
         PrefixCacheConfig,
     },
-    scheduler::{RequestStats, Scheduler},
-    types::{SamplingConfig, SessionRequest},
+    scheduler::{RequestStats, Scheduler, SchedulerObserver},
+    types::{LLMResponse, RequestId, SamplingConfig, SessionRequest},
     CausalModel, ModelError, ModelInput, NextToken, SubmittedGpuWorkWithCompletion,
 };
 use futures::{future::try_join_all, TryStreamExt};
@@ -91,6 +97,9 @@ struct Args {
     warmup: NonZeroUsize,
     #[arg(long, default_value = "3")]
     iterations: NonZeroUsize,
+    /// Capture only the warmed measured sample with Nsight CUDA-profiler API control.
+    #[arg(long)]
+    profile: bool,
     #[arg(long)]
     trace_steps: bool,
     #[arg(long = "bench", hide = true)]
@@ -230,6 +239,39 @@ struct Sample {
     kv_retained_bytes_before_shutdown: usize,
 }
 
+/// Profiling-only handoff marks; normal runs retain the existing completion stats.
+struct CohortObserver {
+    stats: Mutex<Vec<RequestStats>>,
+    trace_delivery: bool,
+}
+
+impl CohortObserver {
+    fn mark(stage: &str, id: RequestId) {
+        let message = CString::new(format!("delivery.{stage}.{id}")).unwrap();
+        nvtx_sys::mark_ascii(&message);
+    }
+}
+
+impl SchedulerObserver for CohortObserver {
+    fn text_delta(&self, response: &LLMResponse, _first: Option<Duration>) {
+        if self.trace_delivery {
+            Self::mark("scheduler", response.request_id);
+        }
+    }
+
+    fn request_finished(
+        &self,
+        id: RequestId,
+        stats: &RequestStats,
+        _result: &Result<(), engine::error::EngineError>,
+    ) {
+        self.stats.lock().unwrap().push(*stats);
+        if self.trace_delivery {
+            Self::mark("finished", id);
+        }
+    }
+}
+
 async fn sample<T: WeightElement + ElementType>(
     args: &Args,
     state: CacheState,
@@ -240,8 +282,10 @@ async fn sample<T: WeightElement + ElementType>(
     snapshotter: &Snapshotter,
 ) -> Result<Sample> {
     let initial = pool.metrics();
-    let stats = Arc::new(Mutex::new(Vec::<RequestStats>::new()));
-    let captured = stats.clone();
+    let observer = Arc::new(CohortObserver {
+        stats: Mutex::new(Vec::new()),
+        trace_delivery: args.profile,
+    });
     let cancel = CancellationToken::new();
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (replies, reply_rx) = mpsc::unbounded_channel();
@@ -249,11 +293,7 @@ async fn sample<T: WeightElement + ElementType>(
         cancel.child_token(),
         commands,
         reply_rx,
-        vec![Arc::new(
-            move |_id, stat: &RequestStats, _result: &Result<(), engine::error::EngineError>| {
-                captured.lock().unwrap().push(*stat);
-            },
-        )],
+        vec![observer.clone()],
     );
     let owned_pool = pool.clone();
     let runner = RunnerBuilder::default()
@@ -291,7 +331,7 @@ async fn sample<T: WeightElement + ElementType>(
                 .execute(request(workload.shared_prefix.clone(), 1))
                 .await?;
         }
-        stats.lock().unwrap().clear();
+        observer.stats.lock().unwrap().clear();
         Counters::drain(snapshotter);
         let requests: Vec<_> = workload
             .prompts
@@ -313,8 +353,16 @@ async fn sample<T: WeightElement + ElementType>(
             try_join_all(streams.into_iter().map(|stream| async move {
                 futures::pin_mut!(stream);
                 let mut text = String::new();
+                let mut request_id = None;
                 while let Some(delta) = stream.try_next().await? {
+                    if args.profile {
+                        CohortObserver::mark("consumer", delta.request_id);
+                        request_id = Some(delta.request_id);
+                    }
                     text.push_str(&delta.output);
+                }
+                if let Some(id) = request_id {
+                    CohortObserver::mark("drained", id);
                 }
                 Ok::<_, engine::error::EngineError>(text)
             }))
@@ -356,7 +404,7 @@ async fn sample<T: WeightElement + ElementType>(
             counters.forward_count == args.output_tokens.get() as u64,
             "cohort split into unexpected GPU batches"
         );
-        let records = stats.lock().unwrap();
+        let records = observer.stats.lock().unwrap();
         ensure!(
             records.len() == args.batch_size.get()
                 && records
@@ -387,10 +435,15 @@ async fn sample<T: WeightElement + ElementType>(
     result
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Let stream consumers run while Runner performs synchronous CUDA submission work.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(!cfg!(debug_assertions), "use cargo bench (optimized build)");
+    ensure!(
+        !args.profile || (args.cache_state != CacheState::Both && args.iterations.get() == 1),
+        "--profile requires one cache state and --iterations 1"
+    );
     ensure!(
         args.prefix_tokens < args.tokens.get(),
         "leave at least one unique suffix token"
@@ -449,6 +502,12 @@ async fn run<T: WeightElement + ElementType>(args: Args, snapshotter: Snapshotte
         "suffix_token_ids":workload.suffix_token_ids, "num_slots":config.num_slots, "max_rows":config.max_rows,
         "timing_boundary":"fixed_cohort_scheduler_to_stream_end_no_http", "eos_stopping":false})
     );
+    // Keep the CUDA driver alive while its profiler symbols are used.
+    let driver = unsafe { libloading::Library::new("libcuda.so.1")? };
+    let profiler_start =
+        unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStart\0")? };
+    let profiler_stop =
+        unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStop\0")? };
     let mut expected = None;
     let mut measured = Vec::new();
     for iteration in 0..args.warmup.get() + args.iterations.get() {
@@ -463,7 +522,13 @@ async fn run<T: WeightElement + ElementType>(args: Args, snapshotter: Snapshotte
             vec![args.cache_state]
         };
         for state in states {
-            let sample = sample(
+            let profiling = args.profile && !warmup;
+            if profiling {
+                device.bind_to_thread()?;
+                // SAFETY: prior warmup submissions are drained; the driver owns this symbol.
+                ensure!(unsafe { profiler_start() } == 0, "cuProfilerStart failed");
+            }
+            let result = sample(
                 &args,
                 state,
                 &workload,
@@ -472,7 +537,13 @@ async fn run<T: WeightElement + ElementType>(args: Args, snapshotter: Snapshotte
                 policy.clone(),
                 &snapshotter,
             )
-            .await?;
+            .await;
+            if profiling {
+                device.bind_to_thread()?;
+                // SAFETY: sample shutdown drained its GPU work, including error paths.
+                ensure!(unsafe { profiler_stop() } == 0, "cuProfilerStop failed");
+            }
+            let sample = result?;
             if let Some(expected) = &expected {
                 ensure!(
                     sample.output_text == *expected,
