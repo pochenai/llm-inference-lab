@@ -1,8 +1,10 @@
-use super::prefix_buckets::MAX_KEY_BYTES;
 use super::prefix_tree::{PrefixTree, EVICTION_HEADROOM_DIVISOR};
 use crate::{error::EngineError, types::SessionId};
 use rand::{seq::IteratorRandom, Rng};
 use std::{collections::HashMap, num::NonZeroUsize};
+
+/// Keep routing key work bounded independently of full forwarded prompt size.
+const MAX_KEY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DestinationId(pub u64);
@@ -424,9 +426,10 @@ mod tests {
         let mut saw_batch = false;
         for i in 0..100 {
             let input = format!("{i:08x}:{}", "x".repeat(4087));
-            let before = state.index_bytes();
+            let before = state.prefixes.len();
             state.record_dispatch(&input, DestinationId(1));
-            if before + PrefixTree::entry_charge(input.len()) > budget {
+            // Detect actual eviction, including pressure from arena-capacity growth.
+            if state.prefixes.len() <= before {
                 assert!(state.index_bytes() <= budget - budget / EVICTION_HEADROOM_DIVISOR);
                 saw_batch = true;
             }

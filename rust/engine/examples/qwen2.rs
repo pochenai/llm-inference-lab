@@ -3,6 +3,7 @@
 //! cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir MODEL_DIR
 //! Match --max-new-tokens to the reference run; e.g. --max-new-tokens 32
 //! --dtype f32 --reference-dir rust/engine/artifacts/qwen2 validates the CPU/FP32 reference.
+//! Add --prefix-cache --repeat 2 --trace-steps to verify cross-request token/KV reuse.
 //! Use qwen2_reference.py --dtype bf16 --device cuda --attention sdpa for BF16 fixtures.
 
 use anyhow::{ensure, Result};
@@ -17,6 +18,7 @@ use engine::runner::{
     kv_pool::{KVContext, KVPool, NaiveKVPool},
     model::Qwen2Engine,
     model_runner::RunnerBuilder,
+    PrefixCacheConfig,
 };
 use engine::{
     scheduler::{MetricsObserver, RequestStats, Scheduler},
@@ -56,6 +58,12 @@ struct Args {
     /// Directory containing reference.json and logits.f32 for validation.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
+    /// Retain immutable token prefixes across independent requests on this Runner.
+    #[arg(long)]
+    prefix_cache: bool,
+    /// Repeat the same stateless prompt, checking output equality (prefix-cache demo).
+    #[arg(long, default_value = "1")]
+    repeat: NonZeroUsize,
     /// Enable fixed-buffer decode CUDA Graph replay; prefill stays eager.
     #[arg(long)]
     cuda_graph: bool,
@@ -85,6 +93,8 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         reference_dir,
         trace_steps,
         cuda_graph,
+        prefix_cache,
+        repeat,
     } = args;
     tracing_subscriber::fmt()
         .json()
@@ -117,8 +127,12 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         .encode(formatted.as_str(), false)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let input_ids = encoded.get_ids();
-    let pool =
-        NaiveKVPool::<T>::new(model.kv_pool_config(input_ids.len() + max_new)?, &policy).await?;
+    let mut pool_config = model.kv_pool_config(input_ids.len() + max_new)?;
+    if prefix_cache {
+        // Room for retained KV plus a cold request/suffix; cached prefixes consume no rows.
+        pool_config.num_slots *= 2;
+    }
+    let pool = NaiveKVPool::<T>::new(pool_config, &policy).await?;
     let initial = pool.metrics();
     let mut comparison = serde_json::Value::Null;
     if let Some(dir) = &reference_dir {
@@ -193,21 +207,40 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         ],
     );
     let owned_pool = pool.clone();
-    let runner = RunnerBuilder::default()
+    let builder = RunnerBuilder::default()
         .with_max_batch_tokens(max_batch_tokens)
         .with_overlap(!disable_overlap)
         .with_model_factory(move || async move { Ok(model) })
         .with_pool_factory(move |_| async move { Ok(owned_pool) })
-        .with_policy_factory(move || Ok(policy))
-        .build(command_rx, replies)
-        .await?;
+        .with_policy_factory(move || Ok(policy));
+    let builder = if prefix_cache {
+        builder.with_prefix_cache(PrefixCacheConfig::default())
+    } else {
+        builder
+    };
+    let runner = builder.build(command_rx, replies).await?;
     let task = tokio::spawn(runner.run(cancel.child_token()));
     let mut request = SessionRequest::new(None, formatted);
     request.sampling = Some(SamplingConfig {
         max_new_tokens: Some(max_new),
         ..Default::default()
     });
-    let result = scheduler.execute(request).await;
+    let repeated_request = (repeat.get() > 1).then(|| request.clone());
+    let result: Result<_> = async {
+        let mut response = scheduler.execute(request).await?;
+        for _ in 1..repeat.get() {
+            let next = scheduler
+                .execute(repeated_request.as_ref().unwrap().clone())
+                .await?;
+            ensure!(
+                next.output == response.output,
+                "repeated independent request output differs"
+            );
+            response = next;
+        }
+        Ok(response)
+    }
+    .await;
     cancel.cancel();
     scheduler.wait_stopped().await;
     task.await?;
@@ -231,7 +264,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         serde_json::json!({"model":"Qwen2.5-0.5B-Instruct","compute_dtype":T::DTYPE.to_string(),"input_ids":input_ids,
         "request_id":response.request_id,"text":response.output,"elapsed_seconds":stats.elapsed.as_secs_f64(),
         "time_to_first_text_seconds":stats.time_to_first_text.map(|elapsed| elapsed.as_secs_f64()),
-        "generated_tokens":stats.generated_tokens,"tokens_per_second":stats.tokens_per_second(),"validation":comparison,"kv_released":true})
+        "generated_tokens":stats.generated_tokens,"tokens_per_second":stats.tokens_per_second(),"validation":comparison,"prefix_cache":prefix_cache,"requests":repeat.get(),"kv_released":true})
     );
     Ok(())
 }

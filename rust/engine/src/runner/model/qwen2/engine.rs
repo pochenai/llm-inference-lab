@@ -2371,6 +2371,309 @@ mod tests {
         .await?
     }
 
+    /// Cross-request reuse is token-exact; divergent suffixes match uncached logits.
+    #[tokio::test]
+    async fn radix_prefix_cache_matches_uncached_qwen_logits_and_releases_rows(
+    ) -> Result<(), ModelError> {
+        use crate::runner::{prefix_cache::PrefixCache, PrefixCacheConfig};
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        for graph in [false, true] {
+            let model = tiny_model_with_dtype::<cutile::core::bf16>(&policy).await?;
+            let model = if graph {
+                model.with_cuda_graphs()
+            } else {
+                model
+            };
+            let mut config = model.kv_pool_config(16)?;
+            config.max_rows = 4;
+            config.num_slots = 64;
+            let pool = NaiveKVPool::new(config, &policy).await?;
+            let idle = pool.metrics();
+            let original = [1, 2, 3, 4];
+            // Eager retains multiple branches; Graph also covers a full publication budget.
+            let cache = PrefixCache::new(
+                PrefixCacheConfig {
+                    max_prefix_tokens: std::num::NonZeroUsize::new(if graph {
+                        original.len()
+                    } else {
+                        config.max_seq_len
+                    })
+                    .unwrap(),
+                    max_cached_tokens: std::num::NonZeroUsize::new(if graph {
+                        original.len()
+                    } else {
+                        config.num_slots
+                    })
+                    .unwrap(),
+                },
+                pool.clone(),
+            );
+            let mut source = KVContext::new(pool.clone())?;
+            model
+                .step_with_logits(&original, &mut source, policy.clone())
+                .await?;
+            cache.publish(&original, &mut source)?;
+            source.release();
+            assert_eq!(pool.metrics().index.assigned_bytes, 0, "cache owns no row");
+            let prompts = [
+                vec![1, 2, 3, 4],
+                vec![1, 2, 9, 10],
+                vec![1, 2],
+                vec![257 - 1],
+            ];
+            let expected_matches = [3, 2, 1, 0];
+            for (prompt, matched) in prompts.iter().zip(expected_matches) {
+                let mut cached = KVContext::new(pool.clone())?;
+                let mut fresh = KVContext::new(pool.clone())?;
+                let hit = cache.find(prompt);
+                assert_eq!(hit.as_ref().map_or(0, |hit| hit.token_len()), matched);
+                if let Some(hit) = hit {
+                    cache.reuse(&hit, &mut cached)?;
+                }
+                let (expected, logits) = model
+                    .step_with_logits(prompt, &mut fresh, policy.clone())
+                    .await?;
+                let (actual, cached_logits) = model
+                    .step_with_logits(prompt, &mut cached, policy.clone())
+                    .await?;
+                assert_eq!(actual, expected);
+                let error = logits
+                    .iter()
+                    .zip(&cached_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(error <= 0.02, "cached BF16 logits differ: {error}");
+                let mut history = prompt.clone();
+                history.push(actual);
+                let mut inputs = [
+                    ModelInput {
+                        token_ids: (&history).into(),
+                        kv: &mut cached,
+                    },
+                    ModelInput {
+                        token_ids: (&history).into(),
+                        kv: &mut fresh,
+                    },
+                ];
+                let tokens = model.next_tokens(&mut inputs, policy.clone()).await;
+                assert_eq!(*tokens[0].as_ref().unwrap(), *tokens[1].as_ref().unwrap());
+                cache.publish(&history, &mut cached)?;
+                let before_dedup = pool.metrics().layers.assigned_bytes;
+                cache.publish(&history, &mut fresh)?;
+                if matched > 0 {
+                    assert!(
+                        pool.metrics().layers.assigned_bytes < before_dedup,
+                        "duplicate KV was not returned"
+                    );
+                }
+                // Publication may repoint an already-bound row. The next append must
+                // bind its canonical prefix before eager/Graph attention reads it.
+                history.push(*tokens[0].as_ref().unwrap());
+                let next = model
+                    .next_tokens(
+                        &mut [
+                            ModelInput {
+                                token_ids: (&history).into(),
+                                kv: &mut cached,
+                            },
+                            ModelInput {
+                                token_ids: (&history).into(),
+                                kv: &mut fresh,
+                            },
+                        ],
+                        policy.clone(),
+                    )
+                    .await;
+                assert_eq!(*next[0].as_ref().unwrap(), *next[1].as_ref().unwrap());
+                cached.release();
+                fresh.release();
+            }
+            assert_eq!(pool.metrics().index.assigned_bytes, 0);
+            drop(cache);
+            assert_eq!(pool.metrics(), idle);
+        }
+        Ok(())
+    }
+
+    /// Dropping both CPU cache and context cannot unpin/recycle a path still retained by GPU work.
+    #[tokio::test]
+    async fn radix_prefix_path_outlives_cache_and_context_until_gpu_completion(
+    ) -> anyhow::Result<()> {
+        use crate::runner::model::submission::tests::Gate;
+        use crate::runner::{prefix_cache::PrefixCache, PrefixCacheConfig};
+        use futures::poll;
+        use std::sync::atomic::Ordering;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let device = Device::new(0)?;
+        let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
+        let model = tiny_model(&policy).await?;
+        let pool = NaiveKVPool::new(model.kv_pool_config(16)?, &policy).await?;
+        let idle = pool.metrics();
+        let cache = Arc::new(PrefixCache::new(PrefixCacheConfig::default(), pool.clone()));
+        let mut source = KVContext::new(pool.clone())?;
+        model
+            .step_with_logits(&[1, 2, 3, 4], &mut source, policy.clone())
+            .await?;
+        cache.publish(&[1, 2, 3, 4], &mut source)?;
+        source.release();
+        let hit = cache.find(&[1, 2, 3, 4]).unwrap();
+        let mut child = KVContext::new(pool.clone())?;
+        cache.reuse(&hit, &mut child)?;
+        drop(hit);
+        // Warm policy completion/event setup before blocking its stream; no initialization
+        // or kernel allocation occurs in the gated operation below.
+        value(()).schedule(&policy)?.await?;
+        let stream = policy.next_stream()?;
+        let gpu_cache = cache.clone();
+        let work = with_context(move |exec| {
+            value((|| -> Result<(), ModelError> {
+                child.read_view(0)?.retain(exec)?;
+                drop(child);
+                drop(gpu_cache);
+                Ok(())
+            })())
+        })
+        .schedule(&policy)?;
+        let mut work = Box::pin(work);
+        // Declare the gate last so assertion unwinding releases it before draining work.
+        let gate = Gate::arm(&stream)?;
+        let expired = gate.expired.clone();
+        assert!(poll!(work.as_mut()).is_pending());
+        assert!(pool.metrics().layers.assigned_bytes > 0);
+        assert!(pool.metrics().index.assigned_bytes > 0);
+        // Split the protected edge while the submission still retains its old node ID.
+        let short = cache.find(&[1, 9]).unwrap();
+        assert_eq!(short.token_len(), 1);
+        drop(short);
+        drop(cache);
+        drop(gate);
+        work.as_mut().await??;
+        drop(work);
+        assert!(!expired.load(Ordering::Acquire), "GPU gate expired");
+        assert_eq!(pool.metrics(), idle);
+        Ok(())
+    }
+
+    /// Tight capacity proves Runner admission budgets reused slots, including a new
+    /// session and a stateless branch after the publishing session has been closed.
+    #[tokio::test]
+    async fn radix_prefix_runner_reuses_after_session_close() -> anyhow::Result<()> {
+        use crate::{
+            runner::{model_runner::RunnerBuilder, PrefixCacheConfig},
+            scheduler::Scheduler,
+            types::{SamplingConfig, SessionRequest},
+        };
+        use std::num::NonZeroUsize;
+        use tokio::{sync::mpsc, task};
+        use tokio_util::sync::CancellationToken;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        for overlap in [false, true] {
+            let mut model = tiny_model_with_dtype::<cutile::core::bf16>(&policy).await?;
+            model.tokenizer = Tokenizer::new(
+                tokenizers::models::wordlevel::WordLevel::builder()
+                    .vocab((0..257).map(|i| (i.to_string(), i)).collect())
+                    .unk_token("0".into())
+                    .build()
+                    .unwrap(),
+            );
+            model
+                .tokenizer
+                .with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+            if overlap {
+                model = model.with_cuda_graphs();
+            }
+            let mut config = model.kv_pool_config(16)?;
+            config.num_slots = 5;
+            config.max_rows = 2;
+            let pool = NaiveKVPool::new(config, &policy).await?;
+            let idle = pool.metrics();
+            let mut expected = Vec::new();
+            for prompt in [vec![1, 2, 3], vec![1, 2, 9]] {
+                let mut kv = KVContext::new(pool.clone())?;
+                let mut history = prompt;
+                let start = history.len();
+                for _ in 0..2 {
+                    let token = model
+                        .next_tokens(
+                            &mut [ModelInput {
+                                token_ids: (&history).into(),
+                                kv: &mut kv,
+                            }],
+                            policy.clone(),
+                        )
+                        .await
+                        .pop()
+                        .unwrap()?;
+                    history.push(token);
+                }
+                expected.push(model.tokenizer.decode(&history[start..], true).unwrap());
+            }
+            assert_eq!(pool.metrics(), idle);
+            let cancel = CancellationToken::new();
+            let (commands, command_rx) = mpsc::unbounded_channel();
+            let (replies, reply_rx) = mpsc::unbounded_channel();
+            let scheduler = Scheduler::new(cancel.child_token(), commands, reply_rx);
+            let owned = pool.clone();
+            let runner = RunnerBuilder::default()
+                .with_overlap(overlap)
+                .with_max_batch_tokens(NonZeroUsize::new(2).unwrap())
+                .with_prefix_cache(PrefixCacheConfig {
+                    max_prefix_tokens: NonZeroUsize::new(3).unwrap(),
+                    max_cached_tokens: NonZeroUsize::new(3).unwrap(),
+                })
+                .with_model_factory(move || async move { Ok(model) })
+                .with_pool_factory(move |_| async move { Ok(owned) })
+                .with_policy_factory({
+                    let policy = policy.clone();
+                    move || Ok(policy)
+                })
+                .build(command_rx, replies)
+                .await?;
+            let task = task::spawn(runner.run(cancel.child_token()));
+            let request = |session, text: &str| {
+                let mut request = SessionRequest::new(session, text.to_owned());
+                request.sampling = Some(SamplingConfig {
+                    max_new_tokens: Some(2),
+                    eos_token_id: Some(crate::runner::loader::EosTokenId::One(u32::MAX)),
+                    ..Default::default()
+                });
+                request
+            };
+            let first = scheduler.open_session().await?;
+            assert_eq!(
+                scheduler
+                    .execute(request(Some(first), "1 2 3"))
+                    .await?
+                    .output,
+                expected[0]
+            );
+            scheduler.close_session(first).await?;
+            assert_eq!(pool.metrics().index.assigned_bytes, 0);
+            assert_eq!(pool.metrics().layers.assigned_bytes, 3 * 2 * 2 * 64 * 2);
+            assert_eq!(
+                scheduler.execute(request(None, "1 2 9")).await?.output,
+                expected[1]
+            );
+            let second = scheduler.open_session().await?;
+            assert_eq!(
+                scheduler
+                    .execute(request(Some(second), "1 2 3"))
+                    .await?
+                    .output,
+                expected[0]
+            );
+            scheduler.close_session(second).await?;
+            assert_eq!(pool.metrics().index.assigned_bytes, 0);
+            cancel.cancel();
+            scheduler.wait_stopped().await;
+            task.await?;
+            assert_eq!(pool.metrics(), idle);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn qwen_graph_matches_eager_and_releases_sessions() -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
@@ -4361,7 +4664,7 @@ mod tests {
         use cutile::core::bf16;
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = cuda_async::device_context::global_policy(0)?;
-        let model = tiny_model_with_dtype::<bf16>(&policy).await?;
+        let model = tiny_model_with_dtype::<cutile::core::bf16>(&policy).await?;
         let reference = tiny_model(&policy).await?;
         assert_eq!(
             model.embedding.num_bytes() * 2,
@@ -4507,7 +4810,7 @@ mod tests {
         use cutile::core::bf16;
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let policy = cuda_async::device_context::global_policy(0)?;
-        let mut model = tiny_model_with_dtype::<bf16>(&policy).await?;
+        let mut model = tiny_model_with_dtype::<cutile::core::bf16>(&policy).await?;
         let mut reference = tiny_model(&policy).await?;
         model.config.max_position_embeddings = 512;
         reference.config.max_position_embeddings = 512;

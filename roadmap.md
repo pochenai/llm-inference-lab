@@ -91,8 +91,9 @@ historical baselines and one-change attribution, not replacement cells for the f
 
 ### Next work after W8
 
-1. Start W9: radix prefix matching, computed-prefix publication/reuse, shared KV
-   ownership/reclamation and cache-aware routing. Reuse the existing Runner/KVPool boundary.
+1. Continue W9: exact local prefix reuse and shared KV ownership are implemented.
+   Measure cold/hot saved work, then add automatic eviction and evaluate multi-owner
+   routing using the existing Runner/KVPool boundary.
 2. Keep W6 mixed-arrival/budget evaluation and W7 true quantization as separate
    follow-ups. Native BF16 is complete; INT8/INT4/FP8 quantization is not.
 3. Preserve eager/Graph and serial/overlap controls. Re-run the pinned static matrix
@@ -246,7 +247,7 @@ prerequisite week.
 | W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
 | W7 | Native BF16 Qwen, then a separate quantization path | BF16 implemented; true quantization acceptance remains separate |
 | W8 | Qwen kernel and execution optimization, beginning at 52f19b0 — Done | Prefill/decode tuning, HMMA-compatible QKV/down tiles, optional decode Graph, full matched eager/Graph SGLang matrix and separate Nsight/SASS validation |
-| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Next | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
+| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — In progress | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
@@ -256,7 +257,8 @@ prerequisite week.
 Current checkpoint: the Qwen FP32/BF16 engine supports packed ragged batches,
 continuous batching, chunked prefill, submission-first overlap and optional decode
 Graph replay. W8 kernel/execution optimization and matched static comparison are
-complete. W9 prefix sharing is next; mixed-arrival serving evaluation, true
+complete. W9 local prefix sharing is implemented; automatic eviction, mixed-owner
+serving evaluation, true
 quantization and held-out quality remain separate. See the [engine guide](rust/engine/README.md)
 for commands and metric contracts.
 
@@ -663,8 +665,10 @@ alter logits and token trajectories; eager/Graph equality is not a quality study
 
 Status: In progress. Local multi-destination routing is implemented with bounded
 4 KiB prefix hints, random longest-match selection, session affinity and isolated
-forwarding/accounting. Engine-local exact prefix KV reuse is next; routing alone
-has not demonstrated prefill savings. W8 static comparison remains unchanged.
+forwarding/accounting. Engine-local exact token-prefix reuse now supports rowless
+node-owned KV segments, stable-ID splits, path protection and opt-in Qwen execution. Automatic
+eviction and mixed-owner serving evaluation remain pending; routing hints alone
+do not prove prefill savings. W8 static comparison remains unchanged.
 
 **Focus**
 
@@ -681,7 +685,9 @@ has not demonstrated prefill savings. W8 static comparison remains unchanged.
 **Acceptance**
 
 - [ ] Compare cold/hot cache and unrelated/shared prefixes with identical token histories and model settings; verify exact computed-token savings and outputs.
-- [ ] Shared prefixes survive closing one session; eviction cannot reclaim referenced or in-flight KV; final release restores capacity.
+- [x] Opt-in Qwen prefix reuse matches uncached logits/tokens, including exact/partial/no-hit prefixes, chunking, serial/overlap and decode Graphs.
+- [x] Rowless cached prefixes survive session close; child contexts append independent slots; final Runner/cache release restores capacity. Tight-capacity Runner tests prove reuse is required for admission.
+- [ ] Add automatic eviction and verify it cannot reclaim referenced or in-flight KV. Publication currently stops at its conservative token budget.
 - [ ] A small controlled multi-owner routing experiment chooses the appropriate cached owner and handles misses/stale hints; label any mock routing as simulation.
 - [ ] Distinguish hit rate, prefill work saved, latency, and throughput rather than treating them as interchangeable.
 

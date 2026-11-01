@@ -1,5 +1,5 @@
-use super::prefix_buckets::PrefixBuckets;
 use super::routing::{AccessState, DestinationId};
+use crate::radix_tree::RadixMap;
 use std::{
     collections::{BinaryHeap, HashMap},
     mem::size_of,
@@ -7,7 +7,6 @@ use std::{
 
 /// Reclaim one eighth of the directory per pressure cycle, not one entry per insert.
 pub(super) const EVICTION_HEADROOM_DIVISOR: usize = 8;
-const LIBRARY_LABEL_BYTES: usize = 255;
 /// Recheck this charge if AccessState gains larger or heap-backed fields.
 const NODE_ALLOWANCE_BYTES: usize = 64;
 const ENTRY_ALLOWANCE_BYTES: usize = 128;
@@ -21,12 +20,14 @@ pub(super) struct EvictionCandidate {
 
 #[derive(Default)]
 struct DestinationPrefixes {
-    entries: PrefixBuckets,
+    /// u8 is one UTF-8 byte of a capped prompt key: "abc" -> [97, 98, 99].
+    /// A full key is &[u8], not a node/slot index; AccessState stores its recency.
+    entries: RadixMap<u8, AccessState>,
     charged_bytes: usize,
 }
 
-/// One compressed byte trie per next hop: exact LCP queries never scan prompt records.
-/// Public library nodes are opaque; budget charges conservatively ignore prefix sharing.
+/// One bounded radix index per next hop: exact LCP queries never scan prompt records.
+/// Budget charges conservatively ignore prefix sharing.
 #[derive(Default)]
 pub(super) struct PrefixTree {
     destinations: HashMap<DestinationId, DestinationPrefixes>,
@@ -43,10 +44,9 @@ fn map_bytes<K, V>(map: &HashMap<K, V>) -> usize {
 }
 
 impl PrefixTree {
-    /// patricia_tree 0.10.2 splits labels at 255 bytes. Allow label/branch metadata
-    /// per full key rather than claiming access to private allocator measurements.
+    /// Conservative full-key charge; actual arena/label/child capacity is added separately.
     pub(super) fn entry_charge(len: usize) -> usize {
-        len + len.div_ceil(LIBRARY_LABEL_BYTES) * NODE_ALLOWANCE_BYTES + ENTRY_ALLOWANCE_BYTES
+        len + ENTRY_ALLOWANCE_BYTES
     }
 
     pub(super) fn bytes(&self) -> usize {
@@ -56,8 +56,16 @@ impl PrefixTree {
             + self
                 .destinations
                 .values()
-                .map(|p| p.entries.index_bytes())
+                .map(|p| p.entries.allocated_bytes())
                 .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.destinations
+            .values()
+            .map(|entry| entry.entries.len())
+            .sum()
     }
 
     #[cfg(test)]

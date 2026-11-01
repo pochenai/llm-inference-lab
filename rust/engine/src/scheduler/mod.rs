@@ -1,6 +1,5 @@
 mod forwarding;
 mod observer;
-mod prefix_buckets;
 mod prefix_tree;
 mod routing;
 mod runtime;

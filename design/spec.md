@@ -42,8 +42,8 @@ keeps a destination-to-request-ID reverse index for targeted disconnect cleanup.
 messages. `Forwarding` supplies source-tagged RunnerReply/disconnect events.
 One routing loop serializes transitions; session acknowledgements are polled
 without blocking other requests. The gateway retains response/terminal delivery,
-including when the caller drops its stream. Engine-local prefix KV reuse remains
-unimplemented. See [routing state/actions/control](prefix_cache_routing.md) and
+including when the caller drops its stream. Engine-local exact token-prefix KV reuse is opt-in on Runner; gateway text hints
+remain advisory and do not prove a local cache hit. See [routing state/actions/control](prefix_cache_routing.md) and
 [configuration](../rust/engine/README.md#multi-destination-routing).
 
 ## Architecture
@@ -722,6 +722,15 @@ Optional structured `tracing` events are enabled by the application subscriber.
 pub trait KVPool: Sized + Send + Sync {
     type Element: DType;
     type ContextState: Send + Sync;
+    type PrefixState: SplitPrefix + Send + Sync;
+    /// Transfer committed private slots into a uniquely owned cache segment.
+    fn take_prefix(&self, state: &mut Self::ContextState, positions: Range<usize>)
+        -> Result<Self::PrefixState, KVPoolError>;
+    /// Install canonical slots and path protection; return the previous lease for
+    /// dropping outside the tree lock. Publication also frees duplicate private slots.
+    fn bind_prefix(&self, state: &mut Self::ContextState,
+        segments: &[&Self::PrefixState], lease: &PrefixLease)
+        -> Result<Option<PrefixLease>, KVPoolError>;
     type ReadView<'a> where Self: 'a;
     type WriteView<'a> where Self: 'a;
 
@@ -761,6 +770,11 @@ pub struct KVContext<P: KVPool> {
 impl<P: KVPool> KVContext<P> {
     pub fn new(pool: Arc<P>) -> Result<Self, KVContextError>;
     pub fn state(&self) -> &P::ContextState;
+    /// Transfer only idle, committed positions to the cache.
+    pub(crate) fn take_prefix(&mut self, positions: Range<usize>) -> Result<P::PrefixState, KVContextError>;
+    /// Install a protected path, preserving ready_len for existing contexts.
+    pub(crate) fn bind_prefix(&mut self, segments: &[&P::PrefixState], lease: &PrefixLease)
+        -> Result<Option<PrefixLease>, KVContextError>;
     pub fn pending_range(&self) -> Option<Range<usize>>;
     pub fn ready_len(&self) -> usize;
     pub fn allocated_len(&self) -> usize;
@@ -789,6 +803,8 @@ impl<P: KVPool> KVContext<P> {
 | Transition | Progress / ownership |
 | --- | --- |
 | `new` | `ready=allocated=0`, no pending; one state/row |
+| `take_prefix(range)` | Transfer private committed slots into a unique tree-owned segment |
+| `bind_prefix(path, lease)` | Empty context starts at hit length; existing context keeps progress and adopts canonical slots |
 | `prepare_append(n)` succeeds | `allocated=ready+n`, pending reserved; ready unchanged |
 | `store`, attention submitted | Progress unchanged; same exec orders dependencies |
 | Matching completion succeeds, then FIFO commit | ready advances to that append end; later pending work remains |
@@ -797,9 +813,120 @@ impl<P: KVPool> KVContext<P> {
 
 Failed prepare may already have reserved/submitted part of its work. Pending is
 set before submission, and failure invalidates that context until release. The
-initial interface deliberately excludes abort/truncate, fork, prefix reuse,
-prefix publication, and eviction; these are future extensions, not mandatory
-unimplemented trait methods.
+interface includes immutable prefix retention/reuse. Abort/truncate, explicit
+session fork and automatic cache eviction remain deferred.
+
+## Engine-local radix prefix cache
+
+The reusable `radix_tree` module has no KV, GPU, counters or eviction policy.
+Its compressed paths and split algorithm adapt patricia_tree 0.10.2; the original
+MIT notice is in `rust/engine/src/radix_tree/LICENSE`. Safe iterative arena storage
+replaces the upstream recursive/unsafe layout. There is no crate dependency.
+
+```rust
+trait SplitPrefix { fn split_prefix(&mut self, len: usize) -> Self; }
+struct RadixTree<K, V> { /* arena nodes, parent IDs, compressed labels */ }
+struct CacheEntry<S> {
+    slots: S,           // Unique ownership of this edge's KV slots.
+    lock_ref: usize,    // Active protected paths through this node, not slot refs.
+}
+struct CacheTree<S> {
+    index: RadixTree<u32, CacheEntry<S>>,
+} // Cache-specific pin/unpin and segment traversal live here.
+struct PrefixCache<P: KVPool> {
+    tree: Arc<Mutex<CacheTree<P::PrefixState>>>,
+    pool: Arc<P>,
+    config: PrefixCacheConfig,
+}
+struct PrefixMatch<S: SplitPrefix> {
+    tree: Arc<Mutex<CacheTree<S>>>,
+    node: NodeId,
+    token_len: usize,
+} // Returned in Arc; final Drop unpins the path. Context PrefixLease shares this Arc.
+
+struct PrefixCacheConfig {
+    max_prefix_tokens: NonZeroUsize, // Default 4096; model/pool limits still apply.
+    max_cached_tokens: NonZeroUsize, // Default 4096 unique tree-owned tokens.
+}
+```
+
+```text
+new request / first turn of an empty session
+  -> exact u32 token-prefix lookup, capped at prompt_len - 1
+  -> split a partially matched edge; keep its suffix node ID stable
+  -> protect the matched node-to-root path
+  -> context adopts canonical slot IDs + a shared path lease
+  -> normal append/packed/chunked forward, optional overlap and CUDA Graph
+  -> complete GPU work -> commit KV -> accept CPU tokens -> drain pending work
+  -> publish: transfer only new private KV to tree ownership
+              return duplicate private slots and repoint to canonical cached slots
+              acquire the new path protection, then release the old protection
+  -> restore session or release the temporary context row/private suffix
+```
+
+CacheTree wraps the reusable index and owns cache-specific path operations;
+PrefixCache controls find/reuse/publish, and PrefixMatch protects an active path.
+Cached-token accounting comes from the index's total edge
+key elements, maintained on append/removal and unchanged by splits/merges. There
+is no separate CacheState wrapper or second CachedPathPin guard; PrefixMatch is
+the RAII guard. CacheTree uses the index through its public API, without adding
+cache methods or policy to RadixTree. Its private index and node payload live in
+`runner/prefix_cache/cache_tree.rs`; callers use CacheTree methods only.
+
+When splitting A's 100-token edge at 50, A's node ID continues to identify the
+50-token suffix. A new 50-token parent inherits A's lock_ref. A's existing pin now
+walks through that parent; B can pin just the first 50 tokens. Repeating at 20
+handles C without per-slot counters. Prefix payload splitting moves disjoint slot-ID
+vectors and copies no K/V. The Vec splitter keeps allocation with the larger half
+and bounds spare capacity, avoiding quadratic retained capacity under either
+ascending or descending split boundaries.
+
+```text
+Context ─────────┐
+GPU submission ──┴─> Arc<StateLease>
+                       -> mapping IDs + private slots
+                       -> PrefixLease -> shared PrefixMatch -> tree/node ID
+
+final StateLease Drop:
+  return row + private slots under allocation lock
+  release allocation lock
+  drop prefix protection -> walk node-to-root and decrement lock_ref
+```
+
+Cache node payloads contain allocation ownership only, never a row lease or path
+lease: tree -> node -> path pin -> tree would form an Arc cycle.
+
+The lock order matters: tree operations may call the allocator; returning a row
+must release the allocation mutex before unpinning. Old protection is returned by
+bind_prefix and dropped outside the tree mutex. Zero lock_ref permits future
+node eviction; it does not itself free cached slots. Dropping the cache wrapper
+while contexts/GPU work remain keeps the tree alive until their leases finish.
+
+Only committed KV with known CPU IDs is publishable; pending contexts are rejected.
+A post-transfer binding failure invalidates the context rather than resuming it
+with unowned slots. Concurrent cold requests may compute the same prefix: publication
+returns duplicate slots and adopts the existing path. If this changes a live
+session's mapping, its next append uploads the canonical row before GPU accesses.
+Views may be constructed earlier for graph metadata; constructing a view reads no KV.
+
+Runner opts in with `with_prefix_cache(config)`; default execution stays cold.
+The cache belongs to one Runner/model/pool, so weights/tokenizer/layout namespaces
+cannot mix. Existing nonempty sessions use their own history rather than rematching
+deltas. Even a full hit recomputes the last prompt token because KV has no final
+hidden state/logits. Context writes remain restricted to pending through KVContext;
+direct backend callers must preserve this append-only contract.
+
+The budget counts unique tokens owned by tree edges, not full path lengths per
+request. When full, new KV publication stops; existing paths can still match,
+split and deduplicate. Automatic eviction and a public cache-clear command remain
+deferred. Pool capacity must include retained cache plus active suffixes/cold
+requests. Gateway hints remain advisory rather than a synchronized KV inventory.
+
+Node protection is O(compressed path depth), including a linear worst case.
+Slot-ID copies, duplicate-slot return and mapping upload still process token arrays;
+this change does not make the whole request path O(1). SGLang reference:
+`radix_cache.py::inc_lock_ref/dec_lock_ref/_split_node`, local revision
+`0263fdacb223e92035ebc947f098ba724ee5634f`.
 
 ## 提交与执行完成契约
 
@@ -839,8 +966,13 @@ struct Allocation {
 pub struct NaiveContextState { lease: Arc<StateLease> }
 struct StateLease {
     row: usize,
-    slots: Mutex<Vec<i32>>,
+    slots: Mutex<ContextSlots>,
     allocation: Arc<Mutex<Allocation>>,
+}
+struct ContextSlots {
+    mapping: Vec<i32>,         // Logical row, including cached aliases.
+    owned: Vec<i32>,           // Only private slots; transferred segments are removed.
+    prefix: Option<PrefixLease>,
 }
 struct LayerStorage<'a, T: DType> {
     k: &'a Arc<Tensor<T>>,
@@ -905,8 +1037,9 @@ Correctness is checked against CPU outputs and actual cache contents; no through
 improvement is claimed without a benchmark.
 
 `StateLease` is private resource retention, not a new public sequence handle.
-Its final Drop returns its row and slots. Prefix refcounts/indexes are not present
-yet. Borrowed layer views and submitted work retain the lease as needed.
+Its final Drop returns its row/private slots and releases the cached path protection.
+Tree edges own cached slots. Borrowed views and submitted work retain the row lease
+as needed; there is no per-slot reference-count array.
 
 ```text
                       token_position
@@ -960,8 +1093,8 @@ uses block tables rather than per-token slots; shared partial tails may need COW
 FlashAttention and paging are separate choices and require a compatible kernel /
 view pair. This does not imply arbitrary kernels can consume arbitrary layouts.
 
-Fork, truncate/abort recovery, prefix matching/publication, and eviction should be
-added when their execution/completion contracts are implemented. `release_state`
+Explicit session fork, truncate/abort recovery and automatic eviction remain
+future work. Exact local prefix matching/publication and shared slots are implemented. `release_state`
 closes a context; `evict` would remove retained prefix-cache entries, so closing a
 session does not require eviction. Publish only completed KV, and do not recycle
 shared or in-flight storage. GPU migration and cross-worker KV transfers are deferred.
@@ -989,8 +1122,8 @@ Destination revalidates/protects prefix hits; stale stateless hits can recompute
 Session requests go to their owner;
 migration needs history and KV transfer. Namespace separates model/adapter/position
 semantics; transfers also check dtype/layout/shards. Prefix routing needs tokenizer
-semantics shared with Runner. Remote transfer and prefix routing remain future
-extensions. Publish only ready prefixes; evict only unused slots.
+semantics shared with Runner. Remote transport, engine-confirmed cache inventory synchronization and KV transfer
+remain future extensions; local advisory prefix routing is implemented. Publish only ready prefixes; evict only unused slots.
 
 # Model loader
 

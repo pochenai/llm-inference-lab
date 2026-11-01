@@ -19,6 +19,7 @@ mod batch_policy;
 
 use self::batch_policy::{BatchPolicy, MixedChunkPolicy};
 use super::model::GpuWorkCompletionFuture;
+use super::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use std::{collections::VecDeque, future::Future, num::NonZeroUsize, sync::Arc};
 
 use cuda_async::{
@@ -119,6 +120,7 @@ pub struct RunnerBuilder<
     policy_factory: SF,
     max_batch_tokens: NonZeroUsize,
     overlap: bool,
+    prefix_cache_config: Option<PrefixCacheConfig>,
 }
 
 impl Default for RunnerBuilder {
@@ -129,6 +131,7 @@ impl Default for RunnerBuilder {
             policy_factory: || Ok(global_policy(0)?),
             max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
             overlap: true,
+            prefix_cache_config: None,
         }
     }
 }
@@ -141,6 +144,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             policy_factory: self.policy_factory,
             max_batch_tokens: self.max_batch_tokens,
             overlap: self.overlap,
+            prefix_cache_config: self.prefix_cache_config,
         }
     }
 
@@ -151,6 +155,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             policy_factory: self.policy_factory,
             max_batch_tokens: self.max_batch_tokens,
             overlap: self.overlap,
+            prefix_cache_config: self.prefix_cache_config,
         }
     }
 
@@ -161,6 +166,7 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             policy_factory: factory,
             max_batch_tokens: self.max_batch_tokens,
             overlap: self.overlap,
+            prefix_cache_config: self.prefix_cache_config,
         }
     }
 
@@ -176,6 +182,12 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
     /// CPU result, when the model supports submission-first feedback. Disable for serial.
     pub fn with_overlap(mut self, enabled: bool) -> Self {
         self.overlap = enabled;
+        self
+    }
+
+    /// Enable cross-request immutable KV reuse; disabled by default for clean benchmarks.
+    pub fn with_prefix_cache(mut self, config: PrefixCacheConfig) -> Self {
+        self.prefix_cache_config = Some(config);
         self
     }
 
@@ -198,6 +210,9 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             let mut runner = ModelRunner::new(command_rx, batch_reply_tx, model, pool, policy);
             runner.max_batch_tokens = self.max_batch_tokens;
             runner.overlap = self.overlap;
+            runner.prefix_cache = self
+                .prefix_cache_config
+                .map(|config| PrefixCache::new(config, runner.pool.clone()));
             Ok(runner)
         }
     }
@@ -215,6 +230,7 @@ pub struct ModelRunner<M = SimpleMLPEngine, P: KVPool = NaiveKVPool> {
     sessions: DashMap<SessionId, SessionEntry<P>>,
     max_batch_tokens: NonZeroUsize,
     overlap: bool,
+    prefix_cache: Option<PrefixCache<P>>,
 }
 
 /// CPU history length and confirmed KV progress saved for unchanged-state rollback.
@@ -334,7 +350,23 @@ impl<P: KVPool> ActiveRequest<'_, P> {
             .saturating_sub(self.state.kv.allocated_len())
     }
 
-    fn finish(mut self, replies: &mpsc::UnboundedSender<RunnerReply>) {
+    fn finish(
+        mut self,
+        replies: &mpsc::UnboundedSender<RunnerReply>,
+        cache: Option<&PrefixCache<P>>,
+    ) where
+        P: 'static,
+    {
+        if let Some(cache) = cache.filter(|_| self.generation.model_error.is_none()) {
+            if let Err(error) = cache.publish(&self.state.tokens, &mut self.state.kv) {
+                // A pre-transfer failure is advisory; invalidated ownership must fail the turn.
+                if !self.state.kv.has_owned_pool_state() {
+                    self.generation.model_error = Some(error.into());
+                } else {
+                    tracing::warn!(target: "engine::prefix_cache", %error, "prefix publication skipped");
+                }
+            }
+        }
         let generated = self.generation.model_error.is_none();
         drop(self.generation.decoder);
         let result = match self.generation.model_error.or(self.generation.decode_error) {
@@ -445,6 +477,7 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             sessions: DashMap::new(),
             max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
             overlap: true,
+            prefix_cache: None,
         }
     }
 
@@ -589,8 +622,14 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             .ok_or_else(|| {
                 EngineError::InvalidInput("generation exceeds KV context capacity".into())
             })?;
+        let cache = self.prefix_cache.as_ref().filter(|_| old_len == 0);
+        let cached = cache
+            .as_ref()
+            .and_then(|cache| cache.find(request.input.get_ids()));
+        let reused_tokens = cached.as_ref().map_or(0, |prefix| prefix.token_len());
+        let admission_ready = ready_len.max(reused_tokens);
         if !self.pool.can_append(
-            reserved_tokens.saturating_add(end - ready_len),
+            reserved_tokens.saturating_add(end - admission_ready),
             usize::from(guard.is_none()),
         ) {
             return Err(KVPoolError::CapacityExhausted(
@@ -609,6 +648,14 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             .unwrap(),
         };
         let mut state = guard.take().unwrap();
+        if let Some(prefix) = cached {
+            cache.unwrap().reuse(&prefix, &mut state.kv)?;
+            metrics::counter!("engine_prefix_cache_hits_total").increment(1);
+            metrics::counter!("engine_prefix_cache_reused_tokens_total")
+                .increment(prefix.token_len() as u64);
+            tracing::debug!(target: "engine::prefix_cache", event = "prefix_reused",
+                request_id = request.assigned_request_id(), tokens = prefix.token_len());
+        }
         let tokens = Arc::make_mut(&mut state.tokens);
         tokens.reserve(request.input.len() + remaining);
         tokens.extend_from_slice(request.input.get_ids());
@@ -655,7 +702,9 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
                             .iter()
                             .any(|request| request.request_id == active[index].request_id))
                 {
-                    active.swap_remove(index).finish(replies);
+                    active
+                        .swap_remove(index)
+                        .finish(replies, self.prefix_cache.as_ref());
                 }
             }
             // A finite ingress snapshot prevents a continuous producer from starving GPU steps.
@@ -673,7 +722,7 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
                 match self.try_admit(&request, reserved_tokens, tokenizer) {
                     Ok(turn) => {
                         if turn.generation.remaining == 0 {
-                            turn.finish(replies);
+                            turn.finish(replies, self.prefix_cache.as_ref());
                         } else {
                             reserved_tokens = reserved_tokens
                                 .saturating_add(turn.unreserved_kv_tokens_for_generation());
@@ -844,6 +893,7 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             _ = self.drive(&mut commands, &self.batch_reply_tx) => {},
         }
         self.sessions.clear();
+        self.prefix_cache = None;
     }
 }
 

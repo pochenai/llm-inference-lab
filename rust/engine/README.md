@@ -176,9 +176,8 @@ let scheduler = Scheduler::with_routing(
 
 With multiple compatible destinations, routing records at most the first 4 KiB of
 each new stateless prompt, with a 64 MiB conservative index budget. A singleton
-skips the index entirely. The adapter uses pinned patricia_tree 0.10.2, reviewed in
-[the dependency scan](../../design/patricia_tree_security.md). Small bounded trie
-buckets guard recursive depth; configurable prefix caps above 64 KiB are rejected. Neither
+skips the index entirely. Routing uses our safe, iterative `radix_tree::RadixMap`;
+configurable prefix caps above 64 KiB are rejected to bound routing key work. Neither
 limit truncates the forwarded request. Exact longest-match ties are selected
 uniformly; a miss chooses randomly among available compatible destinations.
 `CacheNamespace` is an application-assigned compatibility identity; the Scheduler
@@ -195,7 +194,7 @@ cleanup; it does not estimate GPU load or supply load fields to the policy. One 
 only its requests/hints; other endpoints continue. Failed session owners are not
 silently reassigned.
 
-The library compresses byte paths per destination and supports implicit-prefix
+The map compresses byte paths per destination and supports implicit-prefix
 matches. Budget charges count full capped keys plus conservative node overhead,
 not allocator RSS; shared bytes can be charged repeatedly. Under pressure, batch
 eviction reclaims one eighth of budget and avoids per-entry arena shrinking.
@@ -204,14 +203,51 @@ large-fleet query cost need measurement before claiming serving scalability.
 SessionLost execution/close replies retire stale placement, so recovery does not
 accumulate dead session routes. Busy errors preserve placement.
 
-This is advisory request-history routing. Engine-local cross-session KV sharing
-and prefix publication/eviction are still pending, so routing alone does not
-reduce prefill computation. See [the architecture](../../design/prefix_cache_routing.md)
+This is advisory request-history routing, not an engine-confirmed cache inventory.
+Opt-in Engine-local prefix reuse below provides actual KV savings; automatic
+eviction and cache inventory synchronization remain deferred. See [the architecture](../../design/prefix_cache_routing.md)
 for ownership and lifecycle contracts. CPU-only routing/transport tests run with:
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml --offline --locked -p engine --lib scheduler::
 ```
+
+## Engine-local prefix KV reuse
+
+`RunnerBuilder::with_prefix_cache(PrefixCacheConfig::default())` enables exact
+cross-request token-prefix reuse. The cache belongs to one Runner/model/pool;
+existing nonempty sessions continue their history directly. It uses the same
+reusable radix module as routing; engine keys are native u32 token sequences.
+The module adapts patricia_tree's compression/splitting algorithm with its MIT
+notice, using safe iterative arena nodes rather than its unsafe recursive storage.
+Gateway text hints stay advisory; local token validation determines actual reuse.
+
+Completed requests publish committed KV only. Each compressed tree edge uniquely
+owns its slot segment. Contexts hold path protection plus private suffix slots;
+GPU submissions retain that protection through the existing row lease. Splits
+preserve suffix IDs and inherit protection counts. There are no per-slot counts.
+Publication returns duplicate KV slots and rebinds live rows to canonical slots
+before their next GPU access. The first forward binds its own row before attention. A full
+prompt hit still recomputes its last token because KV does not contain logits.
+Chunked prefill, GPU feedback and decode Graphs use the existing submission path.
+
+```bash
+cargo run --manifest-path rust/Cargo.toml --offline --locked --release -p engine --example qwen2 -- --model-dir MODEL_DIR --prefix-cache --repeat 2 --trace-steps
+# Also test --disable-overlap or --cuda-graph with the same repeat command.
+```
+
+The example compares independent outputs and checks all KV is released after
+Runner shutdown. Trace events `prefix_published`/`prefix_reused` report token counts;
+metrics counters are `engine_prefix_cache_hits_total`,
+`engine_prefix_cache_reused_tokens_total` and `engine_prefix_cache_published_tokens_total`.
+
+Defaults: 4,096 tokens per indexed prefix and 4,096 unique tree-owned KV tokens.
+Node pins update counts along the parent path, while slot-ID copying/upload still
+scales with token count. A full budget skips new KV publication; automatic eviction and a public cache-clear command are deferred.
+Size the pool for retained cache plus active suffixes/cold requests; it may otherwise
+return capacity exhaustion. No cache is enabled by default, preserving cold benchmarks.
+Node ownership, in-flight split/release validation and paired CPU measurements are
+recorded in the local [node-prefix report](../profiling/qwen2/node-prefix-20261101/RESULTS.md).
 
 ## Uniform attention-MLP profiling
 

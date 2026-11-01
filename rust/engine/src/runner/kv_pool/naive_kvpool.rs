@@ -16,9 +16,12 @@ use cutile::{
     DType,
 };
 
+use crate::radix_tree::SplitPrefix;
 use crate::runner::upload::UploadPool;
 
-use super::{BufferMetrics, KVContext, KVContextError, KVPool, KVPoolError, KVPoolMetrics};
+use super::{
+    BufferMetrics, KVContext, KVContextError, KVPool, KVPoolError, KVPoolMetrics, PrefixLease,
+};
 
 type Result<T> = std::result::Result<T, KVPoolError>;
 
@@ -161,22 +164,71 @@ struct Allocation {
 /// A submission retains this lease, not just the pool buffers, to prevent slot reuse.
 struct StateLease {
     row: usize,
-    slots: Mutex<Vec<i32>>,
+    slots: Mutex<ContextSlots>,
     allocation: Arc<Mutex<Allocation>>,
+}
+
+/// Slot IDs are CPU metadata; neither vector contains GPU K/V data.
+/// For example, mapping = [10, 11, 12, 20, 21], owned = [20, 21]:
+/// the prefix lease protects cached slots [10, 11, 12]; this row owns the suffix.
+#[derive(Default)]
+struct ContextSlots {
+    /// Logical token position -> physical slot, including the shared prefix.
+    mapping: Vec<i32>,
+    /// Slots this row must return on Drop. take_prefix removes transferred slots
+    /// immediately, before bind_prefix replaces the lease, preventing double-free.
+    owned: Vec<i32>,
+    /// Protects tree-owned prefix slots until this row's final GPU lease is dropped.
+    prefix: Option<PrefixLease>,
 }
 
 impl Drop for StateLease {
     fn drop(&mut self) {
         let slots = self.slots.get_mut().unwrap();
-        let mut allocation = self.allocation.lock().unwrap();
-        allocation.bound_positions -= slots.len();
-        allocation.free_slots.append(slots);
-        allocation.free_rows.push(self.row);
+        {
+            let mut allocation = self.allocation.lock().unwrap();
+            allocation.bound_positions -= slots.mapping.len();
+            allocation.free_slots.append(&mut slots.owned);
+            allocation.free_rows.push(self.row);
+        }
+        // Unpin may destroy the tree and return cached slots: never hold allocation here.
+        drop(slots.prefix.take());
     }
 }
 
 pub struct NaiveContextState {
     lease: Arc<StateLease>,
+    /// CPU attachment defers mapping upload until this row's first append.
+    needs_prefix_bind: bool,
+}
+
+/// Cache ownership has no slot-table row and never copies K/V buffers.
+pub struct NaivePrefixState {
+    /// CPU IDs of the physical token slots owned by this tree edge, not K/V data.
+    /// Each ID addresses that token's K/V vectors in every layer of this pool.
+    slots: Vec<i32>,
+    /// Shared CPU allocator bookkeeping; Drop returns slots to its free list.
+    /// Arc clones share this allocator, without copying or owning the GPU buffers.
+    allocation: Arc<Mutex<Allocation>>,
+}
+
+impl Drop for NaivePrefixState {
+    fn drop(&mut self) {
+        self.allocation
+            .lock()
+            .unwrap()
+            .free_slots
+            .append(&mut self.slots);
+    }
+}
+
+impl SplitPrefix for NaivePrefixState {
+    fn split_prefix(&mut self, len: usize) -> Self {
+        Self {
+            slots: self.slots.split_prefix(len),
+            allocation: self.allocation.clone(),
+        }
+    }
 }
 
 struct LayerStorage<'a, T: DType> {
@@ -199,6 +251,8 @@ impl<T: DType> LayerStorage<'_, T> {
 }
 
 /// Read-only addressing. Safe accessors expose const pointers, never writable buffers.
+/// Building a view performs no GPU reads: graph preparation may inspect addresses
+/// before the first append binds a reused row. GPU loads must follow that bind.
 pub struct NaiveReadView<'a, T: DType = f32> {
     inner: LayerStorage<'a, T>,
 }
@@ -348,7 +402,7 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
     ) -> Result<LayerStorage<'a, T>> {
         self.validate_state(state)?;
         if positions.start > positions.end
-            || positions.end > state.lease.slots.lock().unwrap().len()
+            || positions.end > state.lease.slots.lock().unwrap().mapping.len()
         {
             return Err(KVPoolError::InvalidInput(
                 "KV view range exceeds mapped tokens".into(),
@@ -382,7 +436,7 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
             ));
         }
         let mut slots = state.lease.slots.lock().unwrap();
-        if positions.start != slots.len()
+        if positions.start != slots.mapping.len()
             || positions.end > self.max_seq_len()
             || positions.is_empty()
         {
@@ -403,9 +457,16 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
             allocation.bound_positions += reserved.len();
             reserved
         };
-        slots.extend_from_slice(&new_slots);
+        slots.mapping.extend_from_slice(&new_slots);
+        slots.owned.extend_from_slice(&new_slots);
+        let mapping = if state.needs_prefix_bind {
+            state.needs_prefix_bind = false;
+            slots.mapping.clone()
+        } else {
+            new_slots
+        };
         drop(slots);
-        Ok(new_slots)
+        Ok(mapping)
     }
 
     /// Reserve slots on CPU, leaving the upload/bind to the returned backend plan.
@@ -419,7 +480,10 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
         for (state, positions) in appends {
             let slots = self.reserve_append(state, positions.clone(), exec)?;
             let base = state.lease.row * self.config.max_seq_len;
-            offsets.extend(positions.clone().map(|position| (base + position) as i32));
+            offsets.extend(
+                (positions.end - slots.len()..positions.end)
+                    .map(|position| (base + position) as i32),
+            );
             slot_ids.extend(slots);
         }
         offsets.extend(slot_ids);
@@ -442,6 +506,98 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
 impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
     type Element = T;
     type ContextState = NaiveContextState;
+    type PrefixState = NaivePrefixState;
+
+    fn take_prefix(
+        &self,
+        state: &mut Self::ContextState,
+        positions: Range<usize>,
+    ) -> Result<Self::PrefixState> {
+        self.validate_state(state)?;
+        let mut slots = state.lease.slots.lock().unwrap();
+        let cached = slots.prefix.as_ref().map_or(0, PrefixLease::token_len);
+        if positions.start < cached
+            || positions.is_empty()
+            || positions.end > slots.mapping.len()
+            || slots.owned.len() != slots.mapping.len() - cached
+        {
+            return Err(KVPoolError::InvalidInput(
+                "prefix transfer exceeds private slots".into(),
+            ));
+        }
+        let transferred = if positions.start == cached {
+            // Move the whole private suffix when possible; a capped prefix allocates
+            // only the smaller half instead of copying all cached slot IDs.
+            slots.owned.split_prefix(positions.end - cached)
+        } else {
+            slots
+                .owned
+                .drain(positions.start - cached..positions.end - cached)
+                .collect()
+        };
+        Ok(NaivePrefixState {
+            slots: transferred,
+            allocation: self.allocation.clone(),
+        })
+    }
+
+    fn bind_prefix(
+        &self,
+        state: &mut Self::ContextState,
+        segments: &[&Self::PrefixState],
+        lease: &PrefixLease,
+    ) -> Result<Option<PrefixLease>> {
+        self.validate_state(state)?;
+        let len = lease.token_len();
+        let mut slots = state.lease.slots.lock().unwrap();
+        let old_len = slots.prefix.as_ref().map_or(0, PrefixLease::token_len);
+        if len == 0
+            || len > self.config.max_seq_len
+            || len < old_len
+            || segments
+                .iter()
+                .any(|s| !Arc::ptr_eq(&self.allocation, &s.allocation))
+            || segments.iter().map(|s| s.slots.len()).sum::<usize>() != len
+        {
+            return Err(KVPoolError::InvalidInput(
+                "invalid canonical prefix or pool".into(),
+            ));
+        }
+        let empty = slots.mapping.is_empty();
+        if !empty && (len > slots.mapping.len() || slots.owned.len() < slots.mapping.len() - len) {
+            return Err(KVPoolError::InvalidInput(
+                "prefix binding exceeds mapped/private slots".into(),
+            ));
+        }
+        if empty {
+            slots.mapping.reserve(len);
+            for segment in segments {
+                slots.mapping.extend_from_slice(&segment.slots);
+            }
+            self.allocation.lock().unwrap().bound_positions += len;
+            state.needs_prefix_bind = true;
+        } else {
+            let private_tail = slots.mapping.len() - len;
+            let duplicates = slots.owned.len() - private_tail;
+            if duplicates != 0 {
+                // Only deduplication changes the row. Newly transferred slots already
+                // have canonical IDs, so normal publication needs no copy or rebind.
+                self.allocation
+                    .lock()
+                    .unwrap()
+                    .free_slots
+                    .extend(slots.owned.drain(..duplicates));
+                let mut offset = 0;
+                for segment in segments {
+                    let end = offset + segment.slots.len();
+                    slots.mapping[offset..end].copy_from_slice(&segment.slots);
+                    offset = end;
+                }
+                state.needs_prefix_bind = true;
+            }
+        }
+        Ok(slots.prefix.replace(lease.clone()))
+    }
     type ReadView<'a> = NaiveReadView<'a, T>;
     type WriteView<'a> = NaiveWriteView<'a, T>;
 
@@ -457,7 +613,8 @@ impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
     /// Claim an exclusive slot_table row for this context's logical-to-physical mapping:
     /// slot_table[row, token_position] -> slot -> layers[layer].K/V[slot].
     /// This only claims the mapping row; prepare_append assigns physical KV slots
-    /// incrementally. The row and slots are recycled when the final GPU lease drops.
+    /// incrementally. The final GPU lease releases the row/private suffix and unpins
+    /// the cached path. Cached slots remain owned by the tree until it is destroyed.
     fn alloc_state(&self) -> Result<Self::ContextState> {
         let row = self
             .allocation
@@ -471,9 +628,10 @@ impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
         Ok(NaiveContextState {
             lease: Arc::new(StateLease {
                 row,
-                slots: Mutex::new(Vec::new()),
+                slots: Mutex::new(ContextSlots::default()),
                 allocation: self.allocation.clone(),
             }),
+            needs_prefix_bind: false,
         })
     }
 
@@ -486,6 +644,8 @@ impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
         exec: &ExecutionContext,
     ) -> Result<()> {
         let new_slots = self.reserve_append(state, positions.clone(), exec)?;
+        let mapping_start = positions.end - new_slots.len();
+        let mapping_count = new_slots.len();
         // SAFETY: exec owns the submission; its caller establishes completion.
         unsafe {
             let count = new_slots.len();
@@ -507,10 +667,10 @@ impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
                 indices,
                 self.config.max_seq_len as i32,
                 state.lease.row as i32,
-                positions.start as i32,
+                mapping_start as i32,
             )
             .generics(vec![BIND_TOKENS_PER_TILE.to_string()])
-            .grid((positions.len().div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
+            .grid((mapping_count.div_ceil(BIND_TOKENS_PER_TILE) as u32, 1, 1))
             .execute(exec)?;
         }
         Ok(())
@@ -804,6 +964,100 @@ mod tests {
     };
     use cutile::tensor::{Reshape, ToHostVec};
 
+    /// Cache/path pins retain physical slots without rows; children append unique suffixes.
+    #[tokio::test]
+    async fn shared_prefix_ownership_is_rowless_immutable_and_released_once() -> Result<()> {
+        use crate::runner::{prefix_cache::PrefixCache, PrefixCacheConfig};
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = global_policy(0)?;
+        let pool = NaiveKVPool::<f32>::new(
+            NaiveKVPoolConfig {
+                num_slots: 8,
+                max_rows: 2,
+                max_seq_len: 4,
+                head_dim: 4,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .await?;
+        let initial = pool.metrics();
+        let cache = PrefixCache::new(PrefixCacheConfig::default(), pool.clone());
+        let mut source = KVContext::new(pool.clone())?;
+        assert!(source.take_prefix(0..1).is_err());
+        with_context(|exec| value(source.prepare_append(2, exec)))
+            .schedule(&policy)?
+            .await??;
+        assert!(cache.publish(&[1, 2], &mut source).is_err());
+        source.commit_append()?;
+        let prefix_slots = source.state().lease.slots.lock().unwrap().mapping.clone();
+        cache.publish(&[1, 2], &mut source)?;
+        source.release();
+        assert_eq!(pool.metrics().index.assigned_bytes, 0);
+        assert_eq!(
+            pool.metrics().layers.assigned_bytes,
+            2 * 2 * 4 * size_of::<f32>()
+        );
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let hit = cache.find(&[1, 2, 3]).unwrap();
+        cache.reuse(&hit, &mut a)?;
+        cache.reuse(&hit, &mut b)?;
+        assert!(cache.reuse(&hit, &mut a).is_err());
+        assert!(
+            pool.alloc_state().is_err(),
+            "cache owners consume no extra rows"
+        );
+        drop(hit);
+        drop(cache); // Row leases now keep the tree and its path protection alive.
+        with_context(|exec| {
+            value((|| -> Result<()> {
+                assert!(
+                    a.write_view(0, exec).is_err(),
+                    "idle shared contexts are not writable"
+                );
+                KVContext::prepare_append_batch(&mut [(&mut a, 1), (&mut b, 1)], exec)?;
+                assert_eq!(a.write_view(0, exec)?.positions(), &(2..3));
+                assert_eq!(b.write_view(0, exec)?.positions(), &(2..3));
+                Ok(())
+            })())
+        })
+        .schedule(&policy)?
+        .await??;
+        a.commit_append()?;
+        b.commit_append()?;
+        let slots_a = a.state().lease.slots.lock().unwrap().mapping.clone();
+        let slots_b = b.state().lease.slots.lock().unwrap().mapping.clone();
+        assert_eq!(&slots_a[..2], &prefix_slots);
+        assert_eq!(&slots_b[..2], &prefix_slots);
+        assert_ne!(slots_a[2], slots_b[2]);
+        let table = pool
+            .slot_table
+            .clone()
+            .to_host_vec()
+            .schedule(&policy)?
+            .await?;
+        for state in [a.state(), b.state()] {
+            let row = state.lease.row * 4;
+            assert_eq!(
+                &table[row..row + 3],
+                &state.lease.slots.lock().unwrap().mapping
+            );
+        }
+        assert_eq!(
+            pool.metrics().layers.assigned_bytes,
+            4 * 2 * 4 * size_of::<f32>()
+        );
+        a.release();
+        assert_eq!(
+            pool.metrics().layers.assigned_bytes,
+            3 * 2 * 4 * size_of::<f32>()
+        );
+        b.release();
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
     /// CPU reservation is separate from GPU binding; the plan consumes only its
     /// subrange in a larger upload, including an unaligned prefix and tile tail.
     #[tokio::test]
@@ -859,7 +1113,7 @@ mod tests {
             let state = context.state();
             let slots = state.lease.slots.lock().unwrap();
             let base = state.lease.row * 256;
-            expected[base..base + slots.len()].copy_from_slice(&slots);
+            expected[base..base + slots.mapping.len()].copy_from_slice(&slots.mapping);
         }
         assert_eq!(table, expected);
         for context in &mut contexts {
@@ -942,7 +1196,7 @@ mod tests {
                         let state = context.state();
                         let slots = state.lease.slots.lock().unwrap();
                         let base = state.lease.row * 256;
-                        expected[base..base + slots.len()].copy_from_slice(&slots);
+                        expected[base..base + slots.mapping.len()].copy_from_slice(&slots.mapping);
                     }
                     // SAFETY: the outer future completes before CPU inspection.
                     unsafe { Ok(pool.slot_table.clone().to_host_vec().execute(exec)?) }

@@ -16,8 +16,9 @@
 因此最小改动范围很明确：Scheduler 增加多 Engine 分发、session owner、前缀提示索引和负载计数。 Engine 内的精确缓存继续独立实现；在它完成前，可以验证路由选择，但还不能获得跨 session 的 KV 复用收益。
 
 
-Status: local multi-destination routing is implemented; Engine-local prefix KV
-reuse is pending. [The engine guide](../rust/engine/README.md#multi-destination-routing)
+Status: local multi-destination routing and opt-in Engine-local exact token-prefix
+KV reuse are implemented. Cache inventory synchronization and automatic eviction
+remain deferred. [The engine guide](../rust/engine/README.md#multi-destination-routing)
 shows the current public API and validation command. This section records the
 contracts; [spec.md](spec.md) remains the execution/ownership reference.
 Rust snippets summarize state and actions rather than literal implementation.
@@ -104,47 +105,36 @@ struct RoutingRuntime<F, P> {
 }
 
 struct PrefixTree {
-    /// Library-owned compressed keys and access state; no custom radix nodes.
+    /// Shared generic radix map; routing owns access/budget policy, never KV.
     destinations: HashMap<DestinationId, DestinationPrefixes>,
     charged_bytes: usize,
 }
 
 struct DestinationPrefixes {
-    entries: PrefixBuckets,
+    entries: RadixMap<u8, AccessState>,
     charged_bytes: usize,
-}
-
-/// At most 128 keys per library trie bounds recursive walks.
-struct PrefixBuckets {
-    buckets: BTreeMap<Vec<u8>, patricia_tree::PatriciaMap<AccessState>>,
-    len: usize,
-    fence_bytes: usize,
 }
 
 ```
 
-PrefixTree wraps the audited, pinned patricia_tree 0.10.2 dependency. See the
-[dependency review](patricia_tree_security.md). The library owns node allocation,
-path compression, splitting and removal; our wrapper owns access and budget policy.
-For each destination, longest_common_prefix_len finds the best match among its
-retained capped keys, including a match ending inside an implicit shared path:
+PrefixTree wraps the reusable `radix_tree::RadixMap<u8, AccessState>`, sharing its
+safe arena/compressed-path core with the engine's token radix cache. The module
+adapts patricia_tree's compression/splitting algorithm; its MIT notice is retained
+in `rust/engine/src/radix_tree/LICENSE`. The crate dependency and recursive bucket
+adapter are removed. Map lookup is read-only and includes implicit path overlap:
 
 ```text
-A's PatriciaMap: "SYS:aaa"
-B's PatriciaMap: "SYS:bbb"
-
+A's map: "SYS:aaa"
+B's map: "SYS:bbb"
 query "SYS:ccc" -> {A: 4, B: 4}
 query "SYS:aax" -> {A: 6, B: 4}
 ```
 
-Lookup probes up to three neighboring buckets per destination, selected by standard
-BTreeMap fences. Fences may outlive removed keys, so both neighbors are checked.
-The bucket/key limits prevent unbounded recursive walks in the library (see the
-dependency review). Lookup does not scan every stored prompt. Complexity grows with
-cached destinations and capped key length. Paths are compressed within each
-PatriciaMap; identical paths in different destination maps are not shared. This
-trades some cross-destination compression for a small adapter using public APIs.
-There is no engine KV data or original full-input backing allocation in these maps.
+Lookup visits each populated destination's byte path, not all stored prompts or
+three neighbor buckets. Ordinary map removal prunes empty leaves, merges valueless
+unary nodes and reuses arena slots. The engine's resource tree never merges nodes
+behind active path pins. There is no engine KV or full-input backing allocation
+in gateway maps. Paths are compressed within, not across, destinations.
 
 Identity and associated state use named types; counts, byte lengths, capacity
 limits and simple flags retain primitive types. Raw byte slices describe routing keys rather than another identity. Reuse existing RequestId and SessionId contracts.
@@ -402,7 +392,7 @@ never removes or reassigns a live session owner.
 
 The default cap is 4 KiB and the default accounted index budget is 64 MiB; both
 are configurable at construction; prefix caps above 64 KiB are rejected to bound
-library recursion. With only one available compatible destination,
+routing key work independently of full prompt size. With only one available compatible destination,
 skip both prefix lookup and recording: locality cannot change the selected next
 hop. Session routing and request lifecycle tracking remain active. Clear obsolete
 prefix hints if endpoint loss leaves only one compatible destination. One million distinct
@@ -410,19 +400,18 @@ nonsharing capped prefixes contain at most about 3.81 GiB of label payload;
 this is not total index memory or a user-count capacity guarantee. Shared prefixes
 reduce payload; branches, destination associations and container capacities add costs.
 
-The library does not expose allocator sizes. Charge each distinct capped key as
-`length + ceil(length / 255) * 64 + 128` bytes, plus outer map capacity and per-trie
-root allowance, bucket metadata and duplicated fence bytes. The constants refer to the pinned library's 255-byte label chunks
-and conservatively budget node/entry overhead; they are not measured allocation
-sizes. Shared paths are deliberately charged repeatedly, so this policy can evict
-hints earlier than true allocated bytes would require. It does not bound process
-RSS, allocator fragmentation or transient iterator/eviction scratch.
+Charge each distinct capped key as `length + 128` bytes, plus conservative map,
+arena, label-vector, free-list and child-map capacity charges. Shared paths are
+charged repeatedly, so hints may be evicted before true allocation requires it.
+This is not process RSS or a bound on fragmentation/transient eviction scratch.
+Arena slots recycle; batch pressure can discard a destination's remaining map to
+release retained arena capacity. No full-arena compaction occurs per removed key.
 
 After an insertion exceeds budget, reclaim to seven eighths of the budget. Each
 pass scans entries once and keeps only the oldest eighth of keys in a temporary
 heap, then removes those keys. There is no per-entry node-arena shrink_to_fit or
 full-tree scan for every newly admitted hint. Batch scans still reconstruct capped
-keys via the library iterator and can cause periodic actor latency spikes; this
+keys via the map iterator and can cause periodic actor latency spikes; this
 is not a claim of constant-time eviction or million-prefix serving throughput. Avoid allocating the full oversized input
 before applying the cap. Session routes and pending requests are separate state
 and require their own lifecycle/admission bounds.
@@ -468,13 +457,11 @@ No recursive-routing transport, HA, mesh or KV migration is implemented now.
   the old session route table or forwards close to those lost placements.
 - Singleton hint maintenance is allocation-free. Multi-destination prefix reuse
   decisions retain the independent byte-prefix oracle and UTF-8 cap tests.
-- Paired optimized CPU probes reduce 64 MiB pressure insertion from about 219 to
-  3.6 us/op (three-process medians); this is not GPU/HTTP e2e or tail-latency data.
-  Batched eviction is periodic: this short measurement does not characterize its
-  worst sweep, and phase alignment affects the mean. Hot lookup/update and
-  small-budget insertion can be slower with PatriciaMap.
-  More small node allocations are a measured tradeoff for removing custom radix
-  storage. See the local [full report](../rust/profiling/routing/patricia-20261101/RESULTS.md).
+- Historical PatriciaMap CPU probes are archived in the local
+  [report](../rust/profiling/routing/patricia-20261101/RESULTS.md). Their timings do
+  not describe the replacement safe arena map; gateway performance has not been
+  re-benchmarked. Current routing tests cover split/merge, prefix oracles, budget
+  headroom, singleton bypass and session/endpoint cleanup.
 
 ### First implementation checks
 

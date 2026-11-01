@@ -1,5 +1,6 @@
 pub mod error;
 mod profiling;
+pub mod radix_tree;
 pub mod runner;
 pub mod scheduler;
 pub mod types;

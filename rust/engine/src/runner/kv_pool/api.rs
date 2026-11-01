@@ -4,11 +4,12 @@ use cuda_async::device_operation::ExecutionContext;
 use cutile::{tensor::TensorView, DType};
 
 use super::{KVContextError, KVPoolError};
+use crate::radix_tree::SplitPrefix;
 
 type Result<T> = std::result::Result<T, KVPoolError>;
 type ContextResult<T> = std::result::Result<T, KVContextError>;
 
-/// Storage and mapping contract. Prefix sharing and eviction are deliberately deferred.
+/// Storage, mapping and immutable-prefix ownership contract.
 /// A read view cannot be used as a store destination:
 ///
 /// ```compile_fail,E0308
@@ -23,6 +24,26 @@ pub trait KVPool: Sized + Send + Sync {
     /// Storage dtype shared by K/V writes and the matching attention backend.
     type Element: DType;
     type ContextState: Send + Sync;
+    /// Unique ownership of a row-independent KV segment; splits move ownership.
+    type PrefixState: SplitPrefix + Send + Sync;
+
+    /// Transfer a committed private range into cache ownership, without copying K/V.
+    /// Caller follows with bind_prefix before resuming the context. Errors leave state intact.
+    fn take_prefix(
+        &self,
+        state: &mut Self::ContextState,
+        positions: Range<usize>,
+    ) -> Result<Self::PrefixState>;
+
+    /// Install the canonical cached path and its protection. On publication, return
+    /// duplicate private slots and retain only the private suffix. Return the old
+    /// protection for dropping OUTSIDE the tree lock. Errors leave state intact.
+    fn bind_prefix(
+        &self,
+        state: &mut Self::ContextState,
+        segments: &[&Self::PrefixState],
+        lease: &PrefixLease,
+    ) -> Result<Option<PrefixLease>>;
     type ReadView<'a>
     where
         Self: 'a;
@@ -77,6 +98,7 @@ pub trait KVPool: Sized + Send + Sync {
     /// Expose writable destinations for already reserved positions and retain their
     /// buffers/leases in exec. No K/V writes or GPU wait occur here. KVContext chooses
     /// pending positions; this lower-level API validates backend bounds and ownership.
+    /// Direct backend callers must supply only their newly reserved append, never history.
     fn write_view<'a>(
         &'a self,
         state: &'a mut Self::ContextState,
@@ -114,6 +136,27 @@ pub struct KVPoolMetrics {
     pub layers: BufferMetrics,
 }
 
+/// Shared protection of a cached path. The opaque owner unpins the node path on
+/// final Drop; backend row leases retain it through all in-flight GPU accesses.
+#[derive(Clone)]
+pub struct PrefixLease {
+    token_len: usize,
+    _owner: Arc<dyn Send + Sync>,
+}
+
+impl PrefixLease {
+    /// Share an existing protection guard without allocating another Arc wrapper.
+    pub(crate) fn from_shared(token_len: usize, owner: Arc<dyn Send + Sync>) -> Self {
+        Self {
+            token_len,
+            _owner: owner,
+        }
+    }
+    pub fn token_len(&self) -> usize {
+        self.token_len
+    }
+}
+
 /// Logical progress independent of the pool's physical layout.
 pub struct KVContext<P: KVPool> {
     /// Physical storage owner; logical progress does not depend on its layout.
@@ -136,6 +179,58 @@ impl<P: KVPool> KVContext<P> {
             ready_len: 0,
             pending_ends: VecDeque::new(),
         })
+    }
+
+    /// Transfer only completed private KV; no pending append may be published.
+    pub(crate) fn take_prefix(&mut self, positions: Range<usize>) -> ContextResult<P::PrefixState> {
+        if self.state.is_none()
+            || self.is_pending()
+            || positions.is_empty()
+            || positions.end > self.ready_len
+        {
+            return Err(KVContextError::InvalidState(
+                "prefix is not idle committed KV".into(),
+            ));
+        }
+        Ok(self
+            .pool
+            .take_prefix(self.state.as_mut().unwrap(), positions)?)
+    }
+
+    /// Install a canonical cached prefix. Existing committed progress is unchanged;
+    /// an empty context starts at the hit length. Caller drops old protection outside tree locks.
+    pub(crate) fn bind_prefix(
+        &mut self,
+        segments: &[&P::PrefixState],
+        lease: &PrefixLease,
+    ) -> ContextResult<Option<PrefixLease>> {
+        let len = lease.token_len();
+        if self.state.is_none()
+            || self.is_pending()
+            || len == 0
+            || len > self.max_seq_len()
+            || (self.ready_len != 0 && len > self.ready_len)
+        {
+            return Err(KVContextError::InvalidState(
+                "invalid cached prefix binding".into(),
+            ));
+        }
+        let old = self
+            .pool
+            .bind_prefix(self.state.as_mut().unwrap(), segments, lease)?;
+        self.ready_len = self.ready_len.max(len);
+        Ok(old)
+    }
+
+    /// A failed ownership transfer cannot leave a runnable context with unowned slots.
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(state) = self.state.take() {
+            self.pool.release_state(state);
+        }
+    }
+
+    pub(crate) fn uses_pool(&self, pool: &Arc<P>) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
     }
 
     /// Read-only backend state for KVPool implementations.
