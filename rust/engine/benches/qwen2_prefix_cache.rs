@@ -6,7 +6,7 @@
 //! Repeat with --prefix-tokens 0/3584, --output-tokens 64, --mode serial or --cuda-graph.
 //! Each sample creates a fresh Runner/cache, retaining model/JIT/workspace/Graph caches.
 //! Cold samples start with empty KV; warm samples seed ONLY the common prefix outside
-//! timing. All independent requests are admitted before yielding; suffix token IDs
+//! timing. All independent requests are admitted without awaiting; suffix token IDs
 //! differ at the first suffix position. Model counters verify saved work and batching.
 //! Wall time includes ingress, tokenization, generation and streamed text delivery,
 //! excluding Runner setup, prefix seeding and shutdown. No HTTP, sustained arrivals
@@ -344,7 +344,7 @@ async fn sample<T: WeightElement + ElementType>(
             c"prefix_cache.warm"
         });
         let start = Instant::now();
-        // Admission is synchronous: the full cohort is queued before Runner executes it.
+        // Enqueue without awaiting; the forward-count check rejects split cohorts.
         let output = async {
             let streams = requests
                 .into_iter()

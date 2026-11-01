@@ -273,7 +273,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             && config.hidden_size % 32 == 0
             && config.intermediate_size % 32 == 0
             && config.vocab_size > 0
-            && config.vocab_size <= 256 * 1024
+            && config.vocab_size <= kernels::ARGMAX_TILE * kernels::ARGMAX_FINAL_TILE
             && config.rms_norm_eps.is_finite()
             && config.rms_norm_eps > 0.0
             && config.rope_theta.is_finite()
@@ -1318,19 +1318,25 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             recorder,
         )?;
         let _argmax = crate::profiling::ScopedRange::new(c"qwen2.argmax");
-        let blocks = self.config.vocab_size.div_ceil(256);
-        recorder.record(kernels::argmax_blocks(
-            (&mut scratch.maxima).partition([1, 1]),
-            (&mut scratch.indices).partition([1, 1]),
-            &scratch.logits,
-            self.config.vocab_size as i32,
-        ))?;
-        recorder.record(kernels::argmax_final(
-            (&mut scratch.winner).partition([1]),
-            &scratch.maxima,
-            &scratch.indices,
-            blocks as i32,
-        ))?;
+        let blocks = self.config.vocab_size.div_ceil(kernels::ARGMAX_TILE);
+        recorder.record(
+            kernels::argmax_blocks(
+                (&mut scratch.maxima).partition([1, 1]),
+                (&mut scratch.indices).partition([1, 1]),
+                &scratch.logits,
+                self.config.vocab_size as i32,
+            )
+            .generics(vec![kernels::ARGMAX_TILE.to_string()]),
+        )?;
+        recorder.record(
+            kernels::argmax_final(
+                (&mut scratch.winner).partition([1]),
+                &scratch.maxima,
+                &scratch.indices,
+                blocks as i32,
+            )
+            .generics(vec![kernels::ARGMAX_FINAL_TILE.to_string()]),
+        )?;
         Ok(())
     }
 
@@ -2274,6 +2280,82 @@ mod tests {
     use cutile::cuda_core::Device;
     use cutile::tensor::{IntoPartition, Unpartition};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn argmax_larger_tiles_preserve_winners_and_ties() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let readbacks = ReadbackCache::default();
+        for vocab in [1, 255, 256, 257, 4095, 4096, 4097, 151936, 262144] {
+            // Distinct maxima, ties crossing tile boundaries, all -inf, and NaNs.
+            let mut values = vec![-1.0f32; 4 * vocab];
+            values[vocab - 1] = 7.0;
+            let tied = 255.min(vocab - 1);
+            values[vocab + tied] = 9.0;
+            values[2 * vocab - 1] = 9.0;
+            values[2 * vocab..3 * vocab].fill(f32::NEG_INFINITY);
+            values[3 * vocab..].fill(f32::NAN);
+            let values = Arc::new(values);
+            let mut reference = None;
+            for (tile, final_tile) in [
+                (256, 1024),
+                (kernels::ARGMAX_TILE, kernels::ARGMAX_FINAL_TILE),
+            ] {
+                let blocks = vocab.div_ceil(tile);
+                let actual = with_context(|exec| {
+                    value((|| -> Result<Readback<i32>, ModelError> {
+                        // SAFETY: each output is fully written before its readback;
+                        // execution leases retain all tensors until outer completion.
+                        unsafe {
+                            let logits = api::copy_host_vec_to_device(&values)
+                                .execute(exec)?
+                                .reshape(&[4, vocab])?;
+                            let mut maxima = Tensor::<f32>::uninitialized(4 * blocks)
+                                .execute(exec)?
+                                .assume_init()
+                                .reshape(&[4, blocks])?;
+                            let mut indices = Tensor::<i32>::uninitialized(4 * blocks)
+                                .execute(exec)?
+                                .assume_init()
+                                .reshape(&[4, blocks])?;
+                            let mut winner =
+                                Tensor::<i32>::uninitialized(4).execute(exec)?.assume_init();
+                            kernels::argmax_blocks(
+                                (&mut maxima).partition([1, 1]),
+                                (&mut indices).partition([1, 1]),
+                                &logits,
+                                vocab as i32,
+                            )
+                            .generics(vec![tile.to_string()])
+                            .execute(exec)?;
+                            kernels::argmax_final(
+                                (&mut winner).partition([1]),
+                                &maxima,
+                                &indices,
+                                blocks as i32,
+                            )
+                            .generics(vec![final_tile.to_string()])
+                            .execute(exec)?;
+                            Ok(readbacks.enqueue(winner, exec)?)
+                        }
+                    })())
+                })
+                .schedule(&policy)?
+                .await??;
+                assert_eq!(
+                    &actual.as_slice()[..3],
+                    &[(vocab - 1) as i32, tied as i32, 0]
+                );
+                assert_eq!(actual.as_slice()[3], i32::MAX, "all-NaN logits must fail");
+                if let Some(expected) = &reference {
+                    assert_eq!(actual.as_slice(), expected, "vocab={vocab}");
+                } else {
+                    reference = Some(actual.as_slice().to_vec());
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Small deterministic weights exercise the full multi-layer/GQA batch path without HF files.
     async fn tiny_model(policy: &Arc<dyn SchedulingPolicy>) -> Result<Qwen2Engine, ModelError> {

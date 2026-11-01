@@ -11,6 +11,7 @@ use cutile::{
 
 use super::{
     engine::Qwen2Config,
+    kernels::ARGMAX_TILE,
     metrics::{next_instance, WorkspaceInstruments, WorkspaceMetrics},
 };
 use crate::ModelError;
@@ -145,7 +146,7 @@ impl<T: DType> WorkspacePool<T> {
         let k = config.num_key_value_heads * 64;
         let i = config.intermediate_size;
         let vocab = config.vocab_size;
-        let blocks = vocab.div_ceil(256);
+        let blocks = vocab.div_ceil(ARGMAX_TILE);
         let (all_floats, integers) = element_counts(rows, batch_size, config)?;
         let floats = batch_size * (vocab + blocks)
             + decode_partial_elements(rows, batch_size, config).unwrap();
@@ -266,12 +267,7 @@ impl<T: DType> WorkspacePool<T> {
                 &mut float_offset,
                 &[batch_size, vocab],
             ),
-            maxima: handle(
-                &lease,
-                &workspace.floats,
-                &mut float_offset,
-                &[batch_size, blocks],
-            ),
+            // Keep decode scratch addresses independent of the argmax partial count.
             decode_partials: (rows == batch_size).then(|| {
                 handle(
                     &lease,
@@ -283,6 +279,12 @@ impl<T: DType> WorkspacePool<T> {
                     ],
                 )
             }),
+            maxima: handle(
+                &lease,
+                &workspace.floats,
+                &mut float_offset,
+                &[batch_size, blocks],
+            ),
             indices: handle(
                 &lease,
                 &workspace.integers,
@@ -323,7 +325,7 @@ fn element_counts(
 ) -> Result<(usize, usize), ModelError> {
     let per_row =
         6 * config.hidden_size + 3 * config.num_key_value_heads * 64 + 3 * config.intermediate_size;
-    let blocks = config.vocab_size.div_ceil(256);
+    let blocks = config.vocab_size.div_ceil(ARGMAX_TILE);
     let invalid = || ModelError::InvalidInput("Qwen workspace shape exceeds tensor limits".into());
     if batch_size == 0 || rows < batch_size {
         return Err(invalid());
@@ -569,7 +571,7 @@ mod tests {
     fn scratch_budget_depends_on_suffix_length_not_layer_count() {
         let mut config = config();
         let (floats, integers) = element_counts(4096, 1, &config).unwrap();
-        assert_eq!((floats + integers) * 4, 334063252);
+        assert_eq!((floats + integers) * 4, 334058804);
         config.num_hidden_layers = 48;
         assert_eq!(
             element_counts(4096, 1, &config).unwrap(),
@@ -577,8 +579,11 @@ mod tests {
         );
         assert!(element_counts(usize::MAX, 1, &config).is_err());
         let (packed_floats, packed_ints) = element_counts(4096, 3, &config).unwrap();
-        let tail_bytes =
-            4 * (config.hidden_size + config.vocab_size + 2 * config.vocab_size.div_ceil(256) + 1);
+        let tail_bytes = 4
+            * (config.hidden_size
+                + config.vocab_size
+                + 2 * config.vocab_size.div_ceil(ARGMAX_TILE)
+                + 1);
         assert_eq!(
             (packed_floats + packed_ints - floats - integers) * 4,
             2 * tail_bytes
@@ -742,7 +747,7 @@ mod tests {
         let config = config();
         let pool = Arc::new(WorkspacePool::<bf16>::default());
         let (all_floats, integers) = element_counts(33, 2, &config)?;
-        let fp32 = 2 * (config.vocab_size + config.vocab_size.div_ceil(256));
+        let fp32 = 2 * (config.vocab_size + config.vocab_size.div_ceil(ARGMAX_TILE));
         let bytes = (all_floats - fp32) * 2 + (fp32 + integers) * 4;
         let mut pointer = None;
         for _ in 0..2 {

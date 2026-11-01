@@ -31,7 +31,7 @@ in [the roadmap](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01)
 | 6 | Continuous batching, chunked prefill and submission-first overlap | ✅ Fixed-cohort overlap A/B and Nsight validated; mixed arrivals pending |
 | 7 | Native BF16 Qwen; separate quantization follow-up | ✅ BF16 implemented; quantization planned |
 | 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, M/N/K tile selection, HMMA QKV/down, fusion/swizzling, split-KV and CUDA Graph | ✅ Done; current-source prefill/decode SGLang comparison and Nsight/SASS validation |
-| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ✅ Done; local routing, shared prefix KV and LRU eviction implemented |
+| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ✅ Done; local routing, shared prefix KV, LRU eviction and fixed-cohort cold/warm SGLang comparison complete |
 | 10 | Modern model architectures | ⬜ Planned |
 | 11 | Multi-GPU execution | ⬜ Planned |
 | 12 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |
@@ -88,11 +88,13 @@ are reported separately, with raw samples and frozen binaries under the ignored
 local `rust/profiling/qwen2/` directory. Numerical/lifecycle checks accompany the
 measurements; BF16 reduction/fast-math choices can alter logits and argmax selections.
 
-W8 is complete. The final comparison reruns the current source against SGLang
+W8 is complete. Its frozen final comparison measured the W8 source against SGLang
 in both eager and decode Graph modes at B1/B2/B4 and 32/4096 initial tokens.
 The complete prefill/decode tables and measurement contracts are in the
 [roadmap](roadmap.md#w8-final-current-source-benchmark-results); raw samples,
 frozen sources/binary and validation are in the local [full report](rust/profiling/qwen2/w8-final-20261101-114737/matrix/RESULTS.md).
+These static-model results predate the later Runner runtime/argmax changes and
+have not been rerun with that code.
 
 The 4K-input subset is below (Rust / SGLang, milliseconds). Parentheses show
 Rust latency reduction versus SGLang in the same execution mode:
@@ -121,6 +123,33 @@ lifecycle and exact real-model eager/Graph checks accompany the implementation.
 
 Runner-level prefix-cache benchmarks and the matched SGLang Engine comparison are
 complete; see [the roadmap results](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01). True quantization remains a separate W7 follow-up.
+
+The benchmark is restored to **two Tokio workers**, retaining optimized argmax.
+The latest requested B4 repeat remeasures **both Rust and SGLang in the same
+window**, alternating engine order. Workload: BF16, 4096 input tokens/request,
+2048 cached prefix tokens, 64 output tokens/request, overlap and CUDA Graph
+enabled, no HTTP. Values are whole-cohort milliseconds, including prefill and
+streamed text delivery, separate from model-only decode-per-step timing above.
+
+| Batch | Rust, two workers (ms) | SGLang, remeasured (ms) | Rust vs SGLang |
+| ---: | ---: | ---: | ---: |
+| 4† | 454.31 | 455.88 | ↓0.34% |
+
+Both engines use two warmups and five measured cohorts/process across three
+processes. You reported closing other external programs before this final repeat;
+a browser had been running during earlier measurements and could contend for GPU
+resources. Values are medians of process means. The difference is smaller than
+process variation: Rust means span 448.97–455.80 ms; SGLang 455.30–467.29 ms.
+The earlier several-percent B4 gap did not reproduce; this is effectively close
+on this workload, not evidence of a statistically significant Rust win. † Text
+matches for 3/4 requests, so this is a fixed-budget comparison, not output equivalence.
+
+The original short/long prefill/decode tables, cold/warm prefix-cache comparison,
+previous runtime controls and their provenance remain in the
+[roadmap](roadmap.md#latest-available-rustsglang-comparison).
+See the [latest paired B4 report](rust/profiling/qwen2/sglang-b4-recheck-20261101/RESULTS.md).
+Rust B1/B2 were not repeated in this B4 follow-up; SGLang auxiliary B1/B2 cases
+are retained to preserve its original Graph capture buckets [1,2,4].
 
 
 Graph cache counters report captures, replays, cached instances and retained

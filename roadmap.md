@@ -248,7 +248,7 @@ prerequisite week.
 | W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
 | W7 | Native BF16 Qwen, then a separate quantization path | BF16 implemented; true quantization acceptance remains separate |
 | W8 | Qwen kernel and execution optimization, beginning at 52f19b0 — Done | Prefill/decode tuning, HMMA-compatible QKV/down tiles, optional decode Graph, full matched eager/Graph SGLang matrix and separate Nsight/SASS validation |
-| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Done | Exact prefix reuse, shared KV ownership, LRU eviction and local routing implemented; performance evaluation remains separate |
+| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Done | Exact prefix reuse, shared KV ownership, LRU eviction and local routing implemented; fixed-cohort cold/warm SGLang comparison complete; sustained-arrival and routing evaluation pending |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
@@ -590,6 +590,8 @@ This unit starts at `52f19b0d734c1526a3e5be9ee23df6d00f152829`.
 
 Measured 2026-11-01 from one frozen working-tree source/binary snapshot containing
 all retained W8 optimizations, including QKV/down HMMA-compatible tile selection.
+This frozen matrix predates the later Runner runtime/argmax follow-up; it has not
+been rerun with that code. See the latest-available comparison below for coverage.
 This matrix supersedes earlier baseline/targeted timing cells; it does not merge
 measurements from different revisions. The local [full report](rust/profiling/qwen2/w8-final-20261101-114737/matrix/RESULTS.md)
 retains commands, source/binary hashes, raw samples, total latency/TPS, allocator
@@ -819,10 +821,105 @@ drain is only 4.5 µs at B1 and median 6.1 µs at B4. Original unprofiled native
 samples also bound terminal drain overhead to ≤12.9 µs across B1/B2/B4.
 Profiling markers perturb these small intervals; no scheduling change was made.
 See [stream delivery evidence and reproducible analysis](rust/profiling/qwen2/stream-delivery-confirmation-20261101/RESULTS.md).
-The prefix-cache Rust benchmark now uses two Tokio workers so stream consumption
-can proceed during Runner submission. The comparison tables above retain their
-original current-thread measurements; subsequent tuning uses the new runtime on
-both sides of each Rust A/B experiment.
+The first delivery follow-up switched the prefix-cache benchmark to two Tokio
+workers so stream consumption could proceed during Runner submission. The
+argmax A/B below uses that runtime on both sides. A later runtime experiment
+temporarily switched to current-thread Tokio; the B4 SGLang repeat restores two
+workers. Each table retains its actual measured runtime.
+
+Argmax follow-up: const-generic 4096-logit partials replace the 256-logit tiles,
+with a 64-element final reduction. Qwen needs 38 instead of 594 partials/request
+(B4: 152 instead of 2376 CTAs). Both reductions exclude padding from index ties;
+all-NaN rows produce an invalid sentinel. Workspace accounting uses the same tile
+constant, and shared decode scratch precedes argmax partials so its addresses do
+not change with argmax tiling. Supported vocabulary size remains ≤262144.
+Separate warmed node traces measure argmax at 16.43→3.89 µs/step for B1 (~76%
+lower) and 76.82→13.33 µs for B4 (~83% lower). A fresh release native A/B using
+two Tokio workers on both sides, three processes × five measured cohorts each,
+gives B1 316.65→316.66 ms, B2 350.44→350.06 ms, B4 476.86→468.54 ms for the
+warm P2048/L4096/D64 workload. All generated texts match before/after. B1/B2
+have no established e2e improvement; the observed B4 reduction is ~1.7%, with
+unlocked-clock/process variation. These are Rust-only tuning results, not an
+updated SGLang matrix. See [argmax measurements and frozen A/B artifacts](rust/profiling/qwen2/argmax-aligned-20261101/RESULTS.md).
+
+#### Latest available Rust/SGLang comparison
+
+The latest B4 follow-up remeasures both engines in the same window and restores
+two Tokio workers while retaining optimized argmax. Earlier tables remain the
+record for cases not remeasured; do not interpret their Rust cells as measurements
+of the post-argmax source. Historical cross-window references are labeled below.
+
+| Coverage | Latest available Rust measurement | SGLang measurement | Full results |
+| --- | --- | --- | --- |
+| Model-only prefill, 32/4096 tokens, B1/B2/B4, eager and Graph-enabled cohorts | Frozen W8 source, before argmax follow-up | Retained W8 matrix | [Prefill and decode tables](#w8-final-current-source-benchmark-results) |
+| Model-only decode, 32/4096 initial tokens, B1/B2/B4, eager and CUDA Graph | Frozen W8 source, before argmax follow-up | Retained W8 matrix | [Prefill and decode tables](#w8-final-current-source-benchmark-results) |
+| Runner one-output, 4096 input tokens, shared prefixes 0/2048/3584, B1/B2/B4, cold and warm | Original W9 comparison, current-thread runtime | Original W9 comparison | [Nine cold/warm rows](#w9-runnerengine-prefix-cache-comparison--2026-11-01) |
+| Runner 64-output CUDA Graph, P2048/L4096, B1/B2/B4, cold | Original W9 comparison, current-thread runtime | Original W9 comparison | [Three cold/warm rows](#w9-runnerengine-prefix-cache-comparison--2026-11-01) |
+| Runner 64-output CUDA Graph, P2048/L4096, B1/B2, warm | Earlier current-thread/two-worker runtime control with optimized argmax | Original W9 reference; auxiliary newer SGLang data retained separately | Historical table below |
+| Runner 64-output CUDA Graph, P2048/L4096, B4, warm | Latest two-worker Rust + optimized argmax | Remeasured alongside Rust | Latest paired B4 table below |
+
+**Latest paired B4 repeat.** Native BF16, L4096/P2048/D64, overlap and CUDA Graph
+enabled, 20480 usable KV slots/engine. Both engines get two warmups and five
+measured cohorts/process across three independent processes; engine order
+alternates. No profiler or agent GPU tests overlap timing. Values are medians
+of process means, in whole-cohort milliseconds including prefill and stream
+completion. Rust is restored to two Tokio workers.
+The user reports a browser was running during earlier measurements and all other
+external programs were closed before this final paired repeat. This is reported
+test context, not a GPU-utilization trace or proof of the sole cause of variation.
+
+| Batch | Rust, two workers (ms) | SGLang, remeasured (ms) | Rust latency reduction |
+| ---: | ---: | ---: | ---: |
+| 4† | 454.31 | 455.88 | ↓0.34% |
+
+The difference is smaller than observed process variation. Rust process means
+are 454.31/455.80/448.97 ms; SGLang means are 455.30/455.88/467.29 ms. The earlier
+several-percent B4 gap does not reproduce in this run; treat this as effectively
+close on the fixed workload, not a statistically significant Rust win or proof
+that every historical difference was environmental. † Text matches 3/4 requests,
+so the fixed-budget/output-equivalence limitation remains. All 30 primary B4
+cohorts pass token-work, cache-hit, completion and per-engine output checks.
+SGLang retains the original fixture list and Graph buckets [1,2,4]; B1/B2 are
+auxiliary measurements, with no new Rust counterpart in this follow-up.
+See [paired B4 commands, frozen sources/binary and raw samples](rust/profiling/qwen2/sglang-b4-recheck-20261101/RESULTS.md).
+
+**Historical single-thread experiment versus retained SGLang.** Values are whole-cohort
+wall times in milliseconds, including prefill and consumption of all 64 output
+tokens/request, not isolated decode latency. Input is 4096 tokens/request with
+2048 cached prefix tokens, native BF16, overlap and CUDA Graph enabled. Both sides
+have 20480 usable KV slots. `↑` means Rust latency is higher than retained SGLang:
+`(Rust / SGLang - 1) × 100%`.
+
+| Batch | Current-thread Rust, earlier run (ms) | Two-worker Rust, same earlier run (ms) | Retained SGLang (ms) | Current-thread Rust vs SGLang |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 321.23 | 321.57 | 303.79 | ↑5.74% |
+| 2 | 354.76 | 350.63 | 335.29 | ↑5.81% |
+| 4† | 477.20 | 474.50 | 455.42 | ↑4.78% |
+
+Rust values are medians of three process means, with two warmups and five measured
+samples/process; retained SGLang uses two warmups and three measured samples/process
+across three processes. Both Rust columns have optimized argmax and identical
+model/workspace code; runtime order alternates between repetitions. Relative to
+the two-worker control, current-thread is 0.11% lower at B1, 1.18% higher at B2,
+and 0.57% higher at B4. This run does not show a clear current-thread advantage.
+That experiment temporarily used current-thread; the benchmark is now restored
+to two workers. The earlier two-worker argmax
+A/B measured 316.66/350.06/468.54 ms after optimization; the original current-thread
+run measured 304.88/336.28/455.72 ms before it. Switching back did not restore that
+older result, so multi-thread Tokio cannot be blamed from these data. The full
+historical gap remains unisolated: a same-window old-argmax current-thread control
+is still needed, rather than declaring it purely environmental. The earlier
+argmax A/B's B4 ~1.7% reduction is separate from this runtime comparison.
+The retained W8 static-model wins, W9 prefill wins and this Runner generation gap
+measure different execution boundaries; none establishes serving-throughput parity.
+
+The runtime experiment's Rust outputs were checked against retained SGLang JSONL: B1 matches
+1/1 requests, B2 matches 2/2, and B4† matches 3/4. The marked B4 row therefore still
+compares fixed budgets with potentially different autoregressive histories, not
+equivalent outputs. Rust before/after argmax matches exactly for all measured
+cohorts. Sources: [earlier runtime control](rust/profiling/qwen2/tokio-runtime-comparison-20261101/RESULTS.md),
+[earlier argmax A/B](rust/profiling/qwen2/argmax-aligned-20261101/RESULTS.md)
+and [retained SGLang comparison](rust/profiling/qwen2/prefix-cache-comparison-20261101-143149/RESULTS.md).
 
 ### Phase C: modern model architectures (W10)
 

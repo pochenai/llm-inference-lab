@@ -1,5 +1,11 @@
 pub(super) use ops::*;
 
+/// Amortize reduction overhead; Qwen's vocabulary needs 38 partials/request.
+/// Warm 4K B1/B4: ~76%/83% less argmax GPU time in separate Nsight captures.
+pub(super) const ARGMAX_TILE: usize = 4096;
+/// Covers the supported vocabulary limit with ARGMAX_TILE-sized partials.
+pub(super) const ARGMAX_FINAL_TILE: usize = 64;
+
 /// Shared attention/position metadata is a flat i32 tensor: three integers per packed token, followed
 /// by one final packed-row index per request (not a position in its token history).
 /// Token records are [context_row, absolute_position, history_start]. RoPE uses the
@@ -1479,30 +1485,32 @@ pub(super) mod ops {
         out.store(result);
     }
 
+    /// Two-stage greedy reduction; ties select the smallest valid vocabulary index.
     #[cutile::entry()]
-    pub(super) fn argmax_blocks(
+    pub(super) fn argmax_blocks<const BLOCK: i32>(
         maxima: &mut Tensor<f32, { [1, 1] }>,
         indices: &mut Tensor<i32, { [1, 1] }>,
         logits: &Tensor<f32, { [-1, -1] }>,
         len: i32,
     ) {
         let pid = get_tile_block_id();
-        let offsets: Tile<i32, { [256] }> = iota(shape![256]);
-        let ids = offsets + (pid.1 * 256).broadcast(shape![256]);
-        let valid = lt_tile(ids, len.broadcast(shape![256]));
-        let neg: Tile<f32, { [256] }> = constant(f32::NEG_INFINITY, shape![256]);
+        let offsets: Tile<i32, { [BLOCK] }> = iota(shape![BLOCK]);
+        let ids = offsets + (pid.1 * BLOCK).broadcast(shape![BLOCK]);
+        let valid = lt_tile(ids, len.broadcast(shape![BLOCK]));
+        let neg: Tile<f32, { [BLOCK] }> = constant(f32::NEG_INFINITY, shape![BLOCK]);
         let values = select(
             valid,
             logits
-                .partition(shape![1, 256])
+                .partition(shape![1, BLOCK])
                 .load([pid.0, pid.1])
-                .reshape(shape![256]),
+                .reshape(shape![BLOCK]),
             neg,
         );
         let maximum: Tile<f32, { [1] }> = reduce_max(values, 0);
-        let big: Tile<i32, { [256] }> = constant(2147483647i32, shape![256]);
+        let big: Tile<i32, { [BLOCK] }> = constant(2147483647i32, shape![BLOCK]);
         let max_value: f32 = tile_to_scalar(maximum.reshape(shape![]));
-        let mask = eq_tile(values, max_value.broadcast(shape![256]));
+        // Padding must not win ties when NaNs/-infinity leave the maximum at -infinity.
+        let mask = valid & eq_tile(values, max_value.broadcast(shape![BLOCK]));
         let candidates = select(mask, ids, big);
         let index: Tile<i32, { [1] }> = reduce_min(candidates, 0);
         maxima.store(maximum.reshape(shape![1, 1]));
@@ -1510,33 +1518,33 @@ pub(super) mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn argmax_final(
+    pub(super) fn argmax_final<const BLOCK: i32>(
         out: &mut Tensor<i32, { [1] }>,
         maxima: &Tensor<f32, { [-1, -1] }>,
         indices: &Tensor<i32, { [-1, -1] }>,
         count: i32,
     ) {
-        let offsets: Tile<i32, { [1024] }> = iota(shape![1024]);
-        let valid = lt_tile(offsets, count.broadcast(shape![1024]));
-        let neg: Tile<f32, { [1024] }> = constant(f32::NEG_INFINITY, shape![1024]);
+        let offsets: Tile<i32, { [BLOCK] }> = iota(shape![BLOCK]);
+        let valid = lt_tile(offsets, count.broadcast(shape![BLOCK]));
+        let neg: Tile<f32, { [BLOCK] }> = constant(f32::NEG_INFINITY, shape![BLOCK]);
         let values = select(
             valid,
             maxima
-                .partition(shape![1, 1024])
+                .partition(shape![1, BLOCK])
                 .load([program_id(0), 0])
-                .reshape(shape![1024]),
+                .reshape(shape![BLOCK]),
             neg,
         );
         let maximum: Tile<f32, { [1] }> = reduce_max(values, 0);
-        let big: Tile<i32, { [1024] }> = constant(2147483647i32, shape![1024]);
+        let big: Tile<i32, { [BLOCK] }> = constant(2147483647i32, shape![BLOCK]);
         let max_value: f32 = tile_to_scalar(maximum.reshape(shape![]));
-        let mask = eq_tile(values, max_value.broadcast(shape![1024]));
+        let mask = valid & eq_tile(values, max_value.broadcast(shape![BLOCK]));
         let candidates = select(
             mask,
             indices
-                .partition(shape![1, 1024])
+                .partition(shape![1, BLOCK])
                 .load([program_id(0), 0])
-                .reshape(shape![1024]),
+                .reshape(shape![BLOCK]),
             big,
         );
         let index: Tile<i32, { [1] }> = reduce_min(candidates, 0);
