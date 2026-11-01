@@ -708,7 +708,13 @@ Large BF16 linear matrices use a finite `LinearTile` bucket (at least 128 packed
 rows: 32x128, K-reduction 64). Smaller shapes and FP32 retain prior tiles, including
 decode/LM-head matrices. Small BF16 forwards schedule Q/K/V in one launch without
 concatenating weights or allocating new outputs. Skinny decode down projections
-use bounded split-K and reuse the attention partial buffer in stream order.
+use bounded split-K and reuse the attention partial buffer in stream order. Expanded
+BF16 projections now choose tiles using M/N/K: packed M=2..15, N>=2048 and
+2K<=N<=8K use `[16,32,64]`, while single-row, skinny/vocabulary and FP32 paths
+retain their existing tiles. This reduces gate/up GPU time by about 19% in the
+B4 short-history Nsight sample and native B2/B4 decode by 5–8% in the repeated
+Graph comparison. See the local [small-M tuning report](../profiling/qwen2/decode-small-m-20261101/RESULTS.md)
+for frozen commands/results, eager/Graph validation and BF16 rounding limits.
 Linear rows are independent and may cross request boundaries;
 attention routing still checks each context separately. Masked K tails use ceiling
 iteration. This isolated blocking change reduces 4K prefill by about another 32-33%

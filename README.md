@@ -83,22 +83,28 @@ are reported separately, with raw samples and frozen binaries under the ignored
 local `rust/profiling/qwen2/` directory. Numerical/lifecycle checks accompany the
 measurements; BF16 reduction/fast-math choices can alter logits and argmax selections.
 
-The initial matched three-process matrix shows decode Graph lowers our own latency by
-about 16–25%. At 4K, Rust/SGLang Graph decode is 4.76/4.22 ms (B1), 5.40/3.95 ms
-(B2) and 6.68/4.22 ms (B4). Short B1 is close (about 1.7% slower); Graph is not generally
-faster than SGLang. The remaining GPU work motivates GQA decode packing/MMA and
-small-M linear/GEMV experiments. Those optimizations are now implemented; the initial
-figures above precede them. See the local [decode tuning report](rust/profiling/qwen2/decode-tuning-20261101/RESULTS.md)
-for isolated experiments and the new matched comparison. These are static measurements, not serving results.
-See the local [Graph comparison report](rust/profiling/qwen2/cuda-graph-20261101/RESULTS.md).
+The latest three-process Release BF16 Graph comparison adds M/N/K-based tile
+selection for expanded small-M FFN projections. Gate/up GPU time is about 19%
+lower in a separate Nsight sample; native decode improves 5–8% at B2/B4 over
+commit `1d73cf5`. The same-run decode medians are:
 
-After decode tuning, the new three-process Graph comparison reduces our own
-32-token decode latency by 6–8% and 4K-history decode by 16–31%. At 4K,
-Rust/SGLang Graph decode is 4.03/4.50 ms (B1), 4.34/4.05 ms (B2) and 4.82/4.22 ms
-(B4): B1 is faster, while B2/B4 gaps remain. These figures use fresh KV, warmed
-Release binaries and fixed 64 outputs. CPU oracles and eager/Graph equality pass;
-cross-algorithm BF16 argmax differences and the Transformers diagnostic remain
-explicit in the tuning report. Held-out quality and serving throughput are unmeasured.
+| Initial history | Batch | Rust ms/step | SGLang ms/step |
+| ---: | ---: | ---: | ---: |
+| 32 | 1 | 3.876 | 4.139 |
+| 32 | 2 | 3.597 | 3.763 |
+| 32 | 4 | 3.726 | 3.697 |
+| 4096 | 1 | 4.071 | 4.281 |
+| 4096 | 2 | 3.999 | 4.026 |
+| 4096 | 4 | 4.370 | 4.273 |
+
+B2 long-history and B4 short-history differences are within 1%; B4/4K remains
+about 2.3% slower. GPU clocks are unlocked. These static-model results use fresh
+KV, two warmups, three samples/process and fixed 64 outputs; serving throughput
+and held-out quality are unmeasured. Changing BF16 MMA tiles can change rounding
+and generated IDs. CPU oracles and exact B1/B2/B4 eager/Graph checks pass; see the
+local [small-M FFN tuning report](rust/profiling/qwen2/decode-small-m-20261101/RESULTS.md)
+for the raw comparison and numerical limits. Earlier [decode tuning](rust/profiling/qwen2/decode-tuning-20261101/RESULTS.md)
+and [Graph comparison](rust/profiling/qwen2/cuda-graph-20261101/RESULTS.md) reports retain the historical baselines.
 
 
 Graph cache counters report captures, replays, cached instances and retained

@@ -90,9 +90,12 @@ const ATTENTION_DECODE_MMA_TILE: [usize; 2] = [16, 64];
 const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
+/// Expanded small-M projections use a full MMA row tile and fewer K-loop iterations.
+/// B4 short-history Nsight: gate/up GPU time ~19% lower than [4,32,32].
+const LINEAR_EXPANDING_DECODE_TILE: [usize; 3] = [16, 32, 64];
 const LINEAR_MERGE_COLUMNS: usize = 128;
 
-/// Finite M/N buckets retain parallelism for skinny, small and FP32 matrices.
+/// Finite M/N/K buckets retain parallelism for skinny, small and FP32 matrices.
 #[derive(Clone, Copy, Debug)]
 struct LinearTile {
     rows: usize,
@@ -102,7 +105,7 @@ struct LinearTile {
 }
 
 impl LinearTile {
-    fn for_shape<T: DType>(rows: usize, columns: usize) -> Self {
+    fn for_shape<T: DType>(rows: usize, columns: usize, k: usize) -> Self {
         if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= 2048 && columns >= 512 {
             Self {
                 rows: 128,
@@ -119,6 +122,18 @@ impl LinearTile {
                 rows: 32,
                 columns: 128,
                 reduction: 64,
+                group_rows: 1,
+            }
+        } else if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && (2..LINEAR_PREFILL_TILE[0]).contains(&rows)
+            && columns >= 2048
+            && (2 * k..=8 * k).contains(&columns)
+        {
+            // FFN-sized expansion; keep single-row, skinny and vocabulary projections separate.
+            Self {
+                rows: LINEAR_EXPANDING_DECODE_TILE[0],
+                columns: LINEAR_EXPANDING_DECODE_TILE[1],
+                reduction: LINEAR_EXPANDING_DECODE_TILE[2],
                 group_rows: 1,
             }
         } else {
@@ -1119,6 +1134,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             let tile = LinearTile::for_shape::<T>(
                 scratch.x.shape()[0] as usize,
                 scratch.q.shape()[1] as usize,
+                scratch.norm.shape()[1] as usize,
             );
             let columns = (scratch.q.shape()[1] as usize).div_ceil(tile.columns)
                 + 2 * (scratch.k.shape()[1] as usize).div_ceil(tile.columns);
@@ -1315,7 +1331,11 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         // Bias-free specializations never read this existing rank-one weight.
         let bias = bias.unwrap_or_else(|| self.norm.clone());
         // Independent packed rows can share a tile even across request boundaries.
-        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        let tile = LinearTile::for_shape::<T>(
+            x.shape()[0] as usize,
+            out.shape()[1] as usize,
+            x.shape()[1] as usize,
+        );
         tracing::debug!(target: "engine::qwen2", event = "linear_dispatch", rows = x.shape()[0], columns = out.shape()[1],
             reduction = k, tile_rows = tile.rows, tile_columns = tile.columns, tile_reduction = tile.reduction,
             layout = "checkpoint");
@@ -1364,7 +1384,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         let rows = x.shape()[0] as usize;
         let columns = out.shape()[1] as usize;
         let k = x.shape()[1] as usize;
-        let tile = LinearTile::for_shape::<T>(rows, columns);
+        let tile = LinearTile::for_shape::<T>(rows, columns, k);
         let splits = if T::DTYPE == cutile::cuda_core::DTypeId::BF16
             && rows < LINEAR_PREFILL_TILE[0]
             && partials.is_some()
@@ -1424,7 +1444,11 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.up_swiglu");
-        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        let tile = LinearTile::for_shape::<T>(
+            x.shape()[0] as usize,
+            out.shape()[1] as usize,
+            x.shape()[1] as usize,
+        );
         recorder.record(
             kernels::linear_swiglu(out.partition([tile.rows, tile.columns]), x, w, gate).generics(
                 vec![
@@ -1448,7 +1472,11 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.gate_up_swiglu");
-        let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
+        let tile = LinearTile::for_shape::<T>(
+            x.shape()[0] as usize,
+            out.shape()[1] as usize,
+            x.shape()[1] as usize,
+        );
         // Two accumulators use half-width N tiles to retain the original accumulator footprint.
         let columns = tile.columns / 2;
         let mut generics = vec![
@@ -2654,33 +2682,61 @@ mod tests {
             .await?
             .with_cuda_graphs();
         let graph_cache = model.graphs.clone();
-        for pattern in ["repeated", "ramp"] {
-            let mut history: Vec<u32> = (0..4096)
-                .map(|i| 9707 + if pattern == "ramp" { i % 4096 } else { 0 })
-                .collect();
-            let mut config = model.kv_pool_config(4160)?;
-            config.max_rows = 2;
-            config.num_slots *= 2;
-            let pool = NaiveKVPool::new(config, &policy).await?;
-            let initial = pool.metrics();
-            let mut eager = KVContext::new(pool.clone())?;
-            let mut graph = KVContext::new(pool.clone())?;
-            for step in 0..64 {
-                model.graphs = None;
-                let (a, al) = model
-                    .step_with_logits(&history, &mut eager, policy.clone())
-                    .await?;
-                model.graphs = graph_cache.clone();
-                let (b, bl) = model
-                    .step_with_logits(&history, &mut graph, policy.clone())
-                    .await?;
-                assert_eq!(a, b, "{pattern}, step {step}");
-                assert_eq!(al, bl, "{pattern}, step {step}: graph changed arithmetic");
-                history.push(a);
+        for batch_size in [1, 2, 4] {
+            for pattern in ["repeated", "ramp"] {
+                let mut history: Vec<u32> = (0..4096)
+                    .map(|i| 9707 + if pattern == "ramp" { i % 4096 } else { 0 })
+                    .collect();
+                let mut config = model.kv_pool_config(4160)?;
+                config.max_rows = batch_size * 2;
+                config.num_slots *= config.max_rows;
+                let pool = NaiveKVPool::new(config, &policy).await?;
+                let initial = pool.metrics();
+                let mut eager = (0..batch_size)
+                    .map(|_| KVContext::new(pool.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut graph = (0..batch_size)
+                    .map(|_| KVContext::new(pool.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for step in 0..64 {
+                    model.graphs = None;
+                    let mut inputs: Vec<_> = eager
+                        .iter_mut()
+                        .map(|kv| ModelInput {
+                            token_ids: history.as_slice().into(),
+                            kv,
+                        })
+                        .collect();
+                    let a = model
+                        .forward_batch(&mut inputs, policy.clone(), true)
+                        .await?;
+                    model.graphs = graph_cache.clone();
+                    let mut inputs: Vec<_> = graph
+                        .iter_mut()
+                        .map(|kv| ModelInput {
+                            token_ids: history.as_slice().into(),
+                            kv,
+                        })
+                        .collect();
+                    let b = model
+                        .forward_batch(&mut inputs, policy.clone(), true)
+                        .await?;
+                    assert_eq!(
+                        a.token.as_slice(),
+                        b.token.as_slice(),
+                        "B{batch_size}, {pattern}, step {step}"
+                    );
+                    assert_eq!(
+                        a.logits.unwrap().as_slice(),
+                        b.logits.unwrap().as_slice(),
+                        "B{batch_size}, {pattern}, step {step}: graph changed arithmetic"
+                    );
+                    history.push(a.token.as_slice()[0] as u32);
+                }
+                drop(eager);
+                drop(graph);
+                assert_eq!(pool.metrics(), initial);
             }
-            eager.release();
-            graph.release();
-            assert_eq!(pool.metrics(), initial);
         }
         assert_eq!(
             model.workspace_metrics().in_use_bytes,
@@ -3235,14 +3291,15 @@ mod tests {
                     .map(|i| bf16::from_f32(i as f32 / 128.0))
                     .collect(),
             );
-            for (reduction, splits) in [
-                (32, 1),
-                (64, 1),
-                (128, 1),
-                (32, 2),
-                (32, 4),
-                (32, 8),
-                (32, 16),
+            for (tile_rows, tile_columns, reduction, splits) in [
+                (4, 32, 32, 1),
+                (4, 32, 64, 1),
+                (4, 32, 128, 1),
+                (16, 32, 64, 1),
+                (4, 32, 32, 2),
+                (4, 32, 32, 4),
+                (4, 32, 32, 8),
+                (4, 32, 32, 16),
             ] {
                 let output = with_context(|exec| {
                     value((|| -> Result<_, ModelError> {
@@ -3259,7 +3316,7 @@ mod tests {
                                 kernels::linear(
                                     api::full(f32::NAN, &[rows, columns])
                                         .execute(exec)?
-                                        .partition([4, 32]),
+                                        .partition([tile_rows, tile_columns]),
                                     input,
                                     weight,
                                     bias,
@@ -3269,8 +3326,8 @@ mod tests {
                                     "f32".into(),
                                     width.to_string(),
                                     "true".into(),
-                                    "4".into(),
-                                    "32".into(),
+                                    tile_rows.to_string(),
+                                    tile_columns.to_string(),
                                     reduction.to_string(),
                                 ])
                                 .map(|(out, ..)| out)
@@ -3368,8 +3425,8 @@ mod tests {
                     reduction: 32,
                     group_rows: 1,
                 },
-                LinearTile::for_shape::<cutile::core::bf16>(128, 4864),
-                LinearTile::for_shape::<cutile::core::bf16>(4096, 4864),
+                LinearTile::for_shape::<cutile::core::bf16>(128, 4864, 896),
+                LinearTile::for_shape::<cutile::core::bf16>(4096, 4864, 896),
             ] {
                 for has_bias in [false, true] {
                     let actual = with_context(|exec| {
@@ -4342,17 +4399,47 @@ mod tests {
     #[test]
     fn bf16_swizzle_bucket_preserves_small_narrow_and_fp32_grids() {
         use cutile::core::bf16;
-        assert_eq!(LinearTile::for_shape::<bf16>(4096, 4864).group_rows, 1);
-        assert_eq!(LinearTile::for_shape::<bf16>(8192, 4864).group_rows, 8);
-        assert_eq!(LinearTile::for_shape::<bf16>(16384, 128).group_rows, 1);
-        assert_eq!(LinearTile::for_shape::<f32>(16384, 4864).group_rows, 1);
-        let skinny = LinearTile::for_shape::<bf16>(4, 896);
+        assert_eq!(LinearTile::for_shape::<bf16>(4096, 4864, 896).group_rows, 1);
+        assert_eq!(LinearTile::for_shape::<bf16>(8192, 4864, 896).group_rows, 8);
+        assert_eq!(LinearTile::for_shape::<bf16>(16384, 128, 896).group_rows, 1);
+        assert_eq!(LinearTile::for_shape::<f32>(16384, 4864, 896).group_rows, 1);
+        let skinny = LinearTile::for_shape::<bf16>(4, 896, 4864);
         assert_eq!(skinny.decode_splits(4, 896, 4864, 36), 8);
         assert_eq!(skinny.decode_splits(4, 896, 96, 36), 1);
         assert_eq!(
-            LinearTile::for_shape::<bf16>(4, 4864).decode_splits(4, 4864, 896, 36),
+            LinearTile::for_shape::<bf16>(4, 4864, 896).decode_splits(4, 4864, 896, 36),
             1
         );
+    }
+
+    #[test]
+    fn expanded_decode_tiles_follow_m_n_k_buckets() {
+        use cutile::core::bf16;
+        for rows in [2, 4, 15] {
+            let tile = LinearTile::for_shape::<bf16>(rows, 4864, 896);
+            assert_eq!(
+                [tile.rows, tile.columns, tile.reduction],
+                LINEAR_EXPANDING_DECODE_TILE
+            );
+        }
+        for (rows, columns, k) in [
+            (1, 4864, 896),
+            (4, 896, 896),
+            (4, 896, 4864),
+            (4, 151936, 896),
+            (4, 2047, 896),
+            (4, 4864, 32),
+        ] {
+            let tile = LinearTile::for_shape::<bf16>(rows, columns, k);
+            assert_eq!([tile.rows, tile.columns, tile.reduction], [4, 32, 32]);
+        }
+        let prefill = LinearTile::for_shape::<bf16>(16, 4864, 896);
+        assert_eq!(
+            [prefill.rows, prefill.columns, prefill.reduction],
+            [16, 64, 32]
+        );
+        let fp32 = LinearTile::for_shape::<f32>(4, 4864, 896);
+        assert_eq!([fp32.rows, fp32.columns, fp32.reduction], [4, 32, 32]);
     }
 
     #[test]
@@ -4694,8 +4781,8 @@ mod tests {
         );
         let cache = ReadbackCache::default();
         for tile in [
-            LinearTile::for_shape::<bf16>(512, 4864),
-            LinearTile::for_shape::<bf16>(4096, 4864),
+            LinearTile::for_shape::<bf16>(512, 4864, 896),
+            LinearTile::for_shape::<bf16>(4096, 4864, 896),
         ] {
             let actual = with_context(|exec| {
                 value((|| -> Result<_, ModelError> {
