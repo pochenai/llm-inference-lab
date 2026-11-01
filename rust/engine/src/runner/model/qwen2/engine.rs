@@ -90,9 +90,9 @@ const ATTENTION_DECODE_MMA_TILE: [usize; 2] = [16, 64];
 const MIN_TILED_PREFILL_QUERIES: usize = 64;
 const LINEAR_PREFILL_TILE: [usize; 2] = [16, 64];
 const LINEAR_DECODE_TILE: [usize; 2] = [4, 32];
-/// Expanded small-M projections use a full MMA row tile and fewer K-loop iterations.
-/// B4 short-history Nsight: gate/up GPU time ~19% lower than [4,32,32].
-const LINEAR_EXPANDING_DECODE_TILE: [usize; 3] = [16, 32, 64];
+/// Packed QKV and FFN expansion/compression share this tile; square O/vocabulary keep defaults.
+/// Mechanism, measured gains and references are documented on the projection kernels.
+const LINEAR_MULTI_ROW_DECODE_TILE: [usize; 3] = [16, 32, 64];
 const LINEAR_MERGE_COLUMNS: usize = 128;
 
 /// Finite M/N/K buckets retain parallelism for skinny, small and FP32 matrices.
@@ -126,14 +126,14 @@ impl LinearTile {
             }
         } else if T::DTYPE == cutile::cuda_core::DTypeId::BF16
             && (2..LINEAR_PREFILL_TILE[0]).contains(&rows)
-            && columns >= 2048
-            && (2 * k..=8 * k).contains(&columns)
+            && ((columns >= 2048 && (2 * k..=8 * k).contains(&columns))
+                || (k >= 2048 && (2 * columns..=8 * columns).contains(&k)))
         {
-            // FFN-sized expansion; keep single-row, skinny and vocabulary projections separate.
+            // FFN expansion/compression; retain the single-row, square and vocabulary paths.
             Self {
-                rows: LINEAR_EXPANDING_DECODE_TILE[0],
-                columns: LINEAR_EXPANDING_DECODE_TILE[1],
-                reduction: LINEAR_EXPANDING_DECODE_TILE[2],
+                rows: LINEAR_MULTI_ROW_DECODE_TILE[0],
+                columns: LINEAR_MULTI_ROW_DECODE_TILE[1],
+                reduction: LINEAR_MULTI_ROW_DECODE_TILE[2],
                 group_rows: 1,
             }
         } else {
@@ -150,6 +150,24 @@ impl LinearTile {
             }
         }
     }
+    /// Packed QKV has one combined grid; its small-input tile differs from square O.
+    fn for_packed_qkv<T: DType>(rows: usize, columns: usize, k: usize) -> Self {
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16
+            && (2..LINEAR_PREFILL_TILE[0]).contains(&rows)
+            && columns >= 512
+            && k >= 512
+        {
+            Self {
+                rows: LINEAR_MULTI_ROW_DECODE_TILE[0],
+                columns: LINEAR_MULTI_ROW_DECODE_TILE[1],
+                reduction: LINEAR_MULTI_ROW_DECODE_TILE[2],
+                group_rows: 1,
+            }
+        } else {
+            Self::for_shape::<T>(rows, columns, k)
+        }
+    }
+
     /// Bound K partitions by work per CTA and available SM parallelism.
     fn decode_splits(&self, rows: usize, columns: usize, k: usize, sm_count: usize) -> usize {
         const MIN_BLOCKS_PER_SPLIT: usize = 4;
@@ -1131,7 +1149,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             && (scratch.x.shape()[0] as usize) < LINEAR_PREFILL_TILE[0]
         {
             let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.qkv");
-            let tile = LinearTile::for_shape::<T>(
+            let tile = LinearTile::for_packed_qkv::<T>(
                 scratch.x.shape()[0] as usize,
                 scratch.q.shape()[1] as usize,
                 scratch.norm.shape()[1] as usize,
@@ -3191,77 +3209,85 @@ mod tests {
                     )
                 })
                 .collect();
-            let actual = with_context(|exec| {
-                value((|| -> Result<_, ModelError> {
-                    // SAFETY: output scatters and readbacks share exec; all buffers remain leased.
-                    unsafe {
-                        let input = api::copy_host_vec_to_device(&x)
-                            .execute(exec)?
-                            .reshape(&[rows, width])?;
-                        let mut w = Vec::new();
-                        let mut bias = Vec::new();
-                        let mut out = Vec::new();
-                        for part in 0..3 {
-                            w.push(
-                                api::copy_host_vec_to_device(&weights[part])
-                                    .execute(exec)?
-                                    .reshape(&[columns[part], width])?,
-                            );
-                            bias.push(api::copy_host_vec_to_device(&biases[part]).execute(exec)?);
-                            out.push(
-                                api::full(bf16::from_f32(f32::NAN), &[rows, columns[part]])
-                                    .execute(exec)?,
-                            );
+            for (tile_rows, tile_columns, tile_k) in [(4usize, 32usize, 32usize), (16, 32, 64)] {
+                let actual = with_context(|exec| {
+                    value((|| -> Result<_, ModelError> {
+                        // SAFETY: output scatters and readbacks share exec; all buffers remain leased.
+                        unsafe {
+                            let input = api::copy_host_vec_to_device(&x)
+                                .execute(exec)?
+                                .reshape(&[rows, width])?;
+                            let mut w = Vec::new();
+                            let mut bias = Vec::new();
+                            let mut out = Vec::new();
+                            for part in 0..3 {
+                                w.push(
+                                    api::copy_host_vec_to_device(&weights[part])
+                                        .execute(exec)?
+                                        .reshape(&[columns[part], width])?,
+                                );
+                                bias.push(
+                                    api::copy_host_vec_to_device(&biases[part]).execute(exec)?,
+                                );
+                                out.push(
+                                    api::full(bf16::from_f32(f32::NAN), &[rows, columns[part]])
+                                        .execute(exec)?,
+                                );
+                            }
+                            kernels::qkv_decode(
+                                out[0].device_pointer(),
+                                out[1].device_pointer(),
+                                out[2].device_pointer(),
+                                &input,
+                                &w[0],
+                                &w[1],
+                                &w[2],
+                                &bias[0],
+                                &bias[1],
+                                &bias[2],
+                            )
+                            .generics(vec![
+                                "bf16".into(),
+                                width.to_string(),
+                                tile_rows.to_string(),
+                                tile_columns.to_string(),
+                                tile_k.to_string(),
+                            ])
+                            .grid((
+                                rows.div_ceil(tile_rows) as u32,
+                                columns
+                                    .iter()
+                                    .map(|n| n.div_ceil(tile_columns))
+                                    .sum::<usize>() as u32,
+                                1,
+                            ))
+                            .execute(exec)?;
+                            Ok(out
+                                .into_iter()
+                                .map(|out| cache.enqueue(out, exec))
+                                .collect::<Result<Vec<_>, _>>()?)
                         }
-                        kernels::qkv_decode(
-                            out[0].device_pointer(),
-                            out[1].device_pointer(),
-                            out[2].device_pointer(),
-                            &input,
-                            &w[0],
-                            &w[1],
-                            &w[2],
-                            &bias[0],
-                            &bias[1],
-                            &bias[2],
-                        )
-                        .generics(vec![
-                            "bf16".into(),
-                            width.to_string(),
-                            "4".into(),
-                            "32".into(),
-                            "32".into(),
-                        ])
-                        .grid((
-                            rows.div_ceil(4) as u32,
-                            columns.iter().map(|n| n.div_ceil(32)).sum::<usize>() as u32,
-                            1,
-                        ))
-                        .execute(exec)?;
-                        Ok(out
-                            .into_iter()
-                            .map(|out| cache.enqueue(out, exec))
-                            .collect::<Result<Vec<_>, _>>()?)
+                    })())
+                })
+                .schedule(&policy)?
+                .await??;
+                for (part, actual) in actual.iter().enumerate() {
+                    for (index, value) in actual.as_slice().iter().enumerate() {
+                        let row = index / columns[part];
+                        let column = index % columns[part];
+                        let sum = (0..width)
+                            .map(|k| {
+                                x[row * width + k].to_f32()
+                                    * weights[part][column * width + k].to_f32()
+                            })
+                            .sum::<f32>();
+                        let expected = bf16::from_f32(sum + biases[part][column].to_f32()).to_f32();
+                        assert_eq!(
+                            value.to_f32(),
+                            expected,
+                            "part={part}, rows={rows}, index={index}"
+                        );
                     }
-                })())
-            })
-            .schedule(&policy)?
-            .await??;
-            for (part, actual) in actual.iter().enumerate() {
-                for (index, value) in actual.as_slice().iter().enumerate() {
-                    let row = index / columns[part];
-                    let column = index % columns[part];
-                    let sum = (0..width)
-                        .map(|k| {
-                            x[row * width + k].to_f32() * weights[part][column * width + k].to_f32()
-                        })
-                        .sum::<f32>();
-                    let expected = bf16::from_f32(sum + biases[part][column].to_f32()).to_f32();
-                    assert_eq!(
-                        value.to_f32(),
-                        expected,
-                        "part={part}, rows={rows}, index={index}"
-                    );
                 }
             }
         }
@@ -3296,6 +3322,10 @@ mod tests {
                 (4, 32, 64, 1),
                 (4, 32, 128, 1),
                 (16, 32, 64, 1),
+                (16, 32, 64, 2),
+                (16, 32, 64, 4),
+                (16, 32, 64, 8),
+                (16, 32, 64, 16),
                 (4, 32, 32, 2),
                 (4, 32, 32, 4),
                 (4, 32, 32, 8),
@@ -3342,14 +3372,14 @@ mod tests {
                                     .generics(vec![
                                         "bf16".into(),
                                         width.to_string(),
-                                        "4".into(),
-                                        "32".into(),
+                                        tile_rows.to_string(),
+                                        tile_columns.to_string(),
                                         reduction.to_string(),
                                         splits.to_string(),
                                     ])
                                     .grid((
-                                        rows.div_ceil(4) as u32,
-                                        columns.div_ceil(32) as u32,
+                                        rows.div_ceil(tile_rows) as u32,
+                                        columns.div_ceil(tile_columns) as u32,
                                         splits as u32,
                                     ))
                                     .execute(exec)?;
@@ -4413,19 +4443,26 @@ mod tests {
     }
 
     #[test]
-    fn expanded_decode_tiles_follow_m_n_k_buckets() {
+    fn multi_row_decode_tiles_follow_projection_shapes() {
         use cutile::core::bf16;
         for rows in [2, 4, 15] {
-            let tile = LinearTile::for_shape::<bf16>(rows, 4864, 896);
+            for (columns, k) in [(4864, 896), (896, 4864)] {
+                let tile = LinearTile::for_shape::<bf16>(rows, columns, k);
+                assert_eq!(
+                    [tile.rows, tile.columns, tile.reduction],
+                    LINEAR_MULTI_ROW_DECODE_TILE
+                );
+            }
+            let qkv = LinearTile::for_packed_qkv::<bf16>(rows, 896, 896);
             assert_eq!(
-                [tile.rows, tile.columns, tile.reduction],
-                LINEAR_EXPANDING_DECODE_TILE
+                [qkv.rows, qkv.columns, qkv.reduction],
+                LINEAR_MULTI_ROW_DECODE_TILE
             );
         }
         for (rows, columns, k) in [
             (1, 4864, 896),
             (4, 896, 896),
-            (4, 896, 4864),
+            (1, 896, 4864),
             (4, 151936, 896),
             (4, 2047, 896),
             (4, 4864, 32),
@@ -4433,6 +4470,15 @@ mod tests {
             let tile = LinearTile::for_shape::<bf16>(rows, columns, k);
             assert_eq!([tile.rows, tile.columns, tile.reduction], [4, 32, 32]);
         }
+        for (rows, columns, k) in [(1, 896, 896), (4, 128, 128), (4, 511, 896)] {
+            let tile = LinearTile::for_packed_qkv::<bf16>(rows, columns, k);
+            assert_eq!([tile.rows, tile.columns, tile.reduction], [4, 32, 32]);
+        }
+        let fp32_qkv = LinearTile::for_packed_qkv::<f32>(4, 896, 896);
+        assert_eq!(
+            [fp32_qkv.rows, fp32_qkv.columns, fp32_qkv.reduction],
+            [4, 32, 32]
+        );
         let prefill = LinearTile::for_shape::<bf16>(16, 4864, 896);
         assert_eq!(
             [prefill.rows, prefill.columns, prefill.reduction],

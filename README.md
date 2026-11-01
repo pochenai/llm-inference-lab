@@ -11,11 +11,13 @@ streaming greedy generation, sessions, reusable scratch and metrics. Packed GPU
 batches support ragged prefill/decode, continuous batching, chunked prefill and
 one-round submission-first overlap. Native BF16 is implemented.
 
-W8 groups the real-model kernel/execution optimizations starting at `52f19b0`:
+W8 is Done. It groups the real-model kernel/execution optimizations starting at `52f19b0`:
 KV-tile/GQA reuse, shape-based tile-size selection, fused operators, CTA traversal swizzling, split-KV decode
-and optional Qwen decode CUDA Graphs. Measurements distinguish eager and Graph
+and optional Qwen decode CUDA Graphs. Multi-row BF16 projection tuning uses
+Tensor Core-compatible tile shapes; generated SASS confirms the QKV HMMA path.
+Measurements distinguish eager and Graph
 modes; neither static-model latency nor fixed-cohort overlap establishes serving
-throughput. Radix prefix reuse/routing now starts at W9; later units shift by one.
+throughput. Next is W9 radix prefix reuse, shared KV ownership and cache-aware routing.
 
 | Week / unit | Brief content | Status |
 | --- | --- | --- |
@@ -26,14 +28,13 @@ throughput. Radix prefix reuse/routing now starts at W9; later units shift by on
 | 5 | Qwen2.5-0.5B-Instruct: operators, reference checks, scratch reuse, metrics and benchmark | ✅ Done |
 | 6 | Continuous batching, chunked prefill and submission-first overlap | ✅ Fixed-cohort overlap A/B and Nsight validated; mixed arrivals pending |
 | 7 | Native BF16 Qwen; separate quantization follow-up | ✅ BF16 implemented; quantization planned |
-| 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, shape-based tile-size selection, kernel fusion, CTA traversal swizzling, split-KV decode and CUDA Graph | 🚧 Kernels/Graph validated; SGLang Graph performance gap remains |
-| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Planned |
-| 10 | Speculative decoding | ⬜ Planned |
-| 11 | Modern model architectures | ⬜ Planned |
-| 12 | Multi-GPU execution | ⬜ Planned |
-| 13 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |
-| 14 | Routing and serving | ⬜ Planned |
-| 15 | End-to-end synthesis | ⬜ Planned |
+| 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, M/N/K tile selection, HMMA QKV/down, fusion/swizzling, split-KV and CUDA Graph | ✅ Done; current-source prefill/decode SGLang comparison and Nsight/SASS validation |
+| 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ⬜ Next |
+| 10 | Modern model architectures | ⬜ Planned |
+| 11 | Multi-GPU execution | ⬜ Planned |
+| 12 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |
+| 13 | Routing and serving | ⬜ Planned |
+| 14 | End-to-end synthesis | ⬜ Planned |
 
 
 ## Current baseline and next experiment
@@ -48,7 +49,7 @@ throughput. Radix prefix reuse/routing now starts at W9; later units shift by on
   reports prefill/decode latency, tokens/s, scratch ownership and CUDA-pool peaks.
   See the [engine guide](rust/engine/README.md) for runnable commands.
 
-## W8: Qwen kernel and execution optimization
+## W8: Qwen kernel and execution optimization — Done
 
 This unit begins with commit `52f19b0d734c1526a3e5be9ee23df6d00f152829`.
 It covers multi-query BF16 prefill attention MMA, K/V tile reuse across queries
@@ -83,28 +84,39 @@ are reported separately, with raw samples and frozen binaries under the ignored
 local `rust/profiling/qwen2/` directory. Numerical/lifecycle checks accompany the
 measurements; BF16 reduction/fast-math choices can alter logits and argmax selections.
 
-The latest three-process Release BF16 Graph comparison adds M/N/K-based tile
-selection for expanded small-M FFN projections. Gate/up GPU time is about 19%
-lower in a separate Nsight sample; native decode improves 5–8% at B2/B4 over
-commit `1d73cf5`. The same-run decode medians are:
+W8 is complete. The final comparison reruns the current source against SGLang
+in both eager and decode Graph modes at B1/B2/B4 and 32/4096 initial tokens.
+The complete prefill/decode tables and measurement contracts are in the
+[roadmap](roadmap.md#w8-final-current-source-benchmark-results); raw samples,
+frozen sources/binary and validation are in the local [full report](rust/profiling/qwen2/w8-final-20261101-114737/matrix/RESULTS.md).
 
-| Initial history | Batch | Rust ms/step | SGLang ms/step |
+The 4K-input subset is below (Rust / SGLang, milliseconds). Parentheses show
+Rust latency reduction versus SGLang in the same execution mode:
+`(SGLang - Rust) / SGLang × 100%`.
+
+| Batch | Eager prefill ms | Eager decode ms/step | CUDA Graph decode ms/step |
 | ---: | ---: | ---: | ---: |
-| 32 | 1 | 3.876 | 4.139 |
-| 32 | 2 | 3.597 | 3.763 |
-| 32 | 4 | 3.726 | 3.697 |
-| 4096 | 1 | 4.071 | 4.281 |
-| 4096 | 2 | 3.999 | 4.026 |
-| 4096 | 4 | 4.370 | 4.273 |
+| 1 | 90.93 / 95.56 (↓4.8%) | 5.665 / 7.266 (↓22.0%) | 4.151 / 4.335 (↓4.2%) |
+| 2 | 175.92 / 185.42 (↓5.1%) | 5.528 / 7.934 (↓30.3%) | 3.799 / 4.116 (↓7.7%) |
+| 4 | 344.80 / 377.92 (↓8.8%) | 5.563 / 8.253 (↓32.6%) | 4.221 / 4.297 (↓1.8%) |
 
-B2 long-history and B4 short-history differences are within 1%; B4/4K remains
-about 2.3% slower. GPU clocks are unlocked. These static-model results use fresh
-KV, two warmups, three samples/process and fixed 64 outputs; serving throughput
-and held-out quality are unmeasured. Changing BF16 MMA tiles can change rounding
-and generated IDs. CPU oracles and exact B1/B2/B4 eager/Graph checks pass; see the
-local [small-M FFN tuning report](rust/profiling/qwen2/decode-small-m-20261101/RESULTS.md)
-for the raw comparison and numerical limits. Earlier [decode tuning](rust/profiling/qwen2/decode-tuning-20261101/RESULTS.md)
-and [Graph comparison](rust/profiling/qwen2/cuda-graph-20261101/RESULTS.md) reports retain the historical baselines.
+Rust uses optimized release code; both engines use BF16, two warmups, three measured
+samples per process and three independent process repetitions. Modes are compared separately.
+Graph replay accelerates decode; prefill remains eager. Clocks are unlocked; these
+static-model results do not establish serving throughput or generation quality.
+
+The final small-M tuning uses Tensor Core-compatible tiles for packed QKV and
+split-K down, selected through private M/N/K policies. QKV SASS changes from SIMT
+to `HMMA.16816.F32.BF16`; independent profiles lower QKV GPU time about 34% and
+down+merge about 15%, with no new kernel or scratch Tensor. The earlier isolated
+[B4/4K experiment](rust/profiling/qwen2/decode-b4-4k-20261101-110247/RESULTS.md)
+records its own 5.1% decode wall-time improvement, hardware counters and rejected
+candidates. That targeted percentage is separate from the final matrix above.
+BF16 reduction/tile changes may alter logits and generated IDs; CPU/operator,
+lifecycle and exact real-model eager/Graph checks accompany the implementation.
+
+Next: W9 radix prefix matching, shared computed-KV ownership/reclamation and
+cache-aware routing. True quantization remains a separate W7 follow-up.
 
 
 Graph cache counters report captures, replays, cached instances and retained
@@ -115,6 +127,7 @@ Radix caching/routing is W9; true quantization remains a separate W7 follow-up.
 
 ## Future plans
 
+- [Speculative decoding](roadmap.md#speculative-decoding-deferred): deferred; no fixed week or current acceptance requirement.
 - RDMA
 - CoW for forked Conversation
 - Local LLM like [Strata](https://github.com/Niko1221/Strata)

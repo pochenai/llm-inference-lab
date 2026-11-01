@@ -704,17 +704,25 @@ uses --profile --profile-activities CUDA_PROFILER --profile-stage prefill under
 nsys --capture-range=cudaProfilerApi --capture-range-end=stop. Prewarm the same shape.
 
 
-Large BF16 linear matrices use a finite `LinearTile` bucket (at least 128 packed
-rows: 32x128, K-reduction 64). Smaller shapes and FP32 retain prior tiles, including
-decode/LM-head matrices. Small BF16 forwards schedule Q/K/V in one launch without
-concatenating weights or allocating new outputs. Skinny decode down projections
-use bounded split-K and reuse the attention partial buffer in stream order. Expanded
-BF16 projections now choose tiles using M/N/K: packed M=2..15, N>=2048 and
-2K<=N<=8K use `[16,32,64]`, while single-row, skinny/vocabulary and FP32 paths
-retain their existing tiles. This reduces gate/up GPU time by about 19% in the
-B4 short-history Nsight sample and native B2/B4 decode by 5–8% in the repeated
-Graph comparison. See the local [small-M tuning report](../profiling/qwen2/decode-small-m-20261101/RESULTS.md)
-for frozen commands/results, eager/Graph validation and BF16 rounding limits.
+Large BF16 linear matrices use finite `LinearTile` buckets (at least 128 packed
+rows: 32x128, K-reduction 64). Small BF16 forwards schedule Q/K/V in one launch
+without concatenating weights or allocating new outputs. For packed M=2..15 and
+input/query widths>=512, `LinearTile::for_packed_qkv` selects `[16,32,64]`;
+ordinary square O and vocabulary projections retain their prior tiles.
+FFN expansion/compression uses the same tile when the larger dimension>=2048
+and the aspect ratio is between 2 and 8. Down retains bounded split-K and reuses
+the attention partial buffer in stream order. Single-row and FP32 paths keep
+their original dispatch; benchmark prefill rows>=16 use the existing buckets.
+
+The source-level `mma` operation does not guarantee Tensor Core execution:
+Nsight Compute/SASS shows no HMMA for the former M=4 QKV specialization and
+`HMMA.16816.F32.BF16` for M=16. Achieved occupancy remains near 11% in that
+sample. Separate Systems traces show about 34% lower QKV GPU time and 15%
+lower down+merge time; native B4/4K decode improves 5.1% in six-process comparison.
+See the local [B4/4K tuning report](../profiling/qwen2/decode-b4-4k-20261101-110247/RESULTS.md)
+for frozen commands, rejected candidates, numerical limits and full validation.
+The [earlier FFN tuning report](../profiling/qwen2/decode-small-m-20261101/RESULTS.md)
+preserves its independent gate/up measurements.
 Linear rows are independent and may cross request boundaries;
 attention routing still checks each context separately. Masked K tails use ceiling
 iteration. This isolated blocking change reduces 4K prefill by about another 32-33%

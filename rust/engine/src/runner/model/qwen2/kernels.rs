@@ -145,6 +145,8 @@ pub(super) mod ops {
 
     /// Shared projection math; epilogues retain their own activation-dtype rounding.
     /// Callers reshape concrete results to their symbolic tile shape for cuTile 0.4.
+    /// Partition loads zero-pad out-of-bounds rows: BM=16 can compute four valid rows
+    /// without expanding the input Tensor; each epilogue masks invalid output rows.
     fn project_tile<
         T: ElementType,
         const K: i32,
@@ -219,6 +221,16 @@ pub(super) mod ops {
 
     /// One skinny QKV launch schedules all output tiles together without concatenating weights.
     /// Qwen decode: 28 Q + 4 K + 4 V CTAs share one grid, instead of three underfilled grids.
+    /// For small BF16 batches, [BM,BN,BK]=[16,32,64] generates HMMA; the former
+    /// [4,32,32] generated SIMT here. Zero-padded loads and masked stores keep batch=4.
+    /// 4K B4: ~34% QKV GPU-time gain; QKV+down tile changes together give ~5.1% decode wall-time gain.
+    /// HMMA/BF16 instruction shapes and FP32 accumulation:
+    /// https://docs.nvidia.com/cuda/archive/12.4.0/ampere-tuning-guide/index.html#improved-tensor-core-operations
+    /// SGLang v0.5.9 QKV -> ColumnParallelLinear -> unquantized F.linear:
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/models/qwen2.py#L179-L190
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/layers/linear.py#L442-L452
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/layers/quantization/unquant.py#L132-L152
+    /// Those calls delegate kernel selection; HMMA was verified in our local NCU/SASS capture.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) unsafe fn qkv_decode<
         T: ElementType,
@@ -266,6 +278,15 @@ pub(super) mod ops {
     }
 
     /// Split a skinny projection's K reduction across CTAs; share the ordinary MMA tile.
+    /// The small-BF16 [16,32,64] tile shortens the K loop while preserving split buckets
+    /// and the existing FP32 partial buffer; padded token rows are masked on writeback.
+    /// 4K B4: ~15% down+merge GPU-time gain; QKV+down tiles together give ~5.1% decode wall-time gain.
+    /// HMMA/BF16 instruction shapes and FP32 accumulation:
+    /// https://docs.nvidia.com/cuda/archive/12.4.0/ampere-tuning-guide/index.html#improved-tensor-core-operations
+    /// SGLang v0.5.9 down -> RowParallelLinear -> unquantized F.linear:
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/models/qwen2.py#L95-L100
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/layers/linear.py#L1468-L1479
+    /// https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/layers/quantization/unquant.py#L132-L152
     /// ```text
     /// grid = [ceil(M/BM), ceil(N/BN), SPLITS]
     /// partials[split, row, column] = X[row, K_split] * W[column, K_split]^T
