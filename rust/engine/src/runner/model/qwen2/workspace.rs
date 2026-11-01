@@ -22,6 +22,7 @@ pub(super) const MAX_KV_SPLITS: usize = 16;
 pub(super) const KV_PARTIAL_WIDTH: usize = 66;
 
 pub(super) struct Buffers<T: DType> {
+    pub(super) allocation_bytes: usize,
     pub(super) x: Tensor<T>,
     pub(super) residual: Tensor<T>,
     pub(super) norm: Tensor<T>,
@@ -238,6 +239,7 @@ impl<T: DType> WorkspacePool<T> {
         let mut integer_offset = 0;
         let mut float_offset = 0;
         let buffers = Buffers {
+            allocation_bytes: required,
             x: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
             residual: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),
             norm: handle(&lease, &workspace.activations, &mut offset, &[rows, h]),

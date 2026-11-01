@@ -54,7 +54,7 @@ impl GpuTokenReadback {
     /// Enqueue on the caller's stream; host storage is readable only after completion.
     pub(super) unsafe fn enqueue(
         &self,
-        values: Tensor<i32>,
+        values: Arc<Tensor<i32>>,
         exec: &ExecutionContext,
     ) -> Result<Readback<i32>, DeviceError> {
         self.cache.enqueue(values, exec)
@@ -64,13 +64,12 @@ impl GpuTokenReadback {
     /// Positions and producer stream identify the next forward's logical input/dependency.
     pub(super) fn predictions(
         &self,
-        values: Tensor<i32>,
+        values: Arc<Tensor<i32>>,
         positions: Vec<usize>,
         vocab_size: usize,
         completion: GpuWorkCompletionFuture,
         producer_stream_id: Option<usize>,
     ) -> impl Iterator<Item = GpuTokenPredictionHandle> + 'static {
-        let values = Arc::new(values);
         let source = values.clone();
         let cache = self.cache.clone();
         let policy = self.policy.clone();

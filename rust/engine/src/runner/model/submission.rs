@@ -1,7 +1,7 @@
 use std::{sync::Arc, task::Poll};
 
 use cuda_async::{
-    device_operation::{value, with_context, DeviceOp, ExecutionContext},
+    device_operation::{value, with_context, DeviceOp, ExecutionContext, GraphNode},
     scheduling_policies::SchedulingPolicy,
 };
 use futures::{
@@ -70,8 +70,28 @@ impl<T> SubmittedGpuWorkWithCompletion<T> {
     }
 }
 
+/// Share kernel definitions between ordinary submission and checked scope recording.
+/// Both modes borrow scratch; neither creates replacement tensor aliases.
+pub(super) enum GpuKernelRecorder<'a> {
+    Eager(&'a ExecutionContext),
+    Capture(&'a cuda_async::cuda_graph::Scope),
+}
+
+impl GpuKernelRecorder<'_> {
+    /// Eager callers must retain storage and prevent reuse until GPU completion.
+    pub(super) unsafe fn record<N: GraphNode>(
+        &self,
+        op: N,
+    ) -> Result<<N as DeviceOp>::Output, ModelError> {
+        Ok(match self {
+            Self::Eager(exec) => op.execute(exec)?,
+            Self::Capture(scope) => scope.record(op)?,
+        })
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::runner::{
         kv_pool::{KVContext, KVPool},
@@ -88,14 +108,14 @@ mod tests {
     };
 
     /// Hold later stream work until dropped; expiration is a test-harness failure.
-    struct Gate {
+    pub(in crate::runner::model) struct Gate {
         release: mpsc::Sender<()>,
         completed: Arc<AtomicBool>,
-        expired: Arc<AtomicBool>,
+        pub(in crate::runner::model) expired: Arc<AtomicBool>,
     }
 
     impl Gate {
-        fn arm(stream: &Arc<Stream>) -> anyhow::Result<Self> {
+        pub(in crate::runner::model) fn arm(stream: &Arc<Stream>) -> anyhow::Result<Self> {
             let (release, wait) = mpsc::channel();
             let completed = Arc::new(AtomicBool::new(false));
             let expired = Arc::new(AtomicBool::new(false));

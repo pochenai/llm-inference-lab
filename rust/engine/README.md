@@ -77,7 +77,7 @@ The serial control flow follows SGLang's normal loop (local source revision `026
 `event_loop_normal` receives work, `get_next_batch_to_run` selects/merges requests,
 then one forward runs and results update the running batch. Our existing packed
 backend permits prefills and decodes in the same forward. Token-budgeted chunked
-prefill is implemented; preemption and Qwen CUDA Graph remain deferred. The
+prefill is implemented; preemption remains deferred; optional Qwen decode CUDA Graphs are described below. The
 implemented one-round submission-first overlap is described below. Fixed-cohort
 performance results do not establish mixed-arrival scheduling benefits.
 
@@ -575,7 +575,7 @@ compares release runs and hardware counters. Subsequent
 output tiles for at least 16 packed rows, retaining 4x32 tiles for smaller inputs
 and the LM head at batch sizes 1/2/4. On SM120, linear targets occupancy 2 and
 attention targets 4; both hints live on their kernel definitions. No additional GPU scratch is required.
-Split-KV decode remains a candidate; Qwen CUDA Graph is a later submission-cost experiment.
+Adaptive split-KV decode is implemented; optional Qwen decode CUDA Graph replay reuses fixed buffers.
 
 The example supplies the explicit two-message Qwen2 chat template and uses pure
 greedy decoding (no repetition penalty or stochastic sampling).
@@ -649,11 +649,11 @@ other configurations are small/noisy or flat. This is not a SGLang performance c
 Run the sequential release matrix from the repository root:
 
 ```bash
-/usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir "$QWEN2_MODEL_DIR" --include-sglang-graph
+/usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir "$QWEN2_MODEL_DIR" --include-rust-graph --include-sglang-graph
 ```
 
-The primary comparison is eager vs eager, with SGLang decode CUDA Graph reported
-separately. Both use BF16 weights/activations/KV, token ID 9707, fresh KV, batch
+Eager is compared against eager; optional Rust/SGLang decode Graph modes form a
+separate matched comparison. Both use BF16 weights/activations/KV, token ID 9707, fresh KV, batch
 1/2/4, 32/4096 input tokens, and 64 outputs regardless of EOS. The default matrix
 reserves 16640 KV token slots in both engines. Two warmups and three measured
 samples are repeated in three independent processes; engine order rotates.
@@ -677,15 +677,16 @@ are not whole-device memory measurements. No profiler is attached to native runs
 In the initial three-process BF16 matrix, Rust eager short-context decode has
 26-31% lower latency than SGLang eager; 4K prefill is about 12x slower. SGLang
 Graph further reduces decode latency. A separate Nsight capture verifies 64 Rust
-forwards and only one final 4-byte D2H after the last kernel. Profile long prefill
-to separate attention/linear cost before tuning; these static results do not
+forwards and only one final 4-byte D2H after the last kernel. The W8 follow-up
+optimizes long prefill and decode separately; these static results do not
 establish serving throughput or cross-engine generated-ID equivalence.
 
 
 ### Prefill attention routing and operator profiling
 
 BF16 suffixes with at least 64 queries per context use multi-query MMA attention;
-small/mixed suffixes, FP32 and decode retain scalar attention. The tiled path shares
+small/mixed suffixes and FP32 retain scalar attention; one-token/request decode
+uses adaptive split-KV for sufficiently long histories. The tiled path shares
 K/V across queries, preserves token-slot indirection and cached/ragged causal offsets,
 and keeps online softmax/accumulation in FP32. No extra global score buffer is used.
 The initial 4K comparison improves prefill about 5.9x at B1/2/4 while leaving linear
@@ -745,4 +746,33 @@ This measures static-model prefill, not serving throughput. Native logits are FP
 HF BF16 logits can tie after rounding, so strict greedy IDs may differ on ambiguous
 samples even with unchanged logits before/after fusion. The retained tie case is
 reported alongside passing long/exact-4K references; checks are not relaxed.
-Decode and Qwen CUDA Graph remain follow-up work.
+Adaptive split-KV decode and optional Qwen decode CUDA Graphs are the W8 follow-up implementation.
+
+
+### Optional Qwen decode CUDA Graphs (W8)
+
+Qwen Graphs default off. Enable `Qwen2Engine::with_cuda_graphs()` before placing
+the model in a Runner, or pass `--cuda-graph` to the Qwen example/benchmark:
+
+```bash
+cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen2 -- --model-dir MODEL_DIR --cuda-graph
+/usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir MODEL_DIR --include-rust-graph --include-sglang-graph
+```
+
+Only one-token/request decode steps are captured. Prefill/mixed steps stay eager.
+Cache keys contain batch size, the fixed split bucket and KV storage identity.
+Fixed pinned/GPU buffers upload token addresses and row/position metadata before
+replay on the ordered compute stream. Shared Transformer stages preserve eager
+operator order and rounding. Cold allocation/JIT/capture occurs outside DeviceOp
+execution; the private warmup cache never touches live request KV.
+
+Graphs retain GPU storage, not session row/slot leases. Each submission retains
+its actual states and feedback sources until completion; escaped prediction
+handles prevent reuse of their output arena. The bounded cache evicts idle
+instances only. Cached graph scratch remains checked out of WorkspacePool:
+`cuda_graph_metrics().retained_workspace_bytes` explains that residency separately
+from in-flight work. KV capacity must still return after closing sessions.
+
+The matrix driver reports Rust/SGLang eager and Graph modes separately. Capture
+must finish in warmup; no new captures are allowed during measured samples.
+Graph replay correctness does not imply a performance win in every shape.

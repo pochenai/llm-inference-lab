@@ -239,8 +239,10 @@ impl<T: DType> NaiveReadView<'_, T> {
     /// Internal bridge for tensor-based kernels; safe callers only receive const pointers.
     ///
     /// # Safety
-    /// Use these handles only for reads within positions and retain the view in exec
-    /// before submission. Do not use Tensor's mutable device pointers to write storage.
+    /// Reads require retaining this view and staying within its positions. These
+    /// owners alone grant no write permission: fused/graph writes require a matching
+    /// pending WriteView on the actual submission. Only its unique pending slots may
+    /// be written; acquiring a view or recording a graph does not complete GPU work.
     pub(crate) unsafe fn tensors(&self) -> (&Arc<Tensor<T>>, &Arc<Tensor<T>>, &Arc<Tensor<i32>>) {
         (self.inner.k, self.inner.v, self.inner.slot_table)
     }

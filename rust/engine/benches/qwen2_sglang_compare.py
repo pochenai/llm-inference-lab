@@ -1,7 +1,7 @@
 """Compare BF16 static GPU-feedback steps, excluding HTTP, text decode and serving overlap.
 
 From the repository root:
-  /usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir MODEL_DIR --include-sglang-graph
+  /usr/bin/python3 rust/engine/benches/qwen2_sglang_compare.py --model-dir MODEL_DIR --include-rust-graph --include-sglang-graph
 
 Defaults: B=1/2/4, input=32/4096, output=64, two warmups, three samples per
 shape and three independent process repetitions. Rust is optimized/eager; SGLang
@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--tokens", type=int, nargs="+", default=[32, 4096])
     parser.add_argument("--include-sglang-graph", action="store_true")
+    parser.add_argument("--include-rust-graph", action="store_true")
     args = parser.parse_args()
     if min(args.repetitions, args.warmup, args.iterations, args.output_tokens - 1, *args.batch_size, *args.tokens) < 1:
         parser.error("counts must be positive and output-tokens must exceed one")
@@ -85,25 +86,26 @@ def main() -> None:
     kv_slots = ((max(args.batch_size) * (max(args.tokens) + args.output_tokens) + 127) // 128) * 128
     cases = list(itertools.product(args.batch_size, args.tokens))
     checksums = {n: sum((i+1)*(9707+(i%4096 if args.input_pattern=="ramp" else 0)) for i in range(n)) for n in args.tokens}
-    engines = ["rust-eager", "sglang-eager"] + (["sglang-graph"] if args.include_sglang_graph else [])
+    engines = ["rust-eager", "sglang-eager"] + (["rust-graph"] if args.include_rust_graph else []) + (["sglang-graph"] if args.include_sglang_graph else [])
     results: dict[tuple[int, int, str], list[dict[str, float]]] = {}
     for repetition in range(args.repetitions):
         order = engines[repetition % len(engines):] + engines[:repetition % len(engines)]
         for engine in order:
-            if engine == "rust-eager":
+            if engine.startswith("rust-"):
                 for batch, tokens in cases:
                     label = f"r{repetition}-{engine}-b{batch}-t{tokens}"
-                    run(label, [str(frozen), "--model-dir", str(args.model_dir.resolve()), "--dtype", "bf16", "--input-pattern", args.input_pattern, "--gpu-feedback", "--kv-slots", str(kv_slots), "--batch-size", str(batch), "--tokens", str(tokens), "--decode-steps", str(args.output_tokens - 1), "--warmup", str(args.warmup), "--iterations", str(args.iterations)])
+                    run(label, [str(frozen), "--model-dir", str(args.model_dir.resolve()), "--dtype", "bf16", "--input-pattern", args.input_pattern, "--gpu-feedback", "--kv-slots", str(kv_slots), "--batch-size", str(batch), "--tokens", str(tokens), "--decode-steps", str(args.output_tokens - 1), "--warmup", str(args.warmup), "--iterations", str(args.iterations)] + (["--cuda-graph"] if engine == "rust-graph" else []))
                     records = read_jsonl(out / f"{label}.stdout")
                     loaded = next(r for r in records if r["event"] == "loaded")
                     assert loaded["dtype"] == "bf16" and loaded["gpu_feedback"] and loaded["kv_slots"] == kv_slots
+                    assert loaded.get("cuda_graph", False) == (engine == "rust-graph")
                     assert loaded["input_pattern"] == args.input_pattern and loaded["input_checksum"] == checksums[tokens]
                     measured = [r for r in records if r["event"] == "sample" and not r["warmup"]]
                     assert len(measured) == args.iterations
                     assert sum(r.get("host_validation", False) for r in records) == 1
                     for sample in measured:
                         assert sample["gpu_feedback"] and sample["forward_count"] == args.output_tokens
-                        assert sample["kv_released"] and sample["workspace_pool"]["in_use_bytes"] == 0
+                        assert sample["kv_released"] and sample["workspace_pool"]["in_use_bytes"] == sample.get("cuda_graphs", {}).get("retained_workspace_bytes", 0)
                     values = {
                         "prefill_seconds": mean(r["prefill_seconds"] for r in measured),
                         "decode_step_median_seconds": median(median(r["decode_step_seconds"]) for r in measured),
@@ -135,7 +137,7 @@ def main() -> None:
                     })
             # Save independent process aggregates after each successful engine run.
             (out / "comparison.json").write_text(json.dumps([{"batch_size": b, "input_len": t, "engine": e, "processes": p, "median": summarize(p)} for (b, t, e), p in results.items()], indent=2) + "\n")
-    lines = ["# Qwen BF16 static-model comparison", "", "Three-way modes are separate: Rust eager, SGLang eager, optional SGLang decode CUDA Graph.", "", "Ratios are Rust latency / SGLang latency; >1 means Rust is slower. Each cell is the median of independent process aggregates, not a pooled per-token statistic.", "", "| Batch | Input/request | Engine | Prefill ms | Decode median ms/step | Total ms | Output tokens/s |", "| ---: | ---: | --- | ---: | ---: | ---: | ---: |"]
+    lines = ["# Qwen BF16 static-model comparison", "", "Eager and decode CUDA Graph modes are compared separately for each engine.", "", "Ratios are Rust latency / SGLang latency; >1 means Rust is slower. Each cell is the median of independent process aggregates, not a pooled per-token statistic.", "", "| Batch | Input/request | Engine | Prefill ms | Decode median ms/step | Total ms | Output tokens/s |", "| ---: | ---: | --- | ---: | ---: | ---: | ---: |"]
     for batch, tokens in cases:
         for engine in engines:
             value = summarize(results[(batch, tokens, engine)])
@@ -146,11 +148,17 @@ def main() -> None:
         sglang = summarize(results[(batch, tokens, "sglang-eager")])
         paired = [r["decode_step_median_seconds"] / s["decode_step_median_seconds"] for r, s in zip(results[(batch, tokens, "rust-eager")], results[(batch, tokens, "sglang-eager")])]
         lines.append(f"| {batch} | {tokens} | {rust['prefill_seconds']/sglang['prefill_seconds']:.3f} | {rust['decode_step_median_seconds']/sglang['decode_step_median_seconds']:.3f} | {rust['total_seconds']/sglang['total_seconds']:.3f} | {min(paired):.3f}..{max(paired):.3f} |")
-    lines += ["", "## Observed allocator peaks", "", "Maxima across measured samples and process repetitions, MiB. Rust CUDA-pool used and SGLang torch allocated have different scopes; this is not whole-device VRAM or an allocator-efficiency ranking.", "", "| Batch | Input/request | Rust pool used | SGLang eager allocated | SGLang Graph allocated |", "| ---: | ---: | ---: | ---: | ---: |"]
+    if args.include_rust_graph and args.include_sglang_graph:
+        lines += ["", "## Graph ratios", "", "| Batch | Input/request | Rust/SGLang decode latency | Rust/SGLang total latency |", "| ---: | ---: | ---: | ---: |"]
+        for batch, tokens in cases:
+            rust = summarize(results[(batch, tokens, "rust-graph")])
+            sglang = summarize(results[(batch, tokens, "sglang-graph")])
+            lines.append(f"| {batch} | {tokens} | {rust['decode_step_median_seconds']/sglang['decode_step_median_seconds']:.3f} | {rust['total_seconds']/sglang['total_seconds']:.3f} |")
+    lines += ["", "## Observed allocator peaks", "", "Allocator-specific MiB peaks; these are not whole-device VRAM or directly comparable allocator efficiencies.", "", "| Batch | Input/request | " + " | ".join(engines) + " |", "| ---: | ---: | " + " | ".join("---:" for _ in engines) + " |"]
     for batch, tokens in cases:
         peaks = [max(p["pool_used_peak_bytes"] for p in results[(batch, tokens, e)]) / 2**20 for e in engines]
-        lines.append(f"| {batch} | {tokens} | " + " | ".join(f"{peak:.2f}" for peak in peaks) + (" |" if args.include_sglang_graph else " | n/a |"))
-    lines += ["", f"Input pattern is {args.input_pattern}: repeated token 9707, or ramp 9707+(position%4096). KV token capacity is {kv_slots} in both engines; no prefix reuse, fixed {args.output_tokens} outputs, greedy and no EOS early stopping. Rust --gpu-feedback validates final IDs against an untimed host-feedback control, reads final IDs outside timers and does not retain all previous workspaces. SGLang uses its official synchronous static loop, not its serving overlap scheduler.", "", "Both timers include CPU preparation/submission and GPU completion. Rust input-view construction is outside timers; final D2H and text decode are excluded. SGLang has untimed device synchronization before each step; Rust forward awaits completion. Logit dtype/attention reduction rounding and kernel implementations are not identical even with BF16 weights/activations/KV. Graph reference accelerates decode only; Rust has no Qwen Graph yet.", "", "CUDA-pool used peaks (Rust) and torch allocated peaks (SGLang) are recorded with their allocator-specific meanings. They exclude whole-device/display memory; mapping/graph capacities differ, so they are not an allocator-efficiency ranking.", "", "Raw samples, backend class, graph capture logs, process aggregates, exact commands, frozen sources/binary and version/hardware metadata accompany this report. No Nsight profiler is attached to native samples. Results do not establish serving throughput, overlap parity, or output quality.", ""]
+        lines.append(f"| {batch} | {tokens} | " + " | ".join(f"{peak:.2f}" for peak in peaks) + " |")
+    lines += ["", f"Input pattern is {args.input_pattern}: repeated token 9707, or ramp 9707+(position%4096). KV token capacity is {kv_slots} in both engines; no prefix reuse, fixed {args.output_tokens} outputs, greedy and no EOS early stopping. Rust --gpu-feedback validates final IDs against an untimed host-feedback control, reads final IDs outside timers and does not retain all previous workspaces. SGLang uses its official synchronous static loop, not its serving overlap scheduler.", "", "Both timers include CPU preparation/submission and GPU completion. Rust input-view construction is outside timers; final D2H and text decode are excluded. SGLang has untimed device synchronization before each step; Rust forward awaits completion. Logit dtype/attention reduction rounding and kernel implementations are not identical even with BF16 weights/activations/KV. Graph modes accelerate decode only; prefill stays eager in both engines. Graph capture/replay warmup is outside measured samples.", "", "CUDA-pool used peaks (Rust) and torch allocated peaks (SGLang) are recorded with their allocator-specific meanings. They exclude whole-device/display memory; mapping/graph capacities differ, so they are not an allocator-efficiency ranking.", "", "Raw samples, backend class, graph capture logs, process aggregates, exact commands, frozen sources/binary and version/hardware metadata accompany this report. No Nsight profiler is attached to native samples. Results do not establish serving throughput, overlap parity, or output quality.", ""]
     (out / "RESULTS.md").write_text("\n".join(lines))
     print(out, flush=True)
 

@@ -404,6 +404,73 @@ pub(super) mod ops {
         out.store(result);
     }
 
+    /// Graph replay gets context row/position from metadata, never capture-time CPU scalars.
+    /// Each row writes only its uniquely reserved current KV slot; caller retains those states.
+    #[cutile::entry()]
+    pub(super) unsafe fn store_decode<T: ElementType>(
+        cache_k: *mut T,
+        cache_v: *mut T,
+        table: &Tensor<i32, { [-1, -1] }>,
+        metadata: &Tensor<i32, { [-1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let row = metadata
+            .partition(shape![1])
+            .load([pid.0 * TOKEN_METADATA_WIDTH])
+            .reshape(shape![]);
+        let position = metadata
+            .partition(shape![1])
+            .load([pid.0 * TOKEN_METADATA_WIDTH + 1])
+            .reshape(shape![]);
+        let row: i32 = tile_to_scalar(row);
+        let position: i32 = tile_to_scalar(position);
+        let slot = table
+            .partition(shape![1, 1])
+            .load([row, position])
+            .reshape(shape![]);
+        let slot: i32 = tile_to_scalar(slot);
+        let offset = slot * k.shape()[1] + pid.1 * HEAD_DIM;
+        let columns: Tile<i32, { [HEAD_DIM] }> = iota(shape![HEAD_DIM]);
+        let kp: PointerTile<*mut T, { [] }> = pointer_to_tile(cache_k);
+        let kp = kp.offset(offset);
+        let kp = kp.reshape(shape![1]);
+        let kp = kp.broadcast(shape![HEAD_DIM]);
+        let vp: PointerTile<*mut T, { [] }> = pointer_to_tile(cache_v);
+        let vp = vp.offset(offset);
+        let vp = vp.reshape(shape![1]);
+        let vp = vp.broadcast(shape![HEAD_DIM]);
+        let keys = k
+            .partition(shape![1, HEAD_DIM])
+            .load([pid.0, pid.1])
+            .reshape(shape![HEAD_DIM]);
+        let values = v
+            .partition(shape![1, HEAD_DIM])
+            .load([pid.0, pid.1])
+            .reshape(shape![HEAD_DIM]);
+        let kp: PointerTile<*mut T, { [HEAD_DIM] }> = kp.offset_tile(columns);
+        let vp: PointerTile<*mut T, { [HEAD_DIM] }> = vp.offset_tile(columns);
+        store_ptr_tko(
+            kp,
+            keys,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<1>,
+        );
+        store_ptr_tko(
+            vp,
+            values,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<1>,
+        );
+    }
+
     /// Stream one disjoint KV segment; empty segments return (0, -inf, 0).
     /// Keep raw FP32 (weighted V, maximum, denominator) until the final normalization.
     unsafe fn attention_segment<T: ElementType, const BK: i32, const SPLITS: i32>(

@@ -56,6 +56,9 @@ struct Args {
     /// Directory containing reference.json and logits.f32 for validation.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
+    /// Enable fixed-buffer decode CUDA Graph replay; prefill stays eager.
+    #[arg(long)]
+    cuda_graph: bool,
     /// Emit per-step/batch JSON metrics to stderr (includes cold JIT).
     #[arg(long)]
     trace_steps: bool,
@@ -81,6 +84,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         disable_overlap,
         reference_dir,
         trace_steps,
+        cuda_graph,
     } = args;
     tracing_subscriber::fmt()
         .json()
@@ -97,6 +101,11 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
     let model = Qwen2Engine::<T>::load(&model_dir, &policy).await?;
+    let model = if cuda_graph {
+        model.with_cuda_graphs()
+    } else {
+        model
+    };
     tracing::info!(target: "engine::qwen2", event = "model_loaded",
         seconds = load_start.elapsed().as_secs_f64());
     // Explicit two-message Qwen2 template; raw prompt text alone is not an instruct input.

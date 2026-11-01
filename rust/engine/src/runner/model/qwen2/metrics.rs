@@ -3,8 +3,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use metrics::{Counter, Gauge, Histogram};
 use serde::Serialize;
 
+/// Per-model graph-cache counters and permanently retained scratch, not request timings.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct CudaGraphMetrics {
+    pub captures: u64,
+    pub replays: u64,
+    pub cached_graphs: usize,
+    pub retained_workspace_bytes: usize,
+}
+
 /// Logical scratch allocation bytes, excluding allocator padding/reservations,
-/// weights, KV, uploads and pinned readbacks. In-use includes GPU/escaped-handle leases.
+/// weights, KV, uploads and pinned readbacks. In-use includes GPU/escaped-handle leases and graph-retained scratch.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct WorkspaceMetrics {
     /// One label per model lifetime, shared by its execution/workspace instruments.

@@ -76,6 +76,9 @@ struct Args {
     gpu_feedback: bool,
     #[arg(long)]
     trace_steps: bool,
+    /// Enable fixed-buffer decode CUDA Graph replay; prefill stays eager.
+    #[arg(long)]
+    cuda_graph: bool,
     /// Start CUDA profiler capture after warmup and stop before diagnostic validation.
     #[arg(long)]
     profile: bool,
@@ -112,6 +115,11 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
     let model = Qwen2Engine::<T>::load(&args.model_dir, &policy).await?;
+    let model = if args.cuda_graph {
+        model.with_cuda_graphs()
+    } else {
+        model
+    };
     let mut config = model.kv_pool_config(
         args.tokens
             .get()
@@ -154,7 +162,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
     println!(
         "{}",
         json!({"event":"loaded", "seconds":load_start.elapsed().as_secs_f64(),
-        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string(), "gpu_feedback":args.gpu_feedback, "input_pattern":args.input_pattern, "input_checksum":input_checksum, "kv_slots":config.num_slots, "kv_bytes":initial_kv.layers.allocated_bytes})
+        "tokens":args.tokens.get(), "batch_size":args.batch_size.get(), "dtype":T::DTYPE.to_string(), "gpu_feedback":args.gpu_feedback, "cuda_graph":args.cuda_graph, "input_pattern":args.input_pattern, "input_checksum":input_checksum, "kv_slots":config.num_slots, "kv_bytes":initial_kv.layers.allocated_bytes})
     );
     let mut expected = None;
     let mut prefills = Vec::with_capacity(args.iterations.get());
@@ -181,6 +189,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
                 ids
             })
             .collect();
+        let graphs_before = model.cuda_graph_metrics();
         let mut step_seconds = Vec::with_capacity(args.decode_steps.get() + 1);
         let mut feedback: Vec<GpuTokenPredictionHandle> = Vec::new();
         for _ in 0..=args.decode_steps.get() {
@@ -252,6 +261,17 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         }
         ensure!(pool.metrics() == initial_kv, "KV leaked between samples");
         let workspace_pool = model.workspace_metrics();
+        let cuda_graphs = model.cuda_graph_metrics();
+        ensure!(
+            workspace_pool.in_use_bytes == cuda_graphs.retained_workspace_bytes,
+            "non-graph scratch remains in use"
+        );
+        if !warmup && args.cuda_graph {
+            ensure!(
+                cuda_graphs.captures == graphs_before.captures,
+                "graph captured during measured sample"
+            );
+        }
         let memory = cuda_pool.mem_stats()?;
         used_peak.set(memory.used_high as f64);
         reserved_peak.set(memory.reserved_high as f64);
@@ -267,7 +287,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
             "prefill_tokens_per_second":(prefix.len()*args.batch_size.get()) as f64/step_seconds[0],
             "decode_tokens_per_second":(args.decode_steps.get()*args.batch_size.get()) as f64/decode_seconds,
             "cuda_pool_used_peak_bytes":memory.used_high,"cuda_pool_reserved_peak_bytes":memory.reserved_high,
-            "workspace_pool":workspace_pool,"kv_released":true})
+            "workspace_pool":workspace_pool,"cuda_graphs":cuda_graphs,"kv_released":true})
         );
         if !warmup {
             prefills.push(step_seconds[0]);

@@ -25,6 +25,8 @@ use cutile::{
     tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
 };
 
+use crate::runner::model::submission::GpuKernelRecorder as ComputeRecorder;
+
 use super::{
     graph::{self, GraphInstance, GraphKey, GraphPool},
     kernels,
@@ -123,23 +125,6 @@ struct PreparedBatch {
     mapping_words: usize,
     metadata_start: usize,
     cache: CacheBuffers,
-}
-
-/// Share kernel definitions between ordinary submission and checked scope recording.
-/// Both modes borrow scratch; neither creates replacement tensor aliases.
-enum ComputeRecorder<'a> {
-    Eager(&'a ExecutionContext),
-    Capture(&'a cuda_async::cuda_graph::Scope),
-}
-
-impl ComputeRecorder<'_> {
-    /// Eager callers must retain storage and prevent reuse until GPU completion.
-    unsafe fn record<N: GraphNode>(&self, op: N) -> Result<<N as DeviceOp>::Output, ModelError> {
-        Ok(match self {
-            Self::Eager(exec) => op.execute(exec)?,
-            Self::Capture(scope) => scope.record(op)?,
-        })
-    }
 }
 
 impl SimpleMLPEngine {

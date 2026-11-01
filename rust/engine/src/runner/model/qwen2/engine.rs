@@ -42,10 +42,13 @@
 //! ```
 
 use super::super::readback::{GpuTokenReadback, Readback, ReadbackCache};
+use crate::runner::model::submission::GpuKernelRecorder;
+
 use super::{
+    graph::{DecodeCache, DecodeGraph, DecodeGraphCache, DecodeGraphKey},
     kernels,
     metrics::{Instruments, WorkspaceMetrics},
-    workspace::{WorkspacePool, MAX_KV_SPLITS},
+    workspace::{Buffers, WorkspacePool, MAX_KV_SPLITS},
 };
 use crate::runner::{
     kv_pool::{KVContext, NaiveKVPool, NaiveKVPoolConfig, NaiveReadView},
@@ -182,6 +185,7 @@ struct Layer<T: DType> {
 /// T controls weight/activation/KV storage; reductions, MMA accumulation and logits use FP32.
 /// BF16 and FP32 paths are validated; token IDs and Runner scheduling are dtype-independent.
 pub struct Qwen2Engine<T: WeightElement + ElementType = f32> {
+    graphs: Option<Arc<DecodeGraphCache<T>>>,
     config: Qwen2Config,
     tokenizer: Tokenizer,
     embedding: Weight<T>,
@@ -376,6 +380,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         let workspaces: Arc<WorkspacePool<T>> = Arc::default();
         let instruments = Instruments::new(workspaces.metrics().model_instance);
         Ok(Self {
+            graphs: None,
             token_readback: GpuTokenReadback::new(
                 policy.next_stream()?.device(),
                 instruments.readback_duration.clone(),
@@ -394,6 +399,328 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             inv_freq,
             layers,
             eos,
+        })
+    }
+
+    /// Enable lazy fixed-buffer decode graphs. Prefill remains eager; default is disabled.
+    pub fn with_cuda_graphs(mut self) -> Self {
+        self.graphs.get_or_insert_with(Default::default);
+        self
+    }
+
+    pub fn cuda_graph_metrics(&self) -> super::metrics::CudaGraphMetrics {
+        self.graphs
+            .as_ref()
+            .map_or_else(Default::default, |cache| cache.metrics())
+    }
+
+    /// Capture only storage/geometry. Live KV leases are retained by each real append submission.
+    fn prepare_decode_graph(
+        &self,
+        batch: &[ModelInput<'_, NaiveKVPool<T>>],
+    ) -> Result<Option<Arc<DecodeGraph<T>>>, ModelError> {
+        let Some(graphs) = &self.graphs else {
+            return Ok(None);
+        };
+        if batch.is_empty()
+            || batch
+                .iter()
+                .any(|i| i.uncached_len() != 1 || i.kv.allocated_len() == 0)
+        {
+            return Ok(None);
+        }
+        let view = batch[0].kv.read_view(0)?;
+        // SAFETY: storage identity only; live row/slot leases belong to each replay.
+        let table = unsafe { view.tensors().2.clone() };
+        let count = batch.len();
+        let splits = self
+            .attention
+            .decode_splits(count, batch.iter().map(|i| i.sequence_len()).max().unwrap());
+        let key = DecodeGraphKey {
+            table: Arc::as_ptr(&table) as usize,
+            batch: count,
+            splits,
+        };
+        Ok(Some(graphs.acquire(key, || {
+            let mut layers = Vec::with_capacity(self.layers.len());
+            for index in 0..self.layers.len() {
+                let view = batch[0].kv.read_view(index)?;
+                // SAFETY: capture keeps storage, never a request's state lease.
+                let (k, v, _) = unsafe { view.tensors() };
+                layers.push((k.clone(), v.clone()));
+            }
+            let cache = DecodeCache { layers, table };
+            // Graph scatter bypasses KVPool::store's shape checks; validate once before capture.
+            let width = self.config.num_key_value_heads * 64;
+            if cache.table.device_id() != self.embedding.device_id()
+                || cache
+                    .layers
+                    .iter()
+                    .any(|(k, v)| k.shape() != v.shape() || k.shape()[1] as usize != width)
+            {
+                return Err(ModelError::InvalidInput(
+                    "decode graph requires matching KV width and model device".into(),
+                ));
+            }
+            let stream =
+                cuda_async::device_context::with_device(cache.table.device_id(), |device| {
+                    device
+                        .new_stream()
+                        .map_err(cuda_async::error::DeviceError::from)
+                })??;
+            let (mut buffers, metadata, sources, warm) = with_context(|exec| {
+                value((|| -> Result<_, ModelError> {
+                    if cache.layers[0].0.shape()[0] < count as i32
+                        || cache.table.shape()[0] < count as i32
+                    {
+                        return Err(ModelError::InvalidInput(
+                            "decode graph batch exceeds KV capacity".into(),
+                        ));
+                    }
+                    // SAFETY: each producer overwrites valid scratch before consumers read it.
+                    unsafe {
+                        let buffers = self.workspaces.acquire(count, count, &self.config, exec)?;
+                        let meta: Vec<i32> = (0..count)
+                            .flat_map(|row| [row as i32, 0, 0])
+                            .chain((0..count).map(|row| row as i32))
+                            .collect();
+                        let metadata =
+                            api::copy_host_vec_to_device(&Arc::new(meta)).execute(exec)?;
+                        let sources =
+                            api::copy_host_vec_to_device(&Arc::new(vec![0u64; count * 2]))
+                                .execute(exec)?;
+                        // Private warmup storage prevents touching any real request's KV or mapping.
+                        let shape: Vec<usize> = cache.layers[0]
+                            .0
+                            .shape()
+                            .iter()
+                            .map(|n| *n as usize)
+                            .collect();
+                        let k = Arc::new(
+                            Tensor::<T>::uninitialized(shape.iter().product())
+                                .execute(exec)?
+                                .assume_init()
+                                .reshape(&shape)?,
+                        );
+                        let v = Arc::new(
+                            Tensor::<T>::uninitialized(shape.iter().product())
+                                .execute(exec)?
+                                .assume_init()
+                                .reshape(&shape)?,
+                        );
+                        let mut mapping = vec![0i32; cache.table.size()];
+                        for row in 0..count {
+                            mapping[row * cache.table.shape()[1] as usize] = row as i32;
+                        }
+                        let table = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(mapping))
+                                .execute(exec)?
+                                .reshape(
+                                    &cache
+                                        .table
+                                        .shape()
+                                        .iter()
+                                        .map(|n| *n as usize)
+                                        .collect::<Vec<_>>(),
+                                )?,
+                        );
+                        let warm = DecodeCache {
+                            layers: (0..self.layers.len())
+                                .map(|_| (k.clone(), v.clone()))
+                                .collect(),
+                            table,
+                        };
+                        Ok((buffers, metadata, sources, warm))
+                    }
+                })())
+            })
+            .sync_on(&stream)??;
+            with_context(|exec| {
+                value(unsafe {
+                    self.record_decode_graph(
+                        &mut buffers,
+                        &metadata,
+                        &sources,
+                        &warm,
+                        splits,
+                        &GpuKernelRecorder::Eager(exec),
+                    )
+                })
+            })
+            .sync_on(&stream)??;
+            let graph = cuda_async::cuda_graph::CudaGraph::scope(&stream, |scope| {
+                // No allocation, upload or request state is recorded inside capture.
+                unsafe {
+                    self.record_decode_graph(
+                        &mut buffers,
+                        &metadata,
+                        &sources,
+                        &cache,
+                        splits,
+                        &GpuKernelRecorder::Capture(scope),
+                    )
+                }
+                .map_err(|e| cuda_async::error::DeviceError::Internal(e.to_string()))
+            })?;
+            // SAFETY: checkout excludes replay while these shared output handles survive.
+            let (output, logits) = unsafe {
+                (
+                    buffers.winner.into_shared_alias(),
+                    buffers.logits.into_shared_alias(),
+                )
+            };
+            let host_context = cutile::cuda_core::CudaContext::new(cache.table.device_id())
+                .map_err(cuda_async::error::DeviceError::from)?;
+            let host_metadata =
+                cutile::cuda_core::PinnedHostBuffer::zeroed(&host_context, count * 4)
+                    .map_err(cuda_async::error::DeviceError::from)?;
+            let host_sources =
+                cutile::cuda_core::PinnedHostBuffer::zeroed(&host_context, count * 2)
+                    .map_err(cuda_async::error::DeviceError::from)?;
+            Ok(DecodeGraph {
+                host_metadata,
+                host_sources,
+                key,
+                metadata,
+                sources,
+                output,
+                logits,
+                graph,
+                buffers,
+                _cache: cache,
+            })
+        })?))
+    }
+
+    /// Same Transformer stages as eager, with fixed input buffers and dynamic GPU metadata.
+    unsafe fn record_decode_graph(
+        &self,
+        scratch: &mut Buffers<T>,
+        metadata: &Tensor<i32>,
+        sources: &Tensor<u64>,
+        cache: &DecodeCache<T>,
+        splits: usize,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        recorder.record(
+            kernels::embedding_gather(
+                (&mut scratch.x).partition([1, 256]),
+                sources,
+                self.embedding.clone(),
+                self.config.vocab_size as i32,
+            )
+            .generics(vec![T::DTYPE.to_string()]),
+        )?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            self.project_qkv(layer, scratch, metadata, recorder)?;
+            let (k, v) = &cache.layers[index];
+            recorder.record(
+                kernels::store_decode(
+                    k.device_pointer(),
+                    v.device_pointer(),
+                    cache.table.clone(),
+                    metadata,
+                    &scratch.rotated_k,
+                    &scratch.v,
+                )
+                .generics(vec![T::DTYPE.to_string()])
+                .grid((
+                    scratch.x.shape()[0] as u32,
+                    self.config.num_key_value_heads as u32,
+                    1,
+                )),
+            )?;
+            if splits > 1 {
+                let partials = scratch.decode_partials.as_mut().unwrap();
+                recorder.record(
+                    kernels::attention_split_kv(
+                        partials.partition_prefix([1, 128]),
+                        &scratch.rotated_q,
+                        k.clone(),
+                        v.clone(),
+                        cache.table.clone(),
+                        metadata,
+                        self.attention.q_heads as i32,
+                        self.attention.kv_heads as i32,
+                    )
+                    .generics(vec![
+                        T::DTYPE.to_string(),
+                        KV_TOKENS_PER_TILE.to_string(),
+                        splits.to_string(),
+                    ])
+                    .grid((
+                        (scratch.x.shape()[0] as usize * self.attention.q_heads * splits) as u32,
+                        1,
+                        1,
+                    )),
+                )?;
+                recorder.record(
+                    kernels::attention_merge_splits(
+                        (&mut scratch.attention).partition([1, 64]),
+                        &*partials,
+                        self.attention.q_heads as i32,
+                    )
+                    .generics(vec![T::DTYPE.to_string(), splits.to_string()]),
+                )?;
+            } else {
+                recorder.record(
+                    kernels::attention(
+                        (&mut scratch.attention).partition([1, 64]),
+                        &scratch.rotated_q,
+                        k.clone(),
+                        v.clone(),
+                        cache.table.clone(),
+                        metadata,
+                        self.attention.q_heads as i32,
+                        self.attention.kv_heads as i32,
+                    )
+                    .generics(vec![T::DTYPE.to_string(), KV_TOKENS_PER_TILE.to_string()]),
+                )?;
+            }
+            self.finish_layer(layer, scratch, metadata, recorder)?;
+        }
+        self.finish_logits(scratch, metadata, recorder)
+    }
+
+    /// Real submission retains sources and current KV reservations until completion; cache holds neither.
+    unsafe fn replay_decode_graph(
+        &self,
+        graph: &Arc<DecodeGraph<T>>,
+        batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
+        exec: &ExecutionContext,
+    ) -> Result<StepOutput<Arc<Tensor<i32>>, Arc<Tensor<f32>>>, ModelError> {
+        let started = Instant::now();
+        let mut metadata = Vec::with_capacity(batch.len() * 4);
+        let mut sources = Vec::with_capacity(batch.len() * 2);
+        for input in batch.iter_mut() {
+            // Authorize every updated layer on the real submission, never during capture.
+            // Slot IDs/positions are shared across layers; metadata needs them only once.
+            let (row, position) = {
+                let dst = input.kv.write_view(0, exec)?;
+                (dst.row(), dst.positions().start)
+            };
+            for layer in 1..self.layers.len() {
+                let _dst = input.kv.write_view(layer, exec)?;
+            }
+            metadata.extend([row as i32, position as i32, 0]);
+            match &input.token_ids {
+                ModelTokens::Device(token) => {
+                    exec.retain(token.values.clone())?;
+                    sources.extend([
+                        token.values.device_pointer().cu_deviceptr() + (token.index * 4) as u64,
+                        0,
+                    ]);
+                }
+                _ => sources.extend([0, input.token_ids.host()?[position] as u64]),
+            }
+        }
+        metadata.extend((0..batch.len()).map(|i| i as i32));
+        graph.replay(&metadata, &sources, exec)?;
+        self.graphs.as_ref().unwrap().replayed();
+        Ok(StepOutput {
+            token: graph.output.clone(),
+            logits: Some(graph.logits.clone()),
+            host_submit_seconds: started.elapsed().as_secs_f64(),
         })
     }
 
@@ -509,9 +836,12 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             .iter()
             .any(|input| input.kv.ready_len() == 0 || input.uncached_len() > 1);
         let start = Instant::now();
+        let graph = self.prepare_decode_graph(batch)?;
         let result = Self::execute_append_batch(batch, &policy, |batch, exec| {
             // SAFETY: every GPU access, including D2H, belongs to this submission.
-            unsafe { self.enqueue_forward_with_host_readback(batch, read_logits, exec) }
+            unsafe {
+                self.enqueue_forward_with_host_readback(batch, read_logits, graph.as_ref(), exec)
+            }
         })
         .await;
         let step_wall_seconds = start.elapsed().as_secs_f64();
@@ -534,9 +864,13 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         read_logits: bool,
+        graph: Option<&Arc<DecodeGraph<T>>>,
         exec: &ExecutionContext,
     ) -> Result<StepOutput<Readback<i32>, Readback<f32>>, ModelError> {
-        let output = self.submit_forward_kernels(batch, exec)?;
+        let output = match graph {
+            Some(graph) => self.replay_decode_graph(graph, batch, exec)?,
+            None => self.submit_forward_kernels(batch, exec)?,
+        };
         let token = self.token_readback.enqueue(output.token, exec)?;
         let logits = if read_logits {
             Some(self.logit_readbacks.enqueue(output.logits.unwrap(), exec)?)
@@ -556,7 +890,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         &self,
         batch: &mut [ModelInput<'_, NaiveKVPool<T>>],
         exec: &ExecutionContext,
-    ) -> Result<StepOutput<Tensor<i32>, Tensor<f32>>, ModelError> {
+    ) -> Result<StepOutput<Arc<Tensor<i32>>, Arc<Tensor<f32>>>, ModelError> {
         let submit_started = Instant::now();
         // Thread-local NVTX range covers synchronous submission only, never the await.
         let _range = crate::profiling::ScopedRange::new(
@@ -702,40 +1036,12 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         // All layer accesses share exec's stream. A buffer is overwritten only after
         // its last consumer; no scratch allocation grows with the number of layers.
         for (index, layer) in self.layers.iter().enumerate() {
-            self.normalize(
-                &mut scratch.norm,
-                &scratch.x,
-                layer.input_norm.clone(),
+            self.project_qkv(
+                layer,
+                &mut scratch,
                 &metadata,
-                false,
-                exec,
+                &GpuKernelRecorder::Eager(exec),
             )?;
-            self.linear(
-                c"qwen2.linear.q",
-                &mut scratch.q,
-                &scratch.norm,
-                layer.q.clone(),
-                Some(layer.q_bias.clone()),
-                exec,
-            )?;
-            self.linear(
-                c"qwen2.linear.k",
-                &mut scratch.k,
-                &scratch.norm,
-                layer.k.clone(),
-                Some(layer.k_bias.clone()),
-                exec,
-            )?;
-            self.linear(
-                c"qwen2.linear.v",
-                &mut scratch.v,
-                &scratch.norm,
-                layer.v.clone(),
-                Some(layer.v_bias.clone()),
-                exec,
-            )?;
-            self.rope(&mut scratch.rotated_q, &scratch.q, &metadata, exec)?;
-            self.rope(&mut scratch.rotated_k, &scratch.k, &metadata, exec)?;
             {
                 let _range = crate::profiling::ScopedRange::new(c"qwen2.kv_store");
                 for (input, range) in batch.iter_mut().zip(&query_ranges) {
@@ -780,85 +1086,163 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                     )?;
                 }
             }
-            // Q projection has no remaining consumers: reuse its buffer for O/down.
-            self.linear(
-                c"qwen2.linear.o",
-                &mut scratch.q,
-                &scratch.attention,
-                layer.o.clone(),
-                None,
-                exec,
-            )?;
-            add(&mut scratch.residual, &scratch.x, &scratch.q, exec)?;
-            self.normalize(
-                &mut scratch.norm,
-                &scratch.residual,
-                layer.post_norm.clone(),
+            self.finish_layer(
+                layer,
+                &mut scratch,
                 &metadata,
-                false,
-                exec,
+                &GpuKernelRecorder::Eager(exec),
             )?;
-            if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_FUSED_FFN_TOKEN_ROWS {
-                self.linear_gate_up_swiglu_swizzled(
+        }
+        self.finish_logits(&mut scratch, &metadata, &GpuKernelRecorder::Eager(exec))?;
+        // GPU handles may escape after enqueue; consumers must observe stream order or completion.
+        Ok(StepOutput {
+            token: Arc::new(scratch.winner),
+            logits: Some(Arc::new(scratch.logits)),
+            host_submit_seconds: submit_started.elapsed().as_secs_f64(),
+        })
+    }
+
+    /// Shared eager/captured stages preserve operator order and dtype rounding.
+    unsafe fn project_qkv(
+        &self,
+        layer: &Layer<T>,
+        scratch: &mut Buffers<T>,
+        metadata: &Tensor<i32>,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        self.normalize(
+            &mut scratch.norm,
+            &scratch.x,
+            layer.input_norm.clone(),
+            metadata,
+            false,
+            recorder,
+        )?;
+        self.linear(
+            c"qwen2.linear.q",
+            &mut scratch.q,
+            &scratch.norm,
+            layer.q.clone(),
+            Some(layer.q_bias.clone()),
+            recorder,
+        )?;
+        self.linear(
+            c"qwen2.linear.k",
+            &mut scratch.k,
+            &scratch.norm,
+            layer.k.clone(),
+            Some(layer.k_bias.clone()),
+            recorder,
+        )?;
+        self.linear(
+            c"qwen2.linear.v",
+            &mut scratch.v,
+            &scratch.norm,
+            layer.v.clone(),
+            Some(layer.v_bias.clone()),
+            recorder,
+        )?;
+        self.rope(&mut scratch.rotated_q, &scratch.q, metadata, recorder)?;
+        self.rope(&mut scratch.rotated_k, &scratch.k, metadata, recorder)?;
+        Ok(())
+    }
+
+    unsafe fn finish_layer(
+        &self,
+        layer: &Layer<T>,
+        scratch: &mut Buffers<T>,
+        metadata: &Tensor<i32>,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
+        let rows = scratch.x.shape()[0] as usize;
+        // Q projection has no remaining consumers: reuse its buffer for O/down.
+        self.linear(
+            c"qwen2.linear.o",
+            &mut scratch.q,
+            &scratch.attention,
+            layer.o.clone(),
+            None,
+            recorder,
+        )?;
+        add(&mut scratch.residual, &scratch.x, &scratch.q, recorder)?;
+        self.normalize(
+            &mut scratch.norm,
+            &scratch.residual,
+            layer.post_norm.clone(),
+            metadata,
+            false,
+            recorder,
+        )?;
+        if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_FUSED_FFN_TOKEN_ROWS {
+            self.linear_gate_up_swiglu_swizzled(
+                &mut scratch.activated,
+                &scratch.norm,
+                layer.gate.clone(),
+                layer.up.clone(),
+                recorder,
+            )?;
+        } else {
+            self.linear(
+                c"qwen2.linear.gate",
+                &mut scratch.gate,
+                &scratch.norm,
+                layer.gate.clone(),
+                None,
+                recorder,
+            )?;
+            if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
+                self.linear_swiglu(
                     &mut scratch.activated,
                     &scratch.norm,
-                    layer.gate.clone(),
                     layer.up.clone(),
-                    exec,
+                    &scratch.gate,
+                    recorder,
                 )?;
             } else {
                 self.linear(
-                    c"qwen2.linear.gate",
-                    &mut scratch.gate,
+                    c"qwen2.linear.up",
+                    &mut scratch.up,
                     &scratch.norm,
-                    layer.gate.clone(),
+                    layer.up.clone(),
                     None,
-                    exec,
+                    recorder,
                 )?;
-                if T::DTYPE == cutile::cuda_core::DTypeId::BF16 && rows >= MIN_BULK_TOKEN_ROWS {
-                    self.linear_swiglu(
-                        &mut scratch.activated,
-                        &scratch.norm,
-                        layer.up.clone(),
-                        &scratch.gate,
-                        exec,
-                    )?;
-                } else {
-                    self.linear(
-                        c"qwen2.linear.up",
-                        &mut scratch.up,
-                        &scratch.norm,
-                        layer.up.clone(),
-                        None,
-                        exec,
-                    )?;
-                    let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
+                let _range = crate::profiling::ScopedRange::new(c"qwen2.swiglu");
+                recorder.record(
                     kernels::swiglu(
                         (&mut scratch.activated).partition([1, 256]),
                         &scratch.gate,
                         &scratch.up,
                     )
-                    .generics(vec![T::DTYPE.to_string()])
-                    .execute(exec)?;
-                }
+                    .generics(vec![T::DTYPE.to_string()]),
+                )?;
             }
-            self.linear(
-                c"qwen2.linear.down",
-                &mut scratch.q,
-                &scratch.activated,
-                layer.down.clone(),
-                None,
-                exec,
-            )?;
-            add(&mut scratch.x, &scratch.residual, &scratch.q, exec)?;
         }
+        self.linear(
+            c"qwen2.linear.down",
+            &mut scratch.q,
+            &scratch.activated,
+            layer.down.clone(),
+            None,
+            recorder,
+        )?;
+        add(&mut scratch.x, &scratch.residual, &scratch.q, recorder)?;
+        Ok(())
+    }
+
+    unsafe fn finish_logits(
+        &self,
+        scratch: &mut Buffers<T>,
+        metadata: &Tensor<i32>,
+        recorder: &GpuKernelRecorder<'_>,
+    ) -> Result<(), ModelError> {
         self.normalize(
             &mut scratch.final_norm,
             &scratch.x,
             self.norm.clone(),
-            &metadata,
+            metadata,
             true,
-            exec,
+            recorder,
         )?;
         self.linear(
             c"qwen2.linear.lm_head",
@@ -866,30 +1250,23 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             &scratch.final_norm,
             self.lm_head.clone(),
             None,
-            exec,
+            recorder,
         )?;
         let _argmax = crate::profiling::ScopedRange::new(c"qwen2.argmax");
         let blocks = self.config.vocab_size.div_ceil(256);
-        kernels::argmax_blocks(
+        recorder.record(kernels::argmax_blocks(
             (&mut scratch.maxima).partition([1, 1]),
             (&mut scratch.indices).partition([1, 1]),
             &scratch.logits,
             self.config.vocab_size as i32,
-        )
-        .execute(exec)?;
-        kernels::argmax_final(
+        ))?;
+        recorder.record(kernels::argmax_final(
             (&mut scratch.winner).partition([1]),
             &scratch.maxima,
             &scratch.indices,
             blocks as i32,
-        )
-        .execute(exec)?;
-        // GPU handles may escape after enqueue; consumers must observe stream order or completion.
-        Ok(StepOutput {
-            token: scratch.winner,
-            logits: Some(scratch.logits),
-            host_submit_seconds: submit_started.elapsed().as_secs_f64(),
-        })
+        ))?;
+        Ok(())
     }
 
     unsafe fn linear<O: DType>(
@@ -899,7 +1276,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         x: &Tensor<T>,
         w: Weight<T>,
         bias: Option<Weight<T>>,
-        exec: &ExecutionContext,
+        recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(name);
         let k = x.shape()[1] as usize;
@@ -924,20 +1301,22 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             let blocks = (x.shape()[0] as usize).div_ceil(tile.rows)
                 * (out.shape()[1] as usize).div_ceil(tile.columns);
             generics.extend([tile.group_rows.to_string(), "1".into()]);
-            kernels::linear_swizzled(
-                out.partition([tile.rows, tile.columns])
-                    .map([tile.group_rows, 1], blocks as u32),
-                x,
-                w,
-                bias,
-            )
-            .generics(generics)
-            .grid((blocks as u32, 1, 1))
-            .execute(exec)?;
-        } else {
-            kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
+            recorder.record(
+                kernels::linear_swizzled(
+                    out.partition([tile.rows, tile.columns])
+                        .map([tile.group_rows, 1], blocks as u32),
+                    x,
+                    w,
+                    bias,
+                )
                 .generics(generics)
-                .execute(exec)?;
+                .grid((blocks as u32, 1, 1)),
+            )?;
+        } else {
+            recorder.record(
+                kernels::linear(out.partition([tile.rows, tile.columns]), x, w, bias)
+                    .generics(generics),
+            )?;
         }
         Ok(())
     }
@@ -949,19 +1328,21 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         x: &Tensor<T>,
         w: Weight<T>,
         gate: &Tensor<T>,
-        exec: &ExecutionContext,
+        recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.up_swiglu");
         let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
-        kernels::linear_swiglu(out.partition([tile.rows, tile.columns]), x, w, gate)
-            .generics(vec![
-                T::DTYPE.to_string(),
-                x.shape()[1].to_string(),
-                tile.rows.to_string(),
-                tile.columns.to_string(),
-                tile.reduction.to_string(),
-            ])
-            .execute(exec)?;
+        recorder.record(
+            kernels::linear_swiglu(out.partition([tile.rows, tile.columns]), x, w, gate).generics(
+                vec![
+                    T::DTYPE.to_string(),
+                    x.shape()[1].to_string(),
+                    tile.rows.to_string(),
+                    tile.columns.to_string(),
+                    tile.reduction.to_string(),
+                ],
+            ),
+        )?;
         Ok(())
     }
 
@@ -971,7 +1352,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         x: &Tensor<T>,
         gate: Weight<T>,
         up: Weight<T>,
-        exec: &ExecutionContext,
+        recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.linear.gate_up_swiglu");
         let tile = LinearTile::for_shape::<T>(x.shape()[0] as usize, out.shape()[1] as usize);
@@ -987,15 +1368,16 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         let blocks = ((x.shape()[0] as usize).div_ceil(tile.rows)
             * (out.shape()[1] as usize).div_ceil(columns)) as u32;
         generics.extend([tile.group_rows.to_string(), "1".into()]);
-        kernels::linear_gate_up_swiglu_swizzled(
-            out.partition([tile.rows, columns])
-                .map([tile.group_rows, 1], blocks),
-            x,
-            gate,
-            up,
-        )
-        .generics(generics)
-        .execute(exec)?;
+        recorder.record(
+            kernels::linear_gate_up_swiglu_swizzled(
+                out.partition([tile.rows, columns])
+                    .map([tile.group_rows, 1], blocks),
+                x,
+                gate,
+                up,
+            )
+            .generics(generics),
+        )?;
         Ok(())
     }
 
@@ -1006,7 +1388,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         w: Weight<T>,
         metadata: &Tensor<i32>,
         gather: bool,
-        exec: &ExecutionContext,
+        recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let width = self.config.hidden_size;
         let _range = crate::profiling::ScopedRange::new(c"qwen2.rms_norm");
@@ -1016,22 +1398,23 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
             pointwise_rows::<T>(x.shape()[0] as usize, width.next_power_of_two())
         };
         let last_rows_offset = x.shape()[0] * kernels::TOKEN_METADATA_WIDTH;
-        kernels::rms_norm(
-            out.partition([tile_rows, width.next_power_of_two()]),
-            x,
-            w,
-            metadata,
-            self.config.rms_norm_eps,
-            width as i32,
-            last_rows_offset,
-        )
-        .generics(vec![
-            T::DTYPE.to_string(),
-            width.next_power_of_two().to_string(),
-            gather.to_string(),
-            tile_rows.to_string(),
-        ])
-        .execute(exec)?;
+        recorder.record(
+            kernels::rms_norm(
+                out.partition([tile_rows, width.next_power_of_two()]),
+                x,
+                w,
+                metadata,
+                self.config.rms_norm_eps,
+                width as i32,
+                last_rows_offset,
+            )
+            .generics(vec![
+                T::DTYPE.to_string(),
+                width.next_power_of_two().to_string(),
+                gather.to_string(),
+                tile_rows.to_string(),
+            ]),
+        )?;
         Ok(())
     }
 
@@ -1040,18 +1423,19 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         out: &mut Tensor<T>,
         x: &Tensor<T>,
         metadata: &Tensor<i32>,
-        exec: &ExecutionContext,
+        recorder: &GpuKernelRecorder<'_>,
     ) -> Result<(), ModelError> {
         let _range = crate::profiling::ScopedRange::new(c"qwen2.rope");
         let tile_rows = pointwise_rows::<T>(x.shape()[0] as usize, 64);
-        kernels::rope(
-            out.partition([tile_rows, 64]),
-            x,
-            self.inv_freq.clone(),
-            metadata,
-        )
-        .generics(vec![T::DTYPE.to_string(), tile_rows.to_string()])
-        .execute(exec)?;
+        recorder.record(
+            kernels::rope(
+                out.partition([tile_rows, 64]),
+                x,
+                self.inv_freq.clone(),
+                metadata,
+            )
+            .generics(vec![T::DTYPE.to_string(), tile_rows.to_string()]),
+        )?;
         Ok(())
     }
 }
@@ -1356,9 +1740,34 @@ impl<T: WeightElement + ElementType> CausalModel<NaiveKVPool<T>> for Qwen2Engine
         let prefill = batch.iter().zip(&outputs).any(|(input, output)| {
             output.is_ok() && (input.kv.ready_len() == 0 || input.uncached_len() > 1)
         });
+        let selected: Vec<_> = batch
+            .iter_mut()
+            .zip(&outputs)
+            .filter_map(|(input, result)| {
+                result.is_ok().then(|| ModelInput {
+                    token_ids: input.token_ids.clone(),
+                    kv: &mut *input.kv,
+                })
+            })
+            .collect();
+        let graph = match self.prepare_decode_graph(&selected) {
+            Ok(graph) => graph,
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|o| o.is_ok()) {
+                    *output = Err(error.clone());
+                }
+                return outputs;
+            }
+        };
+        drop(selected);
         let submit = |batch: &mut [ModelInput<'_, NaiveKVPool<T>>], exec: &ExecutionContext| {
             // SAFETY: all layers and their resources belong to this submission.
-            unsafe { self.submit_forward_kernels(batch, exec) }
+            unsafe {
+                match &graph {
+                    Some(graph) => self.replay_decode_graph(graph, batch, exec),
+                    None => self.submit_forward_kernels(batch, exec),
+                }
+            }
         };
         let result = if outputs.iter().any(Result::is_err) {
             // only execute non-error request
@@ -1485,6 +1894,26 @@ impl<T: WeightElement + ElementType> CausalModel<NaiveKVPool<T>> for Qwen2Engine
             result.is_ok()
                 && (!matches!(input.token_ids, ModelTokens::Device(_)) || input.uncached_len() > 1)
         });
+        let graph_inputs: Vec<_> = batch
+            .iter_mut()
+            .zip(&outputs)
+            .filter_map(|(input, result)| {
+                result.is_ok().then(|| ModelInput {
+                    token_ids: input.token_ids.clone(),
+                    kv: &mut *input.kv,
+                })
+            })
+            .collect();
+        let graph = match self.prepare_decode_graph(&graph_inputs) {
+            Ok(graph) => graph,
+            Err(error) => {
+                for output in outputs.iter_mut().filter(|o| o.is_ok()) {
+                    *output = Err(error.clone());
+                }
+                return SubmittedGpuWorkWithCompletion::from_completed_output(outputs);
+            }
+        };
+        drop(graph_inputs);
         let selected = outputs
             .iter()
             .enumerate()
@@ -1495,7 +1924,12 @@ impl<T: WeightElement + ElementType> CausalModel<NaiveKVPool<T>> for Qwen2Engine
         let submitted =
             Self::enqueue_append_batch(batch, selected, &policy, move |inputs, exec| {
                 // SAFETY: the common helper prepares KV and retains submission resources.
-                unsafe { model.submit_forward_kernels(inputs, exec) }
+                unsafe {
+                    match &graph {
+                        Some(graph) => model.replay_decode_graph(graph, inputs, exec),
+                        None => model.submit_forward_kernels(inputs, exec),
+                    }
+                }
             })
             .await;
         let SubmittedGpuWorkWithCompletion {
@@ -1607,19 +2041,20 @@ unsafe fn add<T: DType>(
     out: &mut Tensor<T>,
     x: &Tensor<T>,
     y: &Tensor<T>,
-    exec: &ExecutionContext,
+    recorder: &GpuKernelRecorder<'_>,
 ) -> Result<(), ModelError> {
     let _range = crate::profiling::ScopedRange::new(c"qwen2.residual_add");
-    kernels::add(
-        out.partition([pointwise_rows::<T>(x.shape()[0] as usize, 256), 256]),
-        x,
-        y,
-    )
-    .generics(vec![
-        T::DTYPE.to_string(),
-        pointwise_rows::<T>(x.shape()[0] as usize, 256).to_string(),
-    ])
-    .execute(exec)?;
+    recorder.record(
+        kernels::add(
+            out.partition([pointwise_rows::<T>(x.shape()[0] as usize, 256), 256]),
+            x,
+            y,
+        )
+        .generics(vec![
+            T::DTYPE.to_string(),
+            pointwise_rows::<T>(x.shape()[0] as usize, 256).to_string(),
+        ]),
+    )?;
     Ok(())
 }
 
@@ -1696,6 +2131,7 @@ mod tests {
                 let workspaces: Arc<WorkspacePool<T>> = Arc::default();
                 let instruments = Instruments::new(workspaces.metrics().model_instance);
                 Ok(Qwen2Engine {
+                    graphs: None,
                     token_readback: GpuTokenReadback::new(
                         exec.get_cuda_stream().device(),
                         instruments.readback_duration.clone(),
@@ -1726,6 +2162,370 @@ mod tests {
         })
         .schedule(policy)?
         .await?
+    }
+
+    #[tokio::test]
+    async fn qwen_graph_matches_eager_and_releases_sessions() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let eager = tiny_model(&policy).await?;
+        let graph = tiny_model(&policy).await?.with_cuda_graphs();
+        let mut config = graph.kv_pool_config(32)?;
+        config.max_rows = 4;
+        config.num_slots *= 4;
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let mut ea = KVContext::new(pool.clone())?;
+        let mut eb = KVContext::new(pool.clone())?;
+        let mut histories = [vec![1, 2, 3], vec![4, 5]];
+        let mut feedback: Vec<NextToken> = Vec::new();
+        for step in 0..6 {
+            let expected = eager
+                .next_tokens(
+                    &mut [
+                        ModelInput {
+                            token_ids: (&histories[0]).into(),
+                            kv: &mut ea,
+                        },
+                        ModelInput {
+                            token_ids: (&histories[1]).into(),
+                            kv: &mut eb,
+                        },
+                    ],
+                    policy.clone(),
+                )
+                .await;
+            let mut inputs = [
+                ModelInput {
+                    token_ids: if feedback.is_empty() {
+                        (&histories[0]).into()
+                    } else {
+                        match &feedback[0] {
+                            NextToken::Device(t) => ModelTokens::Device(t.clone()),
+                            _ => unreachable!(),
+                        }
+                    },
+                    kv: &mut a,
+                },
+                ModelInput {
+                    token_ids: if feedback.is_empty() {
+                        (&histories[1]).into()
+                    } else {
+                        match &feedback[1] {
+                            NextToken::Device(t) => ModelTokens::Device(t.clone()),
+                            _ => unreachable!(),
+                        }
+                    },
+                    kv: &mut b,
+                },
+            ];
+            if step % 2 == 1 {
+                inputs.swap(0, 1);
+            }
+            let mut outputs = graph.forward(&mut inputs, policy.clone()).await;
+            if step % 2 == 1 {
+                outputs.swap(0, 1);
+            }
+            let mut next = Vec::new();
+            for (index, (actual, expected)) in outputs.into_iter().zip(expected).enumerate() {
+                let actual = actual?;
+                let token = actual.clone().read().await?;
+                assert_eq!(token, expected?);
+                histories[index].push(token);
+                next.push(actual);
+            }
+            feedback = next;
+        }
+        drop(feedback);
+        for ctx in [a, b, ea, eb] {
+            ctx.release();
+        }
+        assert_eq!(
+            pool.metrics(),
+            initial,
+            "graph must not retain session allocations"
+        );
+        let metrics = graph.cuda_graph_metrics();
+        assert_eq!(metrics.replays, 5);
+        assert_eq!(
+            metrics.captures, 2,
+            "live GPU predictions must force separate output buffers"
+        );
+        assert_eq!(
+            graph.workspace_metrics().in_use_bytes,
+            metrics.retained_workspace_bytes
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qwen_graph_replay_requires_a_pending_write_view() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let model = tiny_model(&policy).await?.with_cuda_graphs();
+        let pool = NaiveKVPool::new(model.kv_pool_config(8)?, &policy).await?;
+        let initial = pool.metrics();
+        let mut kv = KVContext::new(pool.clone())?;
+        let mut history = vec![1, 2];
+        let next = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: (&history).into(),
+                    kv: &mut kv,
+                }],
+                policy.clone(),
+            )
+            .await
+            .pop()
+            .unwrap()?;
+        history.push(next);
+        let graph = model
+            .prepare_decode_graph(&[ModelInput {
+                token_ids: (&history).into(),
+                kv: &mut kv,
+            }])?
+            .unwrap();
+        let result = with_context(|exec| {
+            value(unsafe {
+                model.replay_decode_graph(
+                    &graph,
+                    &mut [ModelInput {
+                        token_ids: (&history).into(),
+                        kv: &mut kv,
+                    }],
+                    exec,
+                )
+            })
+        })
+        .schedule(&policy)?
+        .await?;
+        assert!(
+            result.is_err(),
+            "cached storage must not grant write authority without an append"
+        );
+        assert_eq!(kv.ready_len(), 2);
+        assert!(!kv.is_pending());
+        kv.release();
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qwen_graph_rejects_incompatible_pool_before_capture() -> Result<(), ModelError> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let model = tiny_model(&policy).await?.with_cuda_graphs();
+        let mut config = model.kv_pool_config(8)?;
+        config.head_dim = 16; // Model expects a 64-wide K/V vector.
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let mut kv = KVContext::new(pool.clone())?;
+        // Establish a mapped cursor only; rejection must happen before any K/V read.
+        with_context(|exec| value(kv.prepare_append(1, exec)))
+            .schedule(&policy)?
+            .await??;
+        kv.commit_append()?;
+        let outputs = model
+            .forward(
+                &mut [ModelInput {
+                    token_ids: (&[1u32, 2]).into(),
+                    kv: &mut kv,
+                }],
+                policy,
+            )
+            .await;
+        assert!(matches!(&outputs[0], Err(ModelError::InvalidInput(_))));
+        assert_eq!(model.cuda_graph_metrics().captures, 0);
+        assert_eq!(kv.ready_len(), 1);
+        assert!(!kv.is_pending());
+        kv.release();
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qwen_graph_retains_inflight_instances_behind_a_stream_gate() -> anyhow::Result<()> {
+        use crate::runner::model::submission::tests::Gate;
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let device = Device::new(0)?;
+        let single = SingleStream::new(&device)?;
+        let stream = single.stream().clone();
+        let policy: Arc<dyn SchedulingPolicy> = Arc::new(single);
+        let model = tiny_model(&policy).await?.with_cuda_graphs();
+        let mut config = model.kv_pool_config(16)?;
+        config.max_rows = 2;
+        config.num_slots *= 2;
+        let pool = NaiveKVPool::new(config, &policy).await?;
+        let initial = pool.metrics();
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let mut ha = vec![1, 2];
+        let mut hb = vec![3, 4];
+        let a0 = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: (&ha).into(),
+                    kv: &mut a,
+                }],
+                policy.clone(),
+            )
+            .await
+            .pop()
+            .unwrap()?;
+        let b0 = model
+            .next_tokens(
+                &mut [ModelInput {
+                    token_ids: (&hb).into(),
+                    kv: &mut b,
+                }],
+                policy.clone(),
+            )
+            .await
+            .pop()
+            .unwrap()?;
+        ha.push(a0);
+        hb.push(b0);
+        // Warm both graph arenas, modules and upload allocations before blocking a stream.
+        let ga = model
+            .prepare_decode_graph(&[ModelInput {
+                token_ids: (&ha).into(),
+                kv: &mut a,
+            }])?
+            .unwrap();
+        let gb = model
+            .prepare_decode_graph(&[ModelInput {
+                token_ids: (&hb).into(),
+                kv: &mut b,
+            }])?
+            .unwrap();
+        for (history, kv, graph) in [(&ha, &mut a, &ga), (&hb, &mut b, &gb)] {
+            with_context(|exec| {
+                value((|| -> Result<(), ModelError> {
+                    kv.prepare_append(1, exec)?;
+                    unsafe {
+                        model.replay_decode_graph(
+                            graph,
+                            &mut [ModelInput {
+                                token_ids: history.into(),
+                                kv: &mut *kv,
+                            }],
+                            exec,
+                        )?;
+                    }
+                    Ok(())
+                })())
+            })
+            .sync_on(&stream)??;
+            kv.commit_append()?;
+        }
+        ha.push(1);
+        hb.push(2);
+        // Pre-bind the next slots too: the gated operations perform uploads/replay only.
+        with_context(|exec| {
+            value(KVContext::prepare_append_batch(
+                &mut [(&mut a, 1), (&mut b, 1)],
+                exec,
+            ))
+        })
+        .sync_on(&stream)??;
+        let captures = model.cuda_graph_metrics().captures;
+        let mut first = Box::pin(
+            with_context(|exec| {
+                value(unsafe {
+                    model.replay_decode_graph(
+                        &ga,
+                        &mut [ModelInput {
+                            token_ids: (&ha).into(),
+                            kv: &mut a,
+                        }],
+                        exec,
+                    )
+                })
+            })
+            .schedule(&policy)?,
+        );
+        let mut second = Box::pin(
+            with_context(|exec| {
+                value(unsafe {
+                    model.replay_decode_graph(
+                        &gb,
+                        &mut [ModelInput {
+                            token_ids: (&hb).into(),
+                            kv: &mut b,
+                        }],
+                        exec,
+                    )
+                })
+            })
+            .schedule(&policy)?,
+        );
+        // Declared last, so panic unwinding releases the gate before draining either future.
+        let gate = Gate::arm(&stream)?;
+        let expired = gate.expired.clone();
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(model.cuda_graph_metrics().captures, captures);
+        drop(gate);
+        let first = first.await??;
+        let second = second.await??;
+        assert!(!Arc::ptr_eq(&first.token, &second.token));
+        assert!(
+            !expired.load(std::sync::atomic::Ordering::Acquire),
+            "stream gate expired"
+        );
+        a.commit_append()?;
+        b.commit_append()?;
+        a.release();
+        b.release();
+        assert_eq!(pool.metrics(), initial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires QWEN2_MODEL_DIR; exact BF16 eager/graph common-history comparison"]
+    async fn real_bf16_qwen_graph_matches_eager_logits() -> anyhow::Result<()> {
+        let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+        let policy = cuda_async::device_context::global_policy(0)?;
+        let path = std::env::var("QWEN2_MODEL_DIR")?;
+        let mut model = Qwen2Engine::<cutile::core::bf16>::load(Path::new(&path), &policy)
+            .await?
+            .with_cuda_graphs();
+        let graph_cache = model.graphs.clone();
+        for pattern in ["repeated", "ramp"] {
+            let mut history: Vec<u32> = (0..4096)
+                .map(|i| 9707 + if pattern == "ramp" { i % 4096 } else { 0 })
+                .collect();
+            let mut config = model.kv_pool_config(4160)?;
+            config.max_rows = 2;
+            config.num_slots *= 2;
+            let pool = NaiveKVPool::new(config, &policy).await?;
+            let initial = pool.metrics();
+            let mut eager = KVContext::new(pool.clone())?;
+            let mut graph = KVContext::new(pool.clone())?;
+            for step in 0..64 {
+                model.graphs = None;
+                let (a, al) = model
+                    .step_with_logits(&history, &mut eager, policy.clone())
+                    .await?;
+                model.graphs = graph_cache.clone();
+                let (b, bl) = model
+                    .step_with_logits(&history, &mut graph, policy.clone())
+                    .await?;
+                assert_eq!(a, b, "{pattern}, step {step}");
+                assert_eq!(al, bl, "{pattern}, step {step}: graph changed arithmetic");
+                history.push(a);
+            }
+            eager.release();
+            graph.release();
+            assert_eq!(pool.metrics(), initial);
+        }
+        assert_eq!(
+            model.workspace_metrics().in_use_bytes,
+            model.cuda_graph_metrics().retained_workspace_bytes
+        );
+        Ok(())
     }
 
     #[test]
