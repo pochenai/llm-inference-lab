@@ -18,7 +18,8 @@ Tensor Core-compatible tile shapes; generated SASS confirms the QKV HMMA path.
 Measurements distinguish eager and Graph
 modes; neither static-model latency nor fixed-cohort overlap establishes serving
 throughput. W9 prefix reuse, shared KV ownership, LRU eviction and local cache-aware
-routing are implemented; Runner-level cache benchmarking is the next experiment.
+routing are implemented. Runner/Engine cold/warm comparison results are recorded
+in [the roadmap](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01).
 
 | Week / unit | Brief content | Status |
 | --- | --- | --- |
@@ -48,6 +49,8 @@ routing are implemented; Runner-level cache benchmarking is the next experiment.
   structured tracing. No exporter or external monitoring service is installed.
 - [Qwen benchmark](rust/engine/benches/qwen2.rs) uses fresh KV per sample and
   reports prefill/decode latency, tokens/s, scratch ownership and CUDA-pool peaks.
+  A separate [Runner prefix-cache benchmark](rust/engine/benches/qwen2_prefix_cache.rs)
+  compares cold/warm cohorts with measured reuse and computed-token checks.
   See the [engine guide](rust/engine/README.md) for runnable commands.
 
 ## W8: Qwen kernel and execution optimization — Done
@@ -116,7 +119,8 @@ candidates. That targeted percentage is separate from the final matrix above.
 BF16 reduction/tile changes may alter logits and generated IDs; CPU/operator,
 lifecycle and exact real-model eager/Graph checks accompany the implementation.
 
-Next: Runner-level prefix-cache benchmarks and matched SGLang comparison. True quantization remains a separate W7 follow-up.
+Runner-level prefix-cache benchmarks and the matched SGLang Engine comparison are
+complete; see [the roadmap results](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01). True quantization remains a separate W7 follow-up.
 
 
 Graph cache counters report captures, replays, cached instances and retained

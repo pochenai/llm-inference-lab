@@ -92,8 +92,9 @@ historical baselines and one-change attribution, not replacement cells for the f
 ### Next work after W9
 
 1. W9 implementation is complete: exact local prefix reuse, shared ownership, LRU
-   eviction and local cache-aware routing. Next add a Runner-level prefix-cache
-   benchmark and compare controlled cold/hot workloads with SGLang.
+   eviction and local cache-aware routing. The separate Runner-level
+   `qwen2_prefix_cache` benchmark and matched SGLang Engine comparison are complete
+   (results below); sustained-arrival/eviction-pressure evaluation remains separate.
 2. Keep W6 mixed-arrival/budget evaluation and W7 true quantization as separate
    follow-ups. Native BF16 is complete; INT8/INT4/FP8 quantization is not.
 3. Preserve eager/Graph and serial/overlap controls. Re-run the pinned static matrix
@@ -247,7 +248,7 @@ prerequisite week.
 | W6 | Continuous batching, chunked prefill and submission-first overlap | Implemented; fixed-cohort Runner A/B and Nsight complete; mixed-arrival evaluation pending |
 | W7 | Native BF16 Qwen, then a separate quantization path | BF16 implemented; true quantization acceptance remains separate |
 | W8 | Qwen kernel and execution optimization, beginning at 52f19b0 — Done | Prefill/decode tuning, HMMA-compatible QKV/down tiles, optional decode Graph, full matched eager/Graph SGLang matrix and separate Nsight/SASS validation |
-| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Done | Cold/hot cache comparison, prefix hits, shared ownership, routing decisions |
+| W9 | Radix prefix caching, sharing/reclamation, and cache-aware routing — Done | Exact prefix reuse, shared KV ownership, LRU eviction and local routing implemented; performance evaluation remains separate |
 | W10 | MLA, MoE, and hybrid state | Original plan retained |
 | W11 | Multi-GPU execution | Original plan retained |
 | W12 | Distributed KV and prefill/decode disaggregation | Original plan retained |
@@ -687,12 +688,90 @@ do not prove prefill savings. W8 static comparison remains unchanged.
 Implementation is complete; unchecked items below are benchmark/evaluation follow-ups,
 not claims of demonstrated serving throughput or distributed deployment.
 
-- [ ] Compare cold/hot cache and unrelated/shared prefixes with identical token histories and model settings; verify exact computed-token savings and outputs.
+- [x] Separate Runner-level `qwen2_prefix_cache` harness validates exact cold/warm reused/computed tokens, text equality and KV cleanup; release smoke covers BF16 overlap/Graph, FP32 serial, zero prefix and 4K/2K input/prefix.
+- [x] Repeat matched SGLang Engine comparisons across three independent processes per engine/configuration, retaining all cold/warm samples and output differences (tables below).
+- [ ] Evaluate sustained arrivals, eviction pressure and multi-worker routing; fixed-cohort latency is not serving-throughput evidence.
 - [x] Opt-in Qwen prefix reuse matches uncached logits/tokens, including exact/partial/no-hit prefixes, chunking, serial/overlap and decode Graphs.
 - [x] Rowless cached prefixes survive session close; child contexts append independent slots; final Runner/cache release restores capacity. Tight-capacity Runner tests prove reuse is required for admission.
 - [x] Unpinned-leaf LRU eviction reclaims slots under publication/admission pressure; active and gated in-flight paths remain protected. Cache limits and context-row exhaustion stay separate.
 - [ ] A small controlled multi-owner routing experiment chooses the appropriate cached owner and handles misses/stale hints; label any mock routing as simulation.
-- [ ] Distinguish hit rate, prefill work saved, latency, and throughput rather than treating them as interchangeable.
+- [x] Report cache-hit/work counters separately from fixed-cohort latency; saturated serving throughput remains a separate measurement.
+
+
+### W9 Runner/Engine prefix-cache comparison — 2026-11-01
+
+The W9 implementation is complete. This follow-up measures a fixed cohort through
+our Scheduler/Runner versus SGLang's Engine API, including tokenization, scheduling,
+generation and streamed text, with HTTP disabled. It is separate from the W8 static
+model-only tables above and does not establish saturated serving throughput.
+
+Protocol: Qwen2.5-0.5B-Instruct snapshot `7ae557604adf67be50417f59c2c2f167def9a775`,
+BF16, Rust optimized bench profile, installed SGLang 0.5.9/FlashInfer, overlap on,
+greedy/ignored EOS, identical round-trip token IDs, and 20,480 usable KV token slots
+in each engine. Rust's retained-cache budget is also 20,480. SGLang uses page size
+1, native batch-tokenizer ingress and context limit 8192 for its input guard's
+headroom; actual inputs are 4096 tokens. Full prefill fits each engine's token
+budget. The working sets fit the pool; this does not benchmark LRU pressure.
+
+Every sample starts with empty KV; warm samples seed only the shared prefix outside
+timing. Each state gets two warmup cohorts and three measured cohorts in each of
+three independent process repetitions, alternating engine order. Values below are
+**medians of per-process mean cohort wall times**, in milliseconds. There are 216
+measured cohorts per engine. Model/JIT/workspace/Graph state remains warm, while
+KV is reset. No profiler is attached and clocks/background load are uncontrolled.
+
+**One-output eager cohorts.** Percentages in Rust cells are latency changes relative
+to the matching SGLang state. P=0's warm column is a second empty-cache control.
+
+| Shared prefix tokens/request | Cohort | Rust cold (ms) | SGLang cold (ms) | Rust warm (ms) | SGLang warm (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 93.83 (↓16.4%) | 112.25 | 94.33 (↓16.5%) | 112.95 |
+| 0 | 2 | 181.35 (↓12.5%) | 207.30 | 181.97 (↓13.4%) | 210.21 |
+| 0 | 4† | 359.98 (↓11.5%) | 406.75 | 360.61 (↓11.2%) | 406.07 |
+| 2048 | 1 | 93.55 (↓16.4%) | 111.94 | 57.87 (↓18.0%) | 70.56 |
+| 2048 | 2 | 181.03 (↓12.6%) | 207.17 | 109.31 (↓13.0%) | 125.71 |
+| 2048 | 4 | 360.33 (↓11.5%) | 407.28 | 212.25 (↓9.5%) | 234.59 |
+| 3584 | 1 | 93.05 (↓16.9%) | 111.96 | 24.69 (↓27.1%) | 33.89 |
+| 3584 | 2 | 179.63 (↓13.3%) | 207.27 | 44.09 (↓15.9%) | 52.44 |
+| 3584 | 4† | 358.16 (↓11.7%) | 405.51 | 79.46 (↓10.3%) | 88.58 |
+
+**64-output CUDA Graph control.** Input is 4096 tokens with a 2048-token shared prefix.
+This is whole-cohort generation latency including prefill, not isolated decode time.
+
+| Shared prefix tokens/request | Cohort | Rust cold (ms) | SGLang cold (ms) | Rust warm (ms) | SGLang warm (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 2048 | 1 | 340.58 (↓1.0%) | 344.16 | 304.88 (↑0.4%) | 303.79 |
+| 2048 | 2 | 410.70 (↓1.4%) | 416.68 | 336.28 (↑0.3%) | 335.29 |
+| 2048 | 4† | 610.98 (↓2.0%) | 623.38 | 455.72 (↑0.1%) | 455.42 |
+
+For nonzero shared prefixes, Rust warm latency is **9.5–27.1% lower** in this run.
+Graph generation is practically close: Rust warm medians are **0.07–0.36% higher**.
+Do not extend the prefill-only advantage to all generation workloads.
+
+**Validation and limits.** Each engine's cold/warm outputs are stable across all
+samples and process repetitions. Actual input lengths, output budgets and cache
+hits are checked; Rust also checks computed token/forward counts and KV release.
+Warm prefill rows/request are 4096, 2048 and 512 for prefixes 0, 2048 and 3584.
+† Cross-engine text matches in 9/12 rows: the third request differs in B4/P0
+prefill, B4/P3584 prefill and B4/P2048 Graph generation. The cause is not isolated;
+these marked rows compare fixed budgets rather than prove output equivalence.
+The marked generation row may have different autoregressive histories. This is
+not held-out quality evidence. SGLang's standard IPC/cumulative-text stream and
+Rust's in-process/delta stream are included, so the difference cannot be attributed
+solely to kernels or language. Cache seeding cost is excluded from warm latency.
+
+Reproduce from the repository root:
+
+```bash
+~/.venvs/py3.12/bin/python rust/engine/benches/qwen2_prefix_cache_compare.py --model-dir MODEL_DIR --include-graph-control
+```
+
+See the
+[full report and raw provenance](rust/profiling/qwen2/prefix-cache-comparison-20261101-143149/RESULTS.md),
+[summary](rust/profiling/qwen2/prefix-cache-comparison-20261101-143149/summary.json),
+and [comparison driver](rust/engine/benches/qwen2_prefix_cache_compare.py).
+Cold/hot sustained arrivals, eviction-pressure behavior and multi-worker routing
+remain independent evaluations.
 
 ### Phase C: modern model architectures (W10)
 

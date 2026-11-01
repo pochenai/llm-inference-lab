@@ -255,6 +255,67 @@ and automatic idle-session release remain deferred. No cache is enabled by defau
 Node ownership, in-flight split/release validation and paired CPU measurements are
 recorded in the local [node-prefix report](../profiling/qwen2/node-prefix-20261101/RESULTS.md).
 
+### Runner-level prefix-cache benchmark
+
+The separate [qwen2_prefix_cache benchmark](benches/qwen2_prefix_cache.rs) runs a
+fixed cohort through Scheduler, Runner, the real Qwen model and streamed text.
+It measures empty-cache versus preseeded-prefix execution with distinct suffixes:
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen2_prefix_cache -- --model-dir MODEL_DIR --tokens 4096 --prefix-tokens 2048 --batch-size 4 --output-tokens 1 --warmup 2 --iterations 3
+```
+
+Sweep `--prefix-tokens 0/2048/3584` and `--batch-size 1/2/4`; use
+`--output-tokens 64` for a generation-heavy control. `--cache-state cold|warm|both`
+defaults to `both`, with alternating state order. `--mode serial|overlap`,
+`--cuda-graph` and `--dtype bf16|f32` are independent controls. `--cache-tokens`
+defaults to 4096 and must hold the shared prefix. A unique suffix token is required.
+
+Each sample uses a fresh Runner/cache and the same model/pool, preserving JIT,
+workspace and Graph caches. Warm samples seed only the shared prefix outside
+measurement. Both states run warmup samples before measured samples. Pool slots
+are explicitly provisioned as `cache_tokens + batch_size * max_seq_len`; the
+configuration JSON records that capacity and the exact synthetic token pattern.
+`--num-slots` overrides the derived physical capacity for matched-engine runs.
+All prompts must round-trip through the model tokenizer without changing IDs.
+
+JSONL reports raw samples, counter observations and per-state summaries; warmup
+samples are excluded from summaries. Assertions verify zero cold hits, exact warm
+reuse, the expected computed token/forward counts, identical cold/warm output text,
+fixed output budgets and final KV reclamation. The local debugging metrics recorder
+is enabled in both states; its snapshots drain counters outside timing. CUDA Graph
+and workspace metrics in summaries are model-lifetime snapshots.
+
+Time includes request ingress/tokenization, generation and text delivery. It excludes
+model/Runner setup, prefix seeding and shutdown, and measures no HTTP transport.
+Time to first text is not pure GPU TTFT. These fixed-cohort samples are a prefix-reuse
+baseline, not sustained-arrival, eviction-pressure or multi-worker routing results.
+Compare SGLang under the same timing boundary, inputs and effective KV capacity.
+The matched comparison driver freezes an optimized Rust binary and SGLang adapter,
+uses identical text/token patterns and physical KV slots, and alternates engine
+order across independent process repetitions:
+
+```bash
+~/.venvs/py3.12/bin/python rust/engine/benches/qwen2_prefix_cache_compare.py --model-dir MODEL_DIR --include-graph-control
+```
+
+Its SGLang 0.5.9 Engine adapter includes tokenizer/scheduler/streamed text and IPC,
+with native batch-tokenizer ingress, BF16 FlashInfer attention, overlap and page size
+1. It verifies actual cache hits and request lengths, rejects aborted/truncated
+requests, and keeps HTTP disabled. The context limit is 8192 to accommodate SGLang's
+input headroom; physical KV slots are matched separately. The default matrix uses
+20,480 physical slots and the same retained-cache budget in Rust, so the working
+sets fit without intentional eviction pressure. It is an engine-pipeline comparison,
+not a kernel-only or multi-worker routing measurement. Commands, versions, source/
+binary hashes, fixtures and every raw sample remain in a fresh profiling directory.
+The [2026-11-01 matched results](../profiling/qwen2/prefix-cache-comparison-20261101-143149/RESULTS.md)
+are recorded in [the roadmap](../../roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01),
+including cross-engine text differences and the distinct prefill/generation conclusions.
+
+Local optimized-checkpoint smoke runs cover BF16 overlap/Graph, FP32 serial, zero
+prefix and 4K/2K input/prefix; [raw verification](../profiling/qwen2/prefix-cache-runner-20261101/RESULTS.md)
+retains commands, samples and binary/source hashes. This is not an SGLang comparison.
+
 ## Uniform attention-MLP profiling
 
 `examples/simple_mlp_attn.rs` runs uniform stateless requests through Scheduler and
