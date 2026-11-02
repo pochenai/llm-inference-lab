@@ -21,6 +21,8 @@ throughput. W9 prefix reuse, shared KV ownership, LRU eviction and local cache-a
 routing are implemented. Runner/Engine cold/warm comparison results are recorded
 in [the roadmap](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01).
 
+### Foundations: a working single-GPU inference engine (W1–W9)
+
 | Week / unit | Brief content | Status |
 | --- | --- | --- |
 | 1 | [Model loader, formats, and storage](d1_model_formats/README.md) | ✅ Implemented |
@@ -29,15 +31,39 @@ in [the roadmap](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01)
 | 4 | CUDA Graph foundations, pooled workspace/replay, and mapped host output | ✅ SimpleMLP implemented; Qwen extension in W8 |
 | 5 | Qwen2.5-0.5B-Instruct: operators, reference checks, scratch reuse, metrics and benchmark | ✅ Done |
 | 6 | Continuous batching, chunked prefill and submission-first overlap | ✅ Fixed-cohort overlap A/B and Nsight validated; mixed arrivals pending |
-| 7 | Native BF16 Qwen; separate quantization follow-up | ✅ BF16 implemented; quantization planned |
+| 7 | Native BF16 Qwen and mixed-precision execution | ✅ Done; real quantization is W13 |
 | 8 | Qwen kernel/execution optimization: KV-tile/GQA reuse, M/N/K tile selection, HMMA QKV/down, fusion/swizzling, split-KV and CUDA Graph | ✅ Done; current-source prefill/decode SGLang comparison and Nsight/SASS validation |
 | 9 | Radix prefix caching, shared KV lifecycle, and cache-aware routing | ✅ Done; local routing, shared prefix KV, LRU eviction and fixed-cohort cold/warm SGLang comparison complete |
-| 10 | Modern model architectures | ⬜ Planned |
-| 11 | Multi-GPU execution | ⬜ Planned |
-| 12 | Distributed KV cache and prefill/decode disaggregation | ⬜ Planned |
-| 13 | Routing and serving | ⬜ Planned |
-| 14 | End-to-end synthesis | ⬜ Planned |
 
+### Advanced: modern models and distributed inference (W10–W16)
+
+Develop each mechanism with small tensors or reduced configurations first, then
+validate real checkpoint correctness, memory and performance on suitable rented
+GPUs. Multi-GPU and PD experiments require the corresponding GPU allocation.
+
+| Week / unit | Brief content | Status |
+| --- | --- | --- |
+| 10 | Qwen3.5-35B-A3B BF16 text-only inference, target-specific state/operators, and GPU sampling | ⬜ Planned |
+| 11 | Execution domains, model parallelism and replica routing | ⬜ Planned; TP/external DP, PP/EP where required |
+| 12 | Prefill/decode disaggregation and whole-state handoff | ⬜ Planned; homogeneous layout and partition shape first |
+| 13 | Official Qwen3.5-35B-A3B-FP8 execution | ⬜ Planned; block scales, dynamic activation quantization, memory/quality/performance validation |
+| 14 | Speculative decoding | ⬜ Planned; one draft/verify path with state rollback |
+| 15 | Hierarchical KV/model-state caching | ⬜ Planned; bounded GPU/CPU residency, eviction and reload |
+| 16 | End-to-end load validation and integrated acceptance | ⬜ Planned; sustained arrivals, resource cleanup, routing/SLO evaluation, small ablations and one reproducible report |
+
+The remaining main track covers one modern BF16 target model and its official FP8 path
+(W13), sampling, parallel execution/PD, hierarchical state
+caching, speculation and loaded serving validation. Keep Qwen2.5-0.5B as a regression
+baseline; target the BF16 text path of Qwen3.5-35B-A3B, including its MoE and later MTP,
+rather than adding many model families or the vision encoder.
+[Scope and acceptance boundaries](roadmap.md#scope-complete-mechanisms-one-representative-implementation)
+and [the proposed parallelism/PD architecture](design/parallelism_routing.md) separate
+required mechanisms from future capabilities. Week labels are milestones, not dates.
+
+The next implementation step is to pin the official BF16 checkpoint and its memory/state
+budget, then add its operators and GPU sampling. W13 adds the official FP8 checkpoint
+against this baseline; INT4/AWQ/GGUF support is optional. FP8 alone does not make the
+35B model fit a 24 GiB GPU.
 
 ## Current baseline and next experiment
 
@@ -122,7 +148,7 @@ BF16 reduction/tile changes may alter logits and generated IDs; CPU/operator,
 lifecycle and exact real-model eager/Graph checks accompany the implementation.
 
 Runner-level prefix-cache benchmarks and the matched SGLang Engine comparison are
-complete; see [the roadmap results](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01). True quantization remains a separate W7 follow-up.
+complete; see [the roadmap results](roadmap.md#w9-runnerengine-prefix-cache-comparison--2026-11-01). True quantization is planned in W13.
 
 The benchmark is restored to **two Tokio workers**, retaining optimized argmax.
 The latest requested B4 repeat remeasures **both Rust and SGLang in the same
@@ -156,14 +182,21 @@ Graph cache counters report captures, replays, cached instances and retained
 workspace bytes. This permanent storage is included in workspace in-use bytes;
 KV row/slot release and in-flight scratch ownership are checked separately.
 The [engine guide](rust/engine/README.md) documents the execution contracts.
-Radix caching/routing is W9; true quantization remains a separate W7 follow-up.
+Radix caching/routing is W9; true quantization is planned in W13.
 
-## Future plans
+## Optional extensions
 
-- [Speculative decoding](roadmap.md#speculative-decoding-deferred): deferred; no fixed week or current acceptance requirement.
-- RDMA
-- CoW for forked Conversation
-- Local LLM like [Strata](https://github.com/Niko1221/Strata)
+- LoRA: one adapter/merge experiment if needed; dynamic multi-adapter serving is
+  outside the main acceptance checklist.
+- Strata-style GPU/CPU/SSD weight or expert offload: a capacity-driven branch,
+  separate from W15 hierarchical KV/state caching.
+- Context parallelism, heterogeneous/chunk-overlapped PD, or one shared storage
+  backend only when the selected workload requires them. Custom RDMA, additional
+  model families, multimodal input and orchestration platforms are not required.
+
+See [the scope decisions](roadmap.md#scope-complete-mechanisms-one-representative-implementation)
+for the distinctions and source references. Speculative decoding is now W14 in the
+main track, not an unbounded list of optional algorithms.
 
 ## References
 - https://github.com/patchy631/time-to-first-token
