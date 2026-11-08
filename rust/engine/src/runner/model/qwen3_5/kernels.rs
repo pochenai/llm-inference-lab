@@ -866,7 +866,49 @@ mod ops {
         scores.store(result);
     }
 
-    /// shortcut: direct selected-expert reductions, replace with grouped MMA when tuning MoE.
+    /// Each picked expert owns one CTA row; pad the token dimension to an MMA tile.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) unsafe fn expert_mma<T: ElementType, const K: i32, const N: i32, const TOP: i32>(
+        out: &mut Tensor<T, { [1, EXPERT_OUTPUT_COLUMNS] }>,
+        x: &Tensor<T, { [-1, K] }>,
+        weight: &Tensor<T, { [-1, K] }>,
+        ids: &Tensor<i32, { [-1, TOP] }>,
+        input_repeat: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let source = pointer_to_tile(ids.as_ptr()).offset(pid.0);
+        let (id, _token): (Tile<i32, { [] }>, Token) = load_ptr_tko(
+            source,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<1>,
+        );
+        let id: i32 = tile_to_scalar(id);
+        let row = pid.0 / input_repeat;
+        let columns_per_expert: i32 = N / EXPERT_OUTPUT_COLUMNS;
+        let column = id * columns_per_expert + pid.1;
+        let mut acc: Tile<f32, { [16, EXPERT_OUTPUT_COLUMNS] }> =
+            constant(0.0f32, shape![16, EXPERT_OUTPUT_COLUMNS]);
+        for block in 0..(K / EXPERT_REDUCTION_COLUMNS) {
+            let input = x
+                .partition(shape![1, EXPERT_REDUCTION_COLUMNS])
+                .load([row, block])
+                .broadcast(shape![16, EXPERT_REDUCTION_COLUMNS]);
+            let w = weight
+                .partition(shape![EXPERT_OUTPUT_COLUMNS, EXPERT_REDUCTION_COLUMNS])
+                .load([column, block]);
+            acc = mma(input, w.transpose(), acc);
+        }
+        let zero: Tile<i32, { [] }> = constant(0i32, shape![]);
+        let result: Tile<f32, { [1, EXPERT_OUTPUT_COLUMNS] }> = extract(acc, [zero, zero]);
+        let result: Tile<T, { [1, EXPERT_OUTPUT_COLUMNS] }> = convert_tile(result);
+        out.store(result);
+    }
+
+    /// SIMT fallback for storage types outside the BF16 performance path.
     #[cutile::entry()]
     pub(super) unsafe fn expert<T: ElementType, const K: i32, const N: i32, const TOP: i32>(
         out: &mut Tensor<T, { [1, EXPERT_OUTPUT_COLUMNS] }>,

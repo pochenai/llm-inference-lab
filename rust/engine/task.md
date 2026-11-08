@@ -20,7 +20,7 @@ Profile timings must not be compared directly with native timings.
 ## Plan
 
 - [x] Reduce graph replay resource registration and completion cleanup overhead.
-- [ ] Inspect emitted instructions and optimize routed expert GEMMs, which cost
+- [x] Inspect emitted instructions and optimize routed expert GEMMs, which cost
   2.376 ms/decode step in the graph profile, before narrower projection roles.
 - [ ] Optimize small projections, starting with shared expert gate/up, GDN a/b
   and router. Preserve large projections that already match SGLang.
@@ -75,4 +75,43 @@ zero warm scratch allocations/recaptures, resident scratch unchanged. Timing
 cells use median(process median(sample)); decode samples average seven steps.
 Raw artifacts and report: `rust/profiling/qwen3_5/replay-storage-20261108/`.
 Clocks remain unlocked; no new CPU subphase attribution claim is made.
-Commit: this task/result update accompanies the replay storage implementation.
+Commit: `58b3fbe`.
+
+### 2. Routed expert tensor cores (done)
+
+Keep the original SIMT fallback for other dtypes. For BF16, try an explicit
+16-row MMA tile per picked expert, retaining FP32 accumulation and casting only
+at the same output boundary. Verify real gate/up (K2048/N1024) and down
+(K512/N2048) geometry against independent exact CPU sums and the original
+kernel, then inspect NCU/SASS before running the full-model comparison.
+
+- Exact CPU and old-kernel comparison passed for both real geometries and
+  non-monotonic/repeated expert IDs.
+- NCU hardware counters are unavailable on this host (`ERR_NVGPUCTRPERM`).
+  Instead, a diagnostic-only test build enabled cuTile 0.5's filesystem JIT
+  store; checksum-validated cubin payloads were disassembled with `cuobjdump`.
+  Both old specializations have zero HMMA instructions; both new ones contain
+  `HMMA.16816.F32.BF16` (20/32 static instructions). Registers/thread: 255 -> 128;
+  shared memory grows from 1,108 bytes to 33,956/44,244 bytes. These are static
+  facts, not achieved utilization measurements. Test instrumentation was removed
+  from the working source and does not affect the native benchmark binary.
+- SASS, raw cubins, cache headers, instrumentation and NCU rejection logs:
+  `rust/profiling/qwen3_5/expert-mma-20261108/compute/`.
+- BF16 regression subset: 14 tests passed (the unchanged FP32 pooled control
+  was excluded); tiny graph/eager logits match exactly and independent tiny
+  reference max error is 2.38e-7. Real 35B BF16 reference passed: max error
+  0.66619, RMS 0.12629, matching first ID, and all four chunking variants exactly
+  match full prefill. Existing tolerances were not changed.
+- Native three-process paired comparison completed; no observations excluded.
+
+| Variant | Prefill ms | Decode ms/token | Total 8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `58b3fbe` | 54.419 | 10.155 | 125.251 |
+| Expert MMA | 31.775 | 9.564 | 98.790 |
+
+Prefill -41.61%, decode -5.82%, e2e -21.13%; every paired process improves.
+IDs match; warmed graph/scratch counts and bytes are unchanged. Raw results:
+`rust/profiling/qwen3_5/expert-mma-20261108/`. E2e is now lower than the earlier
+SGLang reference (119.244 ms), but decode still exceeds 7.049 ms/token. Continue
+with the major decode gaps; confirm the final cross-engine result freshly.
+Commit: this update accompanies the expert MMA implementation.

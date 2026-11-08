@@ -784,3 +784,99 @@ async fn graph_state_kernels_match_eager_real_geometry() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn bf16_expert_mma_matches_independent_cpu_and_simt() -> Result<()> {
+    use super::kernels;
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{PartitionMut, Reshape, ToHostVec},
+        tile_kernel::TileKernel,
+        DType,
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    let ids = vec![2i32, 0, 1, 2, 1, 0, 2, 0];
+    let selected = api::copy_host_vec_to_device(&Arc::new(ids.clone()))
+        .schedule(&policy)?
+        .await?
+        .reshape(&[1, 8])?;
+    // Integer/power-of-two operands make the independent FP32 sums exact.
+    for (k, n, repeat) in [(2048usize, 1024usize, 8usize), (512, 2048, 1)] {
+        let inputs = Arc::new(
+            (0..8 / repeat * k)
+                .map(|j| bf16::from_f32(((j * 5 + 3) % 13) as f32 / 16.0 - 0.375))
+                .collect::<Vec<_>>(),
+        );
+        let weights = Arc::new(
+            (0..3 * n * k)
+                .map(|j| bf16::from_f32(((j * 3 + 7) % 17) as f32 / 64.0 - 0.125))
+                .collect::<Vec<_>>(),
+        );
+        let x = api::copy_host_vec_to_device(&inputs)
+            .schedule(&policy)?
+            .await?
+            .reshape(&[8 / repeat, k])?;
+        let w = Arc::new(
+            api::copy_host_vec_to_device(&weights)
+                .schedule(&policy)?
+                .await?
+                .reshape(&[3 * n, k])?,
+        );
+        for mma in [false, true] {
+            let mut out = api::zeros::<bf16>(&[8, n]).schedule(&policy)?.await?;
+            let generics = vec![
+                bf16::DTYPE.to_string(),
+                k.to_string(),
+                n.to_string(),
+                "8".into(),
+            ];
+            // SAFETY: IDs select the three allocated experts; both layouts match K/N/TOP.
+            unsafe {
+                if mma {
+                    kernels::expert_mma(
+                        (&mut out).partition([1, 32]),
+                        &x,
+                        w.clone(),
+                        &selected,
+                        repeat as i32,
+                    )
+                    .generics(generics)
+                    .schedule(&policy)?
+                    .await?;
+                } else {
+                    kernels::expert(
+                        (&mut out).partition([1, 32]),
+                        &x,
+                        w.clone(),
+                        &selected,
+                        repeat as i32,
+                    )
+                    .generics(generics)
+                    .schedule(&policy)?
+                    .await?;
+                }
+            }
+            let actual = out.to_host_vec().schedule(&policy)?.await?;
+            for row in 0..8 {
+                for column in 0..n {
+                    let base = (ids[row] as usize * n + column) * k;
+                    let expected = bf16::from_f32(
+                        (0..k)
+                            .map(|j| {
+                                inputs[row / repeat * k + j].to_f32() * weights[base + j].to_f32()
+                            })
+                            .sum::<f32>(),
+                    );
+                    assert_eq!(
+                        actual[row * n + column].to_bits(),
+                        expected.to_bits(),
+                        "mma={mma}, K={k}, row={row}, column={column}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -950,20 +950,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
 
             {
                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.gate_up");
-                kernels::expert(
-                    (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
-                    &*n,
-                    layer.gate_up.clone(),
-                    &*selected,
-                    top as i32,
-                )
-                .generics(vec![
-                    T::DTYPE.to_string(),
-                    h.to_string(),
-                    (2 * i).to_string(),
-                    top.to_string(),
-                ])
-                .execute(exec)?;
+                expert_project(&mut gu, &n, layer.gate_up.clone(), &selected, top, exec)?;
             }
             let mut activated = scratch.activation(&[rows * top, i], exec)?;
 
@@ -977,20 +964,14 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
 
             {
                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.down");
-                kernels::expert(
-                    (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
-                    &*activated,
+                expert_project(
+                    &mut routed,
+                    &activated,
                     layer.down.clone(),
-                    &*selected,
+                    &selected,
                     1,
-                )
-                .generics(vec![
-                    T::DTYPE.to_string(),
-                    i.to_string(),
-                    h.to_string(),
-                    top.to_string(),
-                ])
-                .execute(exec)?;
+                    exec,
+                )?;
             }
             let (shared_out, shared_gate) = {
                 let _range = ScopedRange::new(c"qwen3_5.moe.shared");
@@ -1078,6 +1059,44 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
             self.token_readbacks.enqueue(token, exec)?,
         ))
     }
+}
+
+unsafe fn expert_project<T: DType>(
+    out: &mut Tensor<T>,
+    x: &Tensor<T>,
+    weight: Weight<T>,
+    selected: &Tensor<i32>,
+    input_repeat: usize,
+    exec: &ExecutionContext,
+) -> Result<()> {
+    let generics = vec![
+        T::DTYPE.to_string(),
+        x.shape()[1].to_string(),
+        out.shape()[1].to_string(),
+        selected.shape()[1].to_string(),
+    ];
+    if T::DTYPE == bf16::DTYPE {
+        kernels::expert_mma(
+            out.partition([1, EXPERT_OUTPUT_COLUMNS]),
+            x,
+            weight,
+            selected,
+            input_repeat as i32,
+        )
+        .generics(generics)
+        .execute(exec)?;
+    } else {
+        kernels::expert(
+            out.partition([1, EXPERT_OUTPUT_COLUMNS]),
+            x,
+            weight,
+            selected,
+            input_repeat as i32,
+        )
+        .generics(generics)
+        .execute(exec)?;
+    }
+    Ok(())
 }
 
 unsafe fn normalize<T: DType + DeviceCopy>(
