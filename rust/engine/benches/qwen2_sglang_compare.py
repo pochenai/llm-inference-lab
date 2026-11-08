@@ -72,6 +72,7 @@ def main() -> None:
         shutil.copy2(Path(__file__).with_name(name), out / name)
     metadata = {
         "sglang_tool_directory": str(args.sglang_python.parent.absolute()),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "binary_sha256": hashlib.sha256(frozen.read_bytes()).hexdigest(),
@@ -142,7 +143,7 @@ def main() -> None:
         for engine in engines:
             value = summarize(results[(batch, tokens, engine)])
             lines.append(f"| {batch} | {tokens} | {engine} | {value['prefill_seconds']*1000:.2f} | {value['decode_step_median_seconds']*1000:.3f} | {value['total_seconds']*1000:.2f} | {batch*args.output_tokens/value['total_seconds']:.1f} |")
-    lines += ["", "## Eager ratios and independent-process variation", "", "Ratios below are Rust / SGLang eager latency; paired decode ranges cover the three process repetitions and are not confidence intervals.", "", "| Batch | Input/request | Prefill ratio | Decode ratio | Total ratio | Paired decode ratio min..max |", "| ---: | ---: | ---: | ---: | ---: | --- |"]
+    lines += ["", "## Eager ratios and independent-process variation", "", f"Ratios below are Rust / SGLang eager latency; paired decode ranges cover {args.repetitions} process runs per engine and are not confidence intervals.", "", "| Batch | Input/request | Prefill ratio | Decode ratio | Total ratio | Paired decode ratio min..max |", "| ---: | ---: | ---: | ---: | ---: | --- |"]
     for batch, tokens in cases:
         rust = summarize(results[(batch, tokens, "rust-eager")])
         sglang = summarize(results[(batch, tokens, "sglang-eager")])

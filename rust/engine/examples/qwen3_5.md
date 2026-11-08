@@ -165,3 +165,63 @@ smoke output and validation limits. The engine and reference read configuration 
 - [Transformers Qwen3.5 MoE](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py).
 - [NVIDIA TileGym Qwen3.5](https://github.com/NVIDIA/TileGym/blob/main/src/tilegym/transformers/qwen3_5/modeling_qwen3_5.py).
 - Local `../sglang/python/sglang/srt/models/qwen3_5.py` for hybrid layer structure, packed projection loading and norm semantics.
+
+## Warmed B1 latency baseline
+
+The pooled forward benchmark keeps weights and JIT state warm, creates fresh
+session state per sample, and generates a fixed number of tokens without stopping
+at EOS. It times `CausalModel::forward` through completed host feedback, including
+full-logit finite-value validation. Prefill includes lazy recurrent-state
+initialization; model loading, pool construction, tokenization, Scheduler, and
+text decoding are excluded. This is the current serial B1 path, not packed
+batching or a GPU-feedback benchmark.
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen3_5 --no-run
+GPU_LOCAL_CPUS=24-31 # GPU-local physical cores on this RTX 6000D host
+taskset -c "$GPU_LOCAL_CPUS" cargo bench --manifest-path rust/Cargo.toml --offline --locked -p engine --bench qwen3_5 -- \
+  --model-dir ../models/Qwen3.5-35B-A3B --tokens 32 --output-tokens 8 --warmup 2 --iterations 3
+```
+
+JSONL records retain individual decode steps, generated IDs, forward counts and
+resource-release checks. Every sample must reproduce the same generated IDs and
+return pool metrics to their initial state. Run GPU jobs sequentially and freeze
+the release executable before comparing independent process repetitions.
+SGLang's existing static adapter in `benches/sglang_qwen2.py` also accepts this
+checkpoint using text inputs and FP32 Mamba state. In SGLang 0.5.9,
+`--language-only` configures encoder disaggregation and is not a switch for this
+standalone text benchmark; leave it unset. Hybrid GDN on this Blackwell GPU
+requires an explicit supported attention backend; the baseline uses
+`--attention-backend triton`. Its GPU-sampling boundary
+differs from Rust's current host/full-logit validation, so report that difference
+alongside latency rather than claiming kernel parity.
+
+For the installed SGLang 0.5.9 environment on this host, run the eager reference
+separately from Rust (all commands start at the repository root):
+
+```bash
+SGLANG_PYTHON=rust/engine/artifacts/sglang-0.5.9-venv/bin/python
+mkdir -p rust/profiling/qwen3_5/manual
+taskset -c "$GPU_LOCAL_CPUS" env -u LD_LIBRARY_PATH \
+  HF_HUB_OFFLINE=1 CUDA_HOME=/usr/local/cuda OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MAX_JOBS=2 \
+  PATH="$PWD/rust/engine/artifacts/sglang-0.5.9-venv/bin:$PATH" \
+  "$SGLANG_PYTHON" rust/engine/benches/sglang_qwen2.py \
+  --model-path ../models/Qwen3.5-35B-A3B --dtype bfloat16 \
+  --attention-backend triton --mamba-ssm-dtype float32 \
+  --mem-fraction-static 0.9 --max-total-tokens 128 --max-running-requests 1 \
+  --max-mamba-cache-size 4 --context-length 512 --disable-radix-cache \
+  --batch-size 1 --input-len 32 --output-len 8 \
+  --comparison-warmup 2 --comparison-iterations 3 --disable-cuda-graph \
+  --result-filename rust/profiling/qwen3_5/manual/sglang-eager.jsonl
+```
+
+For a separate graph reference, remove `--disable-cuda-graph`, add
+`--cuda-graph-max-bs 1`, and choose a fresh output filename. Run three independent
+processes per engine and preserve each process's samples before aggregating.
+The initial results, frozen executables/sources, exact sequential commands and
+separate traces are in the ignored
+`rust/profiling/qwen3_5/cutile-0.5.0-20261109/` directory.
+
+The benchmark accepts `--profile` for a separate Nsight run. Use
+`nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --output=PROFILE_PATH BENCH_PATH ... --warmup 2 --iterations 1 --profile`
+to exclude loading and warmup. Never pool profiler timings with native samples.

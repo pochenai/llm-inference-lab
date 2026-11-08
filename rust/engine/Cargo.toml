@@ -53,3 +53,7 @@ harness = false
 [[bench]]
 name = "qwen2_prefix_cache"
 harness = false
+
+[[bench]]
+name = "qwen3_5"
+harness = false

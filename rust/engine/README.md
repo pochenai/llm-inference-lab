@@ -993,3 +993,96 @@ for architecture, state ownership, memory budget, reference checks and the
 KV slots are assigned incrementally through NaiveKVPool, with separate fixed-size
 DeltaNet session state. Prefix snapshots, packed execution and GPU sampling
 remain pending; W10 is not complete.
+
+## cuTile 0.5.0 migration measurements
+
+The 0.4/0.5 migration control used Qwen2.5-0.5B-Instruct on an RTX 6000D,
+CUDA 13.2, CPU cores 24–31 on the GPU-local NUMA node, BF16 eager execution,
+GPU feedback and 64 fixed outputs. Each version/shape has three independent
+processes with two warmups and three measured samples. Below are medians of
+process aggregates; positive decode change means slower. GPU clocks were not
+locked. This is a static forward comparison, not serving throughput.
+
+| Batch | Input tokens | 0.4 decode ms | 0.5 decode ms | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 32 | 2.149 | 2.190 | +1.9% |
+| 1 | 4096 | 2.349 | 2.625 | +11.7% |
+| 2 | 32 | 2.382 | 2.809 | +17.9% |
+| 2 | 4096 | 3.292 | 2.888 | -12.3% |
+| 4 | 32 | 2.861 | 3.389 | +18.4% |
+| 4 | 4096 | 3.998 | 3.419 | -14.5% |
+
+All 108 measured samples passed fixed-work, host-feedback and resource-release
+checks; final IDs matched between versions for every shape. The complete release
+suite passed 133 tests and four doc-tests. Real-checkpoint CPU-reference/chunked-KV
+and BF16 eager/graph common-history logit regressions also passed separately.
+The cancellation test now waits for an explicit owner-drop notification because
+0.5 reclaims cancelled submissions asynchronously.
+
+Separate B1/32 Nsight captures have the same 23,448 kernel instances in both
+versions and approximately equal GPU kernel totals (eager 119.73/119.71 ms,
+graph 116.01/116.08 ms). These are profiled whole-cohort diagnostics, not native
+per-step latency or evidence about every shape. A separate one-process SGLang
+0.5.9 B1/32 reference measured Rust/SGLang eager decode at 2.189/9.291 ms and
+graph decode at 2.184/2.223 ms; this small reference does not establish a general
+engine ranking. Backend and feedback boundaries are recorded with the samples.
+
+Raw data, commands, frozen binaries, hashes, CPU affinity, validation logs,
+process aggregates, and separate Nsight traces live in the ignored directory
+`rust/profiling/qwen2/cutile-0.5.0-20261109/numa0/`. Unpinned exploratory runs and
+the interrupted transition run are excluded. The comparison driver records CPU
+affinity and the actual requested process count in its report.
+
+The release's tile-library and minimum-CTA-residency features require CUDA 13.5;
+boolean likelihood hints currently have no backend performance effect. They are
+not enabled on this CUDA 13.2 host. The version upgrade alone is not treated as
+a performance optimization. The next model baseline is the pooled Qwen3.5 B1
+benchmark documented in [the example guide](examples/qwen3_5.md).
+
+## Qwen3.5 initial latency target
+
+The new `qwen3_5` benchmark calls the current pooled forward directly. On the
+same RTX 6000D and NUMA-local CPU cores, B1 with 32 repeated input tokens and
+8 fixed outputs produced the following medians of three independent processes
+(two warmups and three measured samples/process):
+
+| Engine | Prefill ms | Decode ms/step | Total ms |
+| --- | ---: | ---: | ---: |
+| Rust eager | 59.164 | 29.593 | 264.983 |
+| SGLang eager | 94.377 | 67.576 | 540.079 |
+| SGLang decode graph | 95.206 | 7.292 | 146.487 |
+
+Rust still has an approximately 4.06x decode gap to this graph reference. Its
+current path includes full-logit D2H/finite-value validation and host token
+feedback; SGLang uses GPU sampling. Rust's lazy recurrent-state initialization
+is timed in prefill. Both use native BF16 weights and FP32 recurrent state;
+SGLang 0.5.9 uses explicit Triton attention and reports default MoE settings
+because it has no RTX 6000D-specific tuning file. SGLang graph runs are separate
+references, not the same execution mode as Rust eager. Eager process variation
+is material, and cross-engine generated histories were not verified equal.
+These numbers do not establish tuned serving throughput or model-quality parity.
+
+All nine measured Rust samples reproduced the same complete generated IDs,
+completed exactly eight forwards and released session resources. Three additional
+Qwen3.5 fixture/reference and pooled Runner regressions passed after migration.
+The benchmark validates CLI counts and supports `--profile` for a separate
+measurement-only Nsight capture. Native and profiling executables/sources are
+frozen separately so profiling does not contaminate native timings.
+
+See [the Qwen3.5 guide](examples/qwen3_5.md#warmed-b1-latency-baseline) for runnable
+Rust/SGLang commands and timing boundaries. Raw samples, process aggregates,
+metadata, failed startup attempts, exact commands and separate traces live in
+`rust/profiling/qwen3_5/cutile-0.5.0-20261109/` (ignored generated artifacts).
+The baseline covers B1/short context only; packed execution, longer-context
+matrices and optimized GPU-feedback/graph execution remain separate work.
+
+A separate Qwen3.5 Nsight capture partitions one prefill plus seven decodes by
+its eight final-argmax kernels. It records 18,260 kernel launches, 10,852
+allocations/frees and 10,844 event records. Summed decode kernel time averages
+9.74 ms/forward: linear projection accounts for 51.7%, expert kernels 24.7%,
+and zero-fill kernels 9.3%. These profiled kernel sums are not native wall times.
+The first iteration should reuse exclusively leased workspace storage before
+adding stable-address graph/GPU-feedback execution, then tune linear/expert
+kernels. Preserve recurrent/KV state separately and validate cancellation/reuse
+with warmed stream gates. This commit establishes the baseline and attribution;
+it does not implement those performance changes or claim to close the gap.
