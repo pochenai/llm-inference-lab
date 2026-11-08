@@ -46,7 +46,9 @@
 //!   Session state: rotated BF16 K + BF16 V
 //! ```
 
-use std::{path::Path, sync::Arc};
+use std::{ffi::CString, path::Path, sync::Arc};
+
+use crate::profiling::ScopedRange;
 
 use anyhow::{ensure, Result};
 use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
@@ -65,6 +67,7 @@ use super::{
     constants::*,
     kernels,
     state::{retained_pointer, Qwen3_5Context, Qwen3_5ExecutionView},
+    workspace::{Scratch, WorkspaceMetrics, WorkspacePool},
     Qwen3_5StatePool,
 };
 use crate::runner::{
@@ -121,6 +124,7 @@ pub struct Qwen3_5Engine<T: DType = bf16> {
     tokenizer: Tokenizer,
     embedding: Weight<T>,
     layers: Vec<Layer<T>>,
+    layer_ranges: Vec<CString>,
     norm: Norm,
     lm_head: Weight<T>,
     frequencies: Norm,
@@ -128,6 +132,8 @@ pub struct Qwen3_5Engine<T: DType = bf16> {
     policy: Arc<dyn SchedulingPolicy>,
     pub(super) owner: Arc<()>,
     weight_bytes: usize,
+    workspaces: Arc<WorkspacePool<T>>,
+    uploads: Arc<crate::runner::upload::UploadPool<u32>>,
     readbacks: crate::runner::model::readback::ReadbackCache<f32>,
     token_readbacks: crate::runner::model::readback::ReadbackCache<i32>,
 }
@@ -285,7 +291,13 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
             eos.iter().all(|id| (*id as usize) < c.vocab_size),
             "invalid EOS token"
         );
+        let layer_ranges = (0..layers.len())
+            .map(|index| {
+                CString::new(format!("qwen3_5.layer.{index}")).expect("layer label has no NUL")
+            })
+            .collect();
         Ok(Self {
+            layer_ranges,
             config,
             tokenizer,
             embedding,
@@ -297,9 +309,15 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
             policy: policy.clone(),
             owner: Arc::new(()),
             weight_bytes,
+            workspaces: Arc::default(),
+            uploads: Arc::default(),
             readbacks: Default::default(),
             token_readbacks: Default::default(),
         })
+    }
+
+    pub fn workspace_metrics(&self) -> WorkspaceMetrics {
+        self.workspaces.metrics()
     }
 
     pub fn config(&self) -> &Qwen3_5Config {
@@ -395,272 +413,355 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
         let c = &self.config.text_config;
         let start_pos = state.start_pos();
         let rows = suffix.len();
+        // Thread-local ranges cover synchronous submission, never an await.
+        let _submit = ScopedRange::new(if start_pos == 0 || rows > 1 {
+            c"qwen3_5.prefill.submit"
+        } else {
+            c"qwen3_5.decode.submit"
+        });
         let h = c.hidden_size;
-        let ids = api::copy_host_vec_to_device(suffix).execute(exec)?;
-        let mut x = api::zeros::<T>(&[rows, h]).execute(exec)?;
-        shared::embedding(
-            (&mut x).partition([1, SHARED_POINTWISE_COLUMNS]),
-            &ids,
-            self.embedding.clone(),
-        )
-        .generics(vec![T::DTYPE.to_string()])
-        .execute(exec)?;
+        let mut scratch = self.workspaces.acquire(rows, exec)?;
+        let ids = {
+            let _range = ScopedRange::new(c"qwen3_5.input.upload");
+            self.uploads.upload(suffix.clone(), &[rows], exec)?
+        };
+        let mut x = scratch.activation(&[rows, h], exec)?;
+        {
+            let _range = ScopedRange::new(c"qwen3_5.embedding");
+            shared::embedding(
+                (&mut x).partition([1, SHARED_POINTWISE_COLUMNS]),
+                &ids,
+                self.embedding.clone(),
+            )
+            .generics(vec![T::DTYPE.to_string()])
+            .execute(exec)?;
+        }
+        let mut residual = scratch.activation(&[rows, h], exec)?;
         for (index, layer) in self.layers.iter().enumerate() {
-            let n = normalize(&x, layer.input_norm.clone(), c.rms_norm_eps, exec)?;
+            let _layer = ScopedRange::new(&self.layer_ranges[index]);
+            scratch.layer(matches!(layer.mixer, Mixer::Delta(_)));
+            let n = normalize(
+                &mut scratch,
+                &x,
+                layer.input_norm.clone(),
+                c.rms_norm_eps,
+                exec,
+            )?;
             let mixed = match &layer.mixer {
                 Mixer::Delta(w) => {
+                    let _mixer = ScopedRange::new(c"qwen3_5.mixer.delta");
                     let delta = state.delta(index)?;
-                    let qkv = linear(&n, w.qkv.clone(), exec)?;
+                    let qkv = linear(&mut scratch, &n, w.qkv.clone(), exec)?;
                     let mut convolved =
-                        api::zeros::<T>(&[rows, qkv.shape()[1] as usize]).execute(exec)?;
+                        scratch.activation(&[rows, qkv.shape()[1] as usize], exec)?;
 
-                    kernels::conv(
-                        retained_pointer(&mut convolved, exec)?,
-                        delta.conv,
-                        &qkv,
-                        w.conv.clone(),
-                    )
-                    .generics(vec![T::DTYPE.to_string(), qkv.shape()[1].to_string()])
-                    .grid((1, (qkv.shape()[1] as usize / POINTWISE_COLUMNS) as u32, 1))
-                    .execute(exec)?;
-                    let a = linear(&n, w.a.clone(), exec)?;
-                    let b = linear(&n, w.b.clone(), exec)?;
-                    let z = linear(&n, w.z.clone(), exec)?;
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.delta.conv");
+                        kernels::conv(
+                            retained_pointer(&mut convolved, exec)?,
+                            delta.conv,
+                            &qkv,
+                            w.conv.clone(),
+                        )
+                        .generics(vec![T::DTYPE.to_string(), qkv.shape()[1].to_string()])
+                        .grid((1, (qkv.shape()[1] as usize / POINTWISE_COLUMNS) as u32, 1))
+                        .execute(exec)?;
+                    }
+                    let a = linear(&mut scratch, &n, w.a.clone(), exec)?;
+                    let b = linear(&mut scratch, &n, w.b.clone(), exec)?;
+                    let z = linear(&mut scratch, &n, w.z.clone(), exec)?;
                     let vh = c.linear_num_value_heads;
-                    let mut core =
-                        api::zeros::<T>(&[rows, vh * GDN_VALUE_HEAD_DIM]).execute(exec)?;
+                    let mut core = scratch.activation(&[rows, vh * GDN_VALUE_HEAD_DIM], exec)?;
 
-                    kernels::delta(
-                        retained_pointer(&mut core, exec)?,
-                        delta.recurrent,
-                        &convolved,
-                        &a,
-                        &b,
-                        w.a_log.clone(),
-                        w.dt.clone(),
-                    )
-                    .generics(vec![
-                        T::DTYPE.to_string(),
-                        c.linear_num_key_heads.to_string(),
-                        vh.to_string(),
-                        GDN_KEY_HEAD_DIM.to_string(),
-                        GDN_VALUE_HEAD_DIM.to_string(),
-                    ])
-                    .grid((
-                        vh as u32,
-                        (GDN_VALUE_HEAD_DIM / DELTA_VALUE_COLUMNS) as u32,
-                        1,
-                    ))
-                    .execute(exec)?;
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.delta.recurrence");
+                        kernels::delta(
+                            retained_pointer(&mut core, exec)?,
+                            delta.recurrent,
+                            &convolved,
+                            &a,
+                            &b,
+                            w.a_log.clone(),
+                            w.dt.clone(),
+                        )
+                        .generics(vec![
+                            T::DTYPE.to_string(),
+                            c.linear_num_key_heads.to_string(),
+                            vh.to_string(),
+                            GDN_KEY_HEAD_DIM.to_string(),
+                            GDN_VALUE_HEAD_DIM.to_string(),
+                        ])
+                        .grid((
+                            vh as u32,
+                            (GDN_VALUE_HEAD_DIM / DELTA_VALUE_COLUMNS) as u32,
+                            1,
+                        ))
+                        .execute(exec)?;
+                    }
                     let core = core.reshape(&[rows * vh, GDN_VALUE_HEAD_DIM])?;
                     let z = z.reshape(&[rows * vh, GDN_VALUE_HEAD_DIM])?;
-                    let mut gated =
-                        api::zeros::<T>(&[rows * vh, GDN_VALUE_HEAD_DIM]).execute(exec)?;
+                    let mut gated = scratch.activation(&[rows * vh, GDN_VALUE_HEAD_DIM], exec)?;
 
-                    kernels::gated_norm(
-                        (&mut gated).partition([1, GDN_VALUE_HEAD_DIM]),
-                        &core,
-                        &z,
-                        w.norm.clone(),
-                        c.rms_norm_eps,
-                    )
-                    .generics(vec![T::DTYPE.to_string(), GDN_VALUE_HEAD_DIM.to_string()])
-                    .execute(exec)?;
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.delta.gated_norm");
+                        kernels::gated_norm(
+                            (&mut gated).partition([1, GDN_VALUE_HEAD_DIM]),
+                            &core,
+                            &z,
+                            w.norm.clone(),
+                            c.rms_norm_eps,
+                        )
+                        .generics(vec![T::DTYPE.to_string(), GDN_VALUE_HEAD_DIM.to_string()])
+                        .execute(exec)?;
+                    }
                     linear(
+                        &mut scratch,
                         &gated.reshape(&[rows, vh * GDN_VALUE_HEAD_DIM])?,
                         w.out.clone(),
                         exec,
                     )?
                 }
                 Mixer::Attention(w) => {
-                    let qg = linear(&n, w.q.clone(), exec)?;
-                    let raw_k = linear(&n, w.k.clone(), exec)?;
-                    let raw_v = linear(&n, w.v.clone(), exec)?;
-                    let mut q =
-                        api::zeros::<T>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
-                            .execute(exec)?;
+                    let _mixer = ScopedRange::new(c"qwen3_5.mixer.gqa");
+                    let qg = linear(&mut scratch, &n, w.q.clone(), exec)?;
+                    let raw_k = linear(&mut scratch, &n, w.k.clone(), exec)?;
+                    let raw_v = linear(&mut scratch, &n, w.v.clone(), exec)?;
+                    let mut q = scratch
+                        .activation(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM], exec)?;
 
-                    kernels::qk(
-                        retained_pointer(&mut q, exec)?,
-                        &qg,
-                        w.q_norm.clone(),
-                        self.frequencies.clone(),
-                        c.rms_norm_eps,
-                        start_pos as i32,
-                        c.num_attention_heads as i32,
-                        0,
-                    )
-                    .generics(vec![
-                        T::DTYPE.to_string(),
-                        ATTENTION_HEAD_DIM.to_string(),
-                        ROTARY_DIM.to_string(),
-                        "true".into(),
-                    ])
-                    .grid((rows as u32, c.num_attention_heads as u32, 1))
-                    .execute(exec)?;
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.gqa.q_rope");
+                        kernels::qk(
+                            retained_pointer(&mut q, exec)?,
+                            &qg,
+                            w.q_norm.clone(),
+                            self.frequencies.clone(),
+                            c.rms_norm_eps,
+                            start_pos as i32,
+                            c.num_attention_heads as i32,
+                            0,
+                        )
+                        .generics(vec![
+                            T::DTYPE.to_string(),
+                            ATTENTION_HEAD_DIM.to_string(),
+                            ROTARY_DIM.to_string(),
+                            "true".into(),
+                        ])
+                        .grid((rows as u32, c.num_attention_heads as u32, 1))
+                        .execute(exec)?;
+                    }
 
-                    let mut rotated_k =
-                        api::zeros::<T>(&[rows, c.num_key_value_heads * ATTENTION_HEAD_DIM])
-                            .execute(exec)?;
-                    kernels::qk(
-                        retained_pointer(&mut rotated_k, exec)?,
-                        &raw_k,
-                        w.k_norm.clone(),
-                        self.frequencies.clone(),
-                        c.rms_norm_eps,
-                        start_pos as i32,
-                        c.num_key_value_heads as i32,
-                        0,
-                    )
-                    .generics(vec![
-                        T::DTYPE.to_string(),
-                        ATTENTION_HEAD_DIM.to_string(),
-                        ROTARY_DIM.to_string(),
-                        "false".into(),
-                    ])
-                    .grid((rows as u32, c.num_key_value_heads as u32, 1))
-                    .execute(exec)?;
+                    let mut rotated_k = scratch
+                        .activation(&[rows, c.num_key_value_heads * ATTENTION_HEAD_DIM], exec)?;
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.gqa.k_rope");
+                        kernels::qk(
+                            retained_pointer(&mut rotated_k, exec)?,
+                            &raw_k,
+                            w.k_norm.clone(),
+                            self.frequencies.clone(),
+                            c.rms_norm_eps,
+                            start_pos as i32,
+                            c.num_key_value_heads as i32,
+                            0,
+                        )
+                        .generics(vec![
+                            T::DTYPE.to_string(),
+                            ATTENTION_HEAD_DIM.to_string(),
+                            ROTARY_DIM.to_string(),
+                            "false".into(),
+                        ])
+                        .grid((rows as u32, c.num_key_value_heads as u32, 1))
+                        .execute(exec)?;
+                    }
 
-                    let mut attended =
-                        api::zeros::<T>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
-                            .execute(exec)?;
+                    let mut attended = scratch
+                        .activation(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM], exec)?;
                     let generics = vec![
                         T::DTYPE.to_string(),
                         ATTENTION_HEAD_DIM.to_string(),
                         c.num_attention_heads.to_string(),
                         c.num_key_value_heads.to_string(),
                     ];
-                    let cache = state.attention(index, &rotated_k, &raw_v)?;
-                    kernels::gqa_attention(
-                        (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
-                        &q,
-                        cache.k,
-                        cache.v,
-                        &qg,
-                        start_pos as i32,
-                        cache.table,
-                        cache.table_offset as i32,
-                    )
-                    .generics(
-                        generics
-                            .into_iter()
-                            .chain([cache.pooled.to_string()])
-                            .collect(),
-                    )
-                    .execute(exec)?;
-                    linear(&attended, w.out.clone(), exec)?
+                    let cache = {
+                        let _range = ScopedRange::new(c"qwen3_5.gqa.kv_store");
+                        state.attention(index, &rotated_k, &raw_v)?
+                    };
+                    {
+                        let _range = ScopedRange::new(c"qwen3_5.gqa.attention");
+                        kernels::gqa_attention(
+                            (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
+                            &q,
+                            cache.k,
+                            cache.v,
+                            &qg,
+                            start_pos as i32,
+                            cache.table,
+                            cache.table_offset as i32,
+                        )
+                        .generics(
+                            generics
+                                .into_iter()
+                                .chain([cache.pooled.to_string()])
+                                .collect(),
+                        )
+                        .execute(exec)?;
+                    }
+                    linear(&mut scratch, &attended, w.out.clone(), exec)?
                 }
             };
-            x = add(&x, &mixed, exec)?;
-            let n = normalize(&x, layer.post_norm.clone(), c.rms_norm_eps, exec)?;
-            let logits = linear(&n, layer.router.clone(), exec)?;
+            add(&mut residual, &x, &mixed, exec)?;
+            let _moe = ScopedRange::new(c"qwen3_5.moe");
+            let n = normalize(
+                &mut scratch,
+                &residual,
+                layer.post_norm.clone(),
+                c.rms_norm_eps,
+                exec,
+            )?;
+            let logits = {
+                let _range = ScopedRange::new(c"qwen3_5.moe.router");
+                linear(&mut scratch, &n, layer.router.clone(), exec)?
+            };
             let top = c.num_experts_per_tok;
             let i = c.moe_intermediate_size;
-            let mut selected = api::zeros::<i32>(&[rows, top]).execute(exec)?;
-            let mut scores = api::zeros::<T>(&[rows, top]).execute(exec)?;
+            let mut selected = scratch.integer(&[rows, top], exec)?;
+            let mut scores = scratch.activation(&[rows, top], exec)?;
 
-            kernels::route(
-                (&mut selected).partition([1, top]),
-                (&mut scores).partition([1, top]),
-                &logits,
-            )
-            .generics(vec![
-                T::DTYPE.to_string(),
-                c.num_experts.to_string(),
-                top.to_string(),
-            ])
-            .grid((rows as u32, 1, 1))
-            .execute(exec)?;
-            let mut gu = api::zeros::<T>(&[rows * top, 2 * i]).execute(exec)?;
-
-            kernels::expert(
-                (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
-                &n,
-                layer.gate_up.clone(),
-                &selected,
-                top as i32,
-            )
-            .generics(vec![
-                T::DTYPE.to_string(),
-                h.to_string(),
-                (2 * i).to_string(),
-                top.to_string(),
-            ])
-            .execute(exec)?;
-            let mut activated = api::zeros::<T>(&[rows * top, i]).execute(exec)?;
-
-            kernels::expert_swiglu((&mut activated).partition([1, POINTWISE_COLUMNS]), &gu)
-                .generics(vec![T::DTYPE.to_string(), i.to_string()])
+            {
+                let _range = ScopedRange::new(c"qwen3_5.moe.route");
+                kernels::route(
+                    (&mut selected).partition([1, top]),
+                    (&mut scores).partition([1, top]),
+                    &logits,
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    c.num_experts.to_string(),
+                    top.to_string(),
+                ])
+                .grid((rows as u32, 1, 1))
                 .execute(exec)?;
-            let mut routed = api::zeros::<T>(&[rows * top, h]).execute(exec)?;
+            }
+            let mut gu = scratch.activation(&[rows * top, 2 * i], exec)?;
 
-            kernels::expert(
-                (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
-                &activated,
-                layer.down.clone(),
-                &selected,
-                1,
-            )
-            .generics(vec![
-                T::DTYPE.to_string(),
-                i.to_string(),
-                h.to_string(),
-                top.to_string(),
-            ])
-            .execute(exec)?;
-            let gate = linear(&n, layer.shared_gate.clone(), exec)?;
-            let up = linear(&n, layer.shared_up.clone(), exec)?;
-            let mut shared_act =
-                api::zeros::<T>(&[rows, c.shared_expert_intermediate_size]).execute(exec)?;
-            shared::swiglu(
-                (&mut shared_act).partition([1, SHARED_POINTWISE_COLUMNS]),
-                &gate,
-                &up,
-            )
-            .generics(vec![T::DTYPE.to_string()])
-            .execute(exec)?;
-            let shared_out = linear(&shared_act, layer.shared_down.clone(), exec)?;
-            let shared_gate = linear(&n, layer.shared_router.clone(), exec)?;
-            let mut merged = api::zeros::<T>(&[rows, h]).execute(exec)?;
+            {
+                let _range = ScopedRange::new(c"qwen3_5.moe.expert.gate_up");
+                kernels::expert(
+                    (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
+                    &n,
+                    layer.gate_up.clone(),
+                    &selected,
+                    top as i32,
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    h.to_string(),
+                    (2 * i).to_string(),
+                    top.to_string(),
+                ])
+                .execute(exec)?;
+            }
+            let mut activated = scratch.activation(&[rows * top, i], exec)?;
 
-            kernels::moe_merge(
-                (&mut merged).partition([1, POINTWISE_COLUMNS]),
-                &routed,
-                &scores,
-                &shared_out,
-                &shared_gate,
-            )
-            .generics(vec![T::DTYPE.to_string(), top.to_string()])
-            .execute(exec)?;
-            x = add(&x, &merged, exec)?;
+            {
+                let _range = ScopedRange::new(c"qwen3_5.moe.expert.swiglu");
+                kernels::expert_swiglu((&mut activated).partition([1, POINTWISE_COLUMNS]), &gu)
+                    .generics(vec![T::DTYPE.to_string(), i.to_string()])
+                    .execute(exec)?;
+            }
+            let mut routed = scratch.activation(&[rows * top, h], exec)?;
+
+            {
+                let _range = ScopedRange::new(c"qwen3_5.moe.expert.down");
+                kernels::expert(
+                    (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
+                    &activated,
+                    layer.down.clone(),
+                    &selected,
+                    1,
+                )
+                .generics(vec![
+                    T::DTYPE.to_string(),
+                    i.to_string(),
+                    h.to_string(),
+                    top.to_string(),
+                ])
+                .execute(exec)?;
+            }
+            let (shared_out, shared_gate) = {
+                let _range = ScopedRange::new(c"qwen3_5.moe.shared");
+                let gate = linear(&mut scratch, &n, layer.shared_gate.clone(), exec)?;
+                let up = linear(&mut scratch, &n, layer.shared_up.clone(), exec)?;
+                let mut shared_act =
+                    scratch.activation(&[rows, c.shared_expert_intermediate_size], exec)?;
+                {
+                    let _range = ScopedRange::new(c"qwen3_5.moe.shared.swiglu");
+                    shared::swiglu(
+                        (&mut shared_act).partition([1, SHARED_POINTWISE_COLUMNS]),
+                        &gate,
+                        &up,
+                    )
+                    .generics(vec![T::DTYPE.to_string()])
+                    .execute(exec)?;
+                }
+                let shared_out =
+                    linear(&mut scratch, &shared_act, layer.shared_down.clone(), exec)?;
+                let shared_gate = linear(&mut scratch, &n, layer.shared_router.clone(), exec)?;
+                (shared_out, shared_gate)
+            };
+            let mut merged = scratch.activation(&[rows, h], exec)?;
+
+            {
+                let _range = ScopedRange::new(c"qwen3_5.moe.merge");
+                kernels::moe_merge(
+                    (&mut merged).partition([1, POINTWISE_COLUMNS]),
+                    &routed,
+                    &scores,
+                    &shared_out,
+                    &shared_gate,
+                )
+                .generics(vec![T::DTYPE.to_string(), top.to_string()])
+                .execute(exec)?;
+            }
+            add(&mut x, &residual, &merged, exec)?;
         }
-        let mut last = api::zeros::<T>(&[1, h]).execute(exec)?;
+        let _head = ScopedRange::new(c"qwen3_5.head");
+        scratch.head();
+        let mut last = scratch.activation(&[1, h], exec)?;
 
         kernels::last_row((&mut last).partition([1, POINTWISE_COLUMNS]), &x)
             .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
-        let n = normalize(&last, self.norm.clone(), c.rms_norm_eps, exec)?;
-        let logits = linear_f32(&n, self.lm_head.clone(), exec)?;
+        let n = normalize(&mut scratch, &last, self.norm.clone(), c.rms_norm_eps, exec)?;
+        let logits = linear_f32(&mut scratch, &n, self.lm_head.clone(), exec)?;
         let blocks = c.vocab_size.div_ceil(shared::ARGMAX_TILE);
-        let mut maxima = api::zeros::<f32>(&[1, blocks]).execute(exec)?;
-        let mut indices = api::zeros::<i32>(&[1, blocks]).execute(exec)?;
-        let mut token = api::zeros::<i32>(&[1]).execute(exec)?;
-        shared::argmax_blocks(
-            (&mut maxima).partition([1, 1]),
-            (&mut indices).partition([1, 1]),
-            &logits,
-            c.vocab_size as i32,
-        )
-        .generics(vec![shared::ARGMAX_TILE.to_string()])
-        .execute(exec)?;
-        shared::argmax_final(
-            (&mut token).partition([1]),
-            &maxima,
-            &indices,
-            blocks as i32,
-        )
-        .generics(vec![shared::ARGMAX_FINAL_TILE.to_string()])
-        .execute(exec)?;
+        let mut maxima = scratch.float(&[1, blocks], exec)?;
+        let mut indices = scratch.integer(&[1, blocks], exec)?;
+        let mut token = scratch.integer(&[1], exec)?;
+        {
+            let _range = ScopedRange::new(c"qwen3_5.argmax.blocks");
+            shared::argmax_blocks(
+                (&mut maxima).partition([1, 1]),
+                (&mut indices).partition([1, 1]),
+                &logits,
+                c.vocab_size as i32,
+            )
+            .generics(vec![shared::ARGMAX_TILE.to_string()])
+            .execute(exec)?;
+        }
+        {
+            let _range = ScopedRange::new(c"qwen3_5.argmax.final");
+            shared::argmax_final(
+                (&mut token).partition([1]),
+                &maxima,
+                &indices,
+                blocks as i32,
+            )
+            .generics(vec![shared::ARGMAX_FINAL_TILE.to_string()])
+            .execute(exec)?;
+        }
+        let _readback = ScopedRange::new(c"qwen3_5.readback.enqueue");
         Ok((
             self.readbacks.enqueue(logits, exec)?,
             self.token_readbacks.enqueue(Arc::new(token), exec)?,
@@ -669,46 +770,54 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
 }
 
 unsafe fn normalize<T: DType + DeviceCopy>(
+    scratch: &mut Scratch<T>,
     x: &Tensor<T>,
     w: Norm,
     eps: f32,
     exec: &ExecutionContext,
 ) -> Result<Tensor<T>> {
+    let _range = ScopedRange::new(c"qwen3_5.rms_norm");
     let rows = x.shape()[0] as usize;
     let d = x.shape()[1] as usize;
-    let mut out = api::zeros::<T>(&[rows, d]).execute(exec)?;
-
+    let mut out = scratch.activation(&[rows, d], exec)?;
     kernels::norm((&mut out).partition([1, d]), x, w, eps)
         .generics(vec![T::DTYPE.to_string(), d.to_string(), "true".into()])
         .execute(exec)?;
     Ok(out)
 }
 unsafe fn linear<T: DType + DeviceCopy>(
+    scratch: &mut Scratch<T>,
     x: &Tensor<T>,
     w: Weight<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<T>> {
-    project(x, w, exec)
+    let out = scratch.activation(&[x.shape()[0] as usize, w.shape()[0] as usize], exec)?;
+    let bias = scratch.activation(&[1], exec)?;
+    project(out, x, w, &bias, exec)
 }
 unsafe fn linear_f32<T: DType + DeviceCopy>(
+    scratch: &mut Scratch<T>,
     x: &Tensor<T>,
     w: Weight<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<f32>> {
-    project(x, w, exec)
+    let out = scratch.float(&[x.shape()[0] as usize, w.shape()[0] as usize], exec)?;
+    let bias = scratch.activation(&[1], exec)?;
+    project(out, x, w, &bias, exec)
 }
-unsafe fn project<T: DType + DeviceCopy, O: DType + DeviceCopy>(
+unsafe fn project<T: DType, O: DType>(
+    mut out: Tensor<O>,
     x: &Tensor<T>,
     w: Weight<T>,
+    bias: &Tensor<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<O>> {
-    let mut out = api::zeros::<O>(&[x.shape()[0] as usize, w.shape()[0] as usize]).execute(exec)?;
-    let bias = api::zeros::<T>(&[1]).execute(exec)?;
+    let _range = ScopedRange::new(c"qwen3_5.linear");
     shared::linear(
         (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
         x,
         w,
-        &bias,
+        bias,
     )
     .generics(vec![
         T::DTYPE.to_string(),
@@ -722,19 +831,21 @@ unsafe fn project<T: DType + DeviceCopy, O: DType + DeviceCopy>(
     .execute(exec)?;
     Ok(out)
 }
-unsafe fn add<T: DType + DeviceCopy>(
+unsafe fn add<T: DType>(
+    out: &mut Tensor<T>,
     a: &Tensor<T>,
     b: &Tensor<T>,
     exec: &ExecutionContext,
-) -> Result<Tensor<T>> {
-    let mut out = api::zeros::<T>(&[a.shape()[0] as usize, a.shape()[1] as usize]).execute(exec)?;
-    shared::add((&mut out).partition([1, SHARED_POINTWISE_COLUMNS]), a, b)
+) -> Result<()> {
+    let _range = ScopedRange::new(c"qwen3_5.residual.add");
+    shared::add(out.partition([1, SHARED_POINTWISE_COLUMNS]), a, b)
         .generics(vec![T::DTYPE.to_string(), "1".into()])
         .execute(exec)?;
-    Ok(out)
+    Ok(())
 }
 
 fn validate_prediction(token: i32, logits: &[f32]) -> Result<u32> {
+    let _range = ScopedRange::new(c"qwen3_5.host_validation");
     ensure!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
     ensure!(
         token >= 0 && (token as usize) < logits.len(),

@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
             // SAFETY: warmup forwards and readbacks have completed.
             ensure!(unsafe { profiler_start() } == 0, "cuProfilerStart failed");
         }
+        let allocations_before = model.workspace_metrics().allocated_buffers;
         let mut kv = KVContext::new(pool.clone())?;
         let mut history = vec![9707u32; args.tokens];
         let mut generated = Vec::with_capacity(args.output_tokens);
@@ -95,9 +96,20 @@ async fn main() -> Result<()> {
             pool.metrics() == initial,
             "session resources were not released"
         );
+        let workspace = model.workspace_metrics();
+        ensure!(
+            workspace.in_use_workspaces == 0,
+            "workspace checkout was not released"
+        );
+        if iteration >= args.warmup && args.warmup > 0 {
+            ensure!(
+                workspace.allocated_buffers == allocations_before,
+                "warm sample allocated scratch buffers"
+            );
+        }
         println!(
             "{}",
-            json!({"event":"sample", "iteration":iteration, "warmup":iteration < args.warmup, "batch_size":1, "input_tokens":args.tokens, "forward_count":args.output_tokens, "prefill_seconds":times[0], "decode_step_seconds":&times[1..], "generated_ids":generated, "kv_released":true})
+            json!({"event":"sample", "iteration":iteration, "warmup":iteration < args.warmup, "batch_size":1, "input_tokens":args.tokens, "forward_count":args.output_tokens, "prefill_seconds":times[0], "decode_step_seconds":&times[1..], "generated_ids":generated, "kv_released":true, "workspace":workspace, "workspace_allocations":workspace.allocated_buffers - allocations_before})
         );
     }
     if args.profile {

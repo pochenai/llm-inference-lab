@@ -63,6 +63,7 @@ impl<T: DType + DeviceCopy + ElementType> Qwen3_5Context<T> {
         pooled: bool,
         exec: &ExecutionContext,
     ) -> Result<Self> {
+        let _range = crate::profiling::ScopedRange::new(c"qwen3_5.state.allocate");
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let mut attention_index = 0;
         for kind in &config.layer_types {

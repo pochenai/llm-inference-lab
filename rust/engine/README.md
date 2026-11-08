@@ -1081,8 +1081,61 @@ its eight final-argmax kernels. It records 18,260 kernel launches, 10,852
 allocations/frees and 10,844 event records. Summed decode kernel time averages
 9.74 ms/forward: linear projection accounts for 51.7%, expert kernels 24.7%,
 and zero-fill kernels 9.3%. These profiled kernel sums are not native wall times.
-The first iteration should reuse exclusively leased workspace storage before
-adding stable-address graph/GPU-feedback execution, then tune linear/expert
-kernels. Preserve recurrent/KV state separately and validate cancellation/reuse
-with warmed stream gates. This commit establishes the baseline and attribution;
-it does not implement those performance changes or claim to close the gap.
+The initial baseline in `84df948` identified exclusively leased workspace
+storage as the first target, followed by stable-address graph/GPU-feedback
+execution and linear/expert kernels. Preserve recurrent/KV state separately and validate cancellation/reuse
+with warmed stream gates. That baseline commit established attribution without implementing those
+performance changes. The workspace iteration below addresses its first target.
+
+
+## Qwen3.5 BF16 workspace iteration
+
+This iteration reuses scratch storage and adds NVTX attribution. It retains
+BF16 weights/activations, the existing FP32 recurrent state/reductions, host token
+feedback and full-logit validation. No FP32 inference performance matrix is used.
+GPU kernels and numerical algorithms are unchanged.
+
+Fresh measurements rotate baseline, candidate and SGLang graph over three
+independent processes/engine, with two warmups and three measured samples each.
+The same RTX 6000D, NUMA-local CPU cores 24–31, B1, 32 input tokens and eight
+fixed outputs are used. Native timing excludes loading/JIT and has no profiler
+or concurrent GPU tests/compilation. GPU clocks and external host load are not
+controlled. Values are medians of process aggregates, not pooled token trials.
+
+| Engine | Prefill ms | Decode ms/step | Total ms |
+| --- | ---: | ---: | ---: |
+| Baseline Rust eager | 60.753 | 31.594 | 279.430 |
+| Workspace Rust eager | 52.959 | 12.811 | 142.067 |
+| SGLang graph reference | 68.651 | 7.059 | 118.076 |
+
+Observed reductions are 12.8% prefill and 59.5% decode (2.47x). Baseline decode
+process medians vary from 29.006 to 37.868 ms; candidate medians are
+12.570–13.418 ms. The remaining graph-reference decode ratio is 1.81x. This uses
+a fresh baseline rather than attributing cross-window differences to the patch.
+
+The cache keeps at most two idle row/context-specific workspaces. Global
+hidden/residual/head buffers and separate DeltaNet/GQA layer banks bound scratch
+by shape rather than decoder depth. Execution contexts and derived tensor owners
+retain an exclusive lease through GPU completion and escaped-view lifetimes.
+Recurrent/KV state remains session-owned. The benchmark requires zero warmed
+scratch allocations and released checkouts; every measured candidate sample
+passes, with 10,729,868 logical resident scratch bytes (10.23 MiB).
+
+Separate one-prefill/seven-decode Nsight captures reduce allocation/free calls
+from 10,852 each to 60 each, event records from 10,844 to 60, and launches from
+18,260 to 7,476. All 60 remaining allocations correlate with fresh recurrent/
+convolution state initialization. Captured NVTX data validates eight visits to
+every layer, one prefill/seven decode submissions and balanced same-thread ranges.
+See [the guide](examples/qwen3_5.md#nvtx-attribution) for labels and scope semantics.
+
+Ten Qwen3.5 tests passed, including numerical/chunked-state and pooled Runner
+regressions plus two Gate tests. Final BF16 reference, Gate tests, all-target
+compilation, formatting and diff checks passed after instrumentation. The root
+pyright command is still blocked by the absent offline CPU PyTorch wheel.
+
+Raw samples, paired process aggregates, frozen source/binaries, hashes, separate
+traces and validation logs are retained in the ignored
+`rust/profiling/qwen3_5/workspace-reuse-20261109/` directory. The SGLang reference
+uses stock/default MoE tuning and a GPU-sampling/graph boundary; Rust still uses
+host feedback and full-logit validation. Cross-engine output equivalence and
+broader batching/long-context serving performance are not established here.

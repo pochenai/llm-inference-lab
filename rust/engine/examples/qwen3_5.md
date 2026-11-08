@@ -85,10 +85,13 @@ CUDA Graphs, packed batches and GPU sampling remain subsequent work; this engine
 
 This is a correctness baseline: prefill uses sequential DeltaNet recurrence,
 attention scans causal history, and selected-expert projections use direct FP32
-reductions. Scratch is allocated per forward/layer. Submission can block on JIT/module
-loading, allocations or pageable H2D; submission-first overlap and a fully warmed
-gated cancellation check require workspace/input reuse and remain unvalidated. These choices need tuning before
-serving performance comparisons. The vocabulary head runs only for the last
+reductions. Scratch now uses exclusively leased global and mixer-specific banks,
+cached by row count and actual CUDA context. Cold JIT/module loading, workspace
+misses, fresh recurrent-state allocation and pageable H2D can still block
+submission. Gate tests validate local scratch ownership; full hybrid-model
+submission-first overlap and cancellation stress remain unvalidated. Performance
+acceptance focuses on native BF16; FP32 type regressions are numerical/lifecycle
+controls, not a performance comparison. The vocabulary head runs only for the last
 input position. Greedy selection reuses Qwen2's two-stage GPU argmax. Logits are still copied
 to the CPU for finite-value validation; token feedback waits for completion.
 
@@ -225,3 +228,36 @@ separate traces are in the ignored
 The benchmark accepts `--profile` for a separate Nsight run. Use
 `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --output=PROFILE_PATH BENCH_PATH ... --warmup 2 --iterations 1 --profile`
 to exclude loading and warmup. Never pool profiler timings with native samples.
+
+
+## NVTX attribution
+
+Qwen3.5 reuses the engine's `ScopedRange` helper. Layer labels are prepared once
+at model loading; ranges stay in synchronous code and never span an await.
+These are CPU submission scopes, not GPU elapsed-time measurements. Correlate
+CUDA launches with their enclosing ranges; nested NVTX duration sums double-count
+parent/child time.
+
+- `qwen3_5.prefill.submit` / `qwen3_5.decode.submit` and `qwen3_5.layer.0` through
+  `qwen3_5.layer.39` identify submission phase and decoder depth.
+- `mixer.delta`, `delta.conv`, `delta.recurrence`, `delta.gated_norm`, `mixer.gqa`,
+  `gqa.q_rope`, `gqa.k_rope`, `gqa.kv_store` and `gqa.attention` identify mixers.
+- `moe`, `moe.router`, `moe.route`, `moe.expert.gate_up`, `moe.expert.swiglu`,
+  `moe.expert.down`, `moe.shared`, `moe.shared.swiglu` and `moe.merge` split MoE work.
+- `workspace.checkout`, `workspace.allocate` (cache miss only), `state.allocate`,
+  `input.upload`, `embedding`, `rms_norm`, `linear`, `residual.add`, `head`,
+  `argmax.blocks`, `argmax.final`, `readback.enqueue` and `host_validation` identify
+  storage, projections, sampling and CPU validation. All carry the `qwen3_5.` prefix.
+
+The first BF16 workspace iteration's frozen native/profile executables, exact
+commands and NVTX assertions are in
+`rust/profiling/qwen3_5/workspace-reuse-20261109/`. Its eight measured forwards
+have zero scratch misses; 60 remaining allocation calls lie in `state.allocate`.
+Scratch bank reuse is ordered within one execution stream, while a retained lease
+prevents another submission from acquiring storage still in flight or exposed
+through a tensor view. Persistent recurrent/KV state is separate from scratch.
+
+The JSONL `workspace` snapshot counts cumulative backing-buffer allocations,
+idle/active checkouts and logical resident bytes; it excludes other GPU memory
+and allocator reservation. `workspace_allocations` is a per-sample scratch delta,
+not a claim that fresh recurrent state needs no allocations.
