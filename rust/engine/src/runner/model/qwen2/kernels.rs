@@ -2,9 +2,9 @@ pub(in crate::runner::model) use ops::*;
 
 /// Amortize reduction overhead; Qwen's vocabulary needs 38 partials/request.
 /// Warm 4K B1/B4: ~76%/83% less argmax GPU time in separate Nsight captures.
-pub(super) const ARGMAX_TILE: usize = 4096;
+pub(in crate::runner::model) const ARGMAX_TILE: usize = 4096;
 /// Covers the supported vocabulary limit with ARGMAX_TILE-sized partials.
-pub(super) const ARGMAX_FINAL_TILE: usize = 64;
+pub(in crate::runner::model) const ARGMAX_FINAL_TILE: usize = 64;
 
 /// Shared attention/position metadata is a flat i32 tensor: three integers per packed token, followed
 /// by one final packed-row index per request (not a position in its token history).
@@ -1487,7 +1487,7 @@ pub(super) mod ops {
 
     /// Two-stage greedy reduction; ties select the smallest valid vocabulary index.
     #[cutile::entry()]
-    pub(super) fn argmax_blocks<const BLOCK: i32>(
+    pub(in crate::runner::model) fn argmax_blocks<const BLOCK: i32>(
         maxima: &mut Tensor<f32, { [1, 1] }>,
         indices: &mut Tensor<i32, { [1, 1] }>,
         logits: &Tensor<f32, { [-1, -1] }>,
@@ -1518,7 +1518,7 @@ pub(super) mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn argmax_final<const BLOCK: i32>(
+    pub(in crate::runner::model) fn argmax_final<const BLOCK: i32>(
         out: &mut Tensor<i32, { [1] }>,
         maxima: &Tensor<f32, { [-1, -1] }>,
         indices: &Tensor<i32, { [-1, -1] }>,

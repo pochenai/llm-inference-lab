@@ -73,9 +73,9 @@ mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn last_row(
-        out: &mut Tensor<bf16, { [1, POINTWISE_COLUMNS] }>,
-        x: &Tensor<bf16, { [-1, -1] }>,
+    pub(super) fn last_row<T: ElementType>(
+        out: &mut Tensor<T, { [1, POINTWISE_COLUMNS] }>,
+        x: &Tensor<T, { [-1, -1] }>,
     ) {
         out.store(
             x.partition(shape![1, POINTWISE_COLUMNS])
@@ -84,9 +84,9 @@ mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn norm<const D: i32, const ZERO_CENTERED: bool>(
-        out: &mut Tensor<bf16, { [1, D] }>,
-        x: &Tensor<bf16, { [-1, D] }>,
+    pub(super) fn norm<T: ElementType, const D: i32, const ZERO_CENTERED: bool>(
+        out: &mut Tensor<T, { [1, D] }>,
+        x: &Tensor<T, { [-1, D] }>,
         w: &Tensor<f32, { [D] }>,
         eps: f32,
     ) {
@@ -101,7 +101,7 @@ mod ops {
         if ZERO_CENTERED {
             weight = weight + one;
         }
-        let result: Tile<bf16, { [1, D] }> = convert_tile(
+        let result: Tile<T, { [1, D] }> = convert_tile(
             x * rsqrt(mean + eps.broadcast(shape![1, 1]), ftz::Disabled).broadcast(shape![1, D])
                 * weight,
         );
@@ -393,10 +393,10 @@ mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn gated_norm<const D: i32>(
-        out: &mut Tensor<bf16, { [1, D] }>,
-        x: &Tensor<bf16, { [-1, D] }>,
-        z: &Tensor<bf16, { [-1, D] }>,
+    pub(super) fn gated_norm<T: ElementType, const D: i32>(
+        out: &mut Tensor<T, { [1, D] }>,
+        x: &Tensor<T, { [-1, D] }>,
+        z: &Tensor<T, { [-1, D] }>,
         w: &Tensor<f32, { [D] }>,
         eps: f32,
     ) {
@@ -407,13 +407,13 @@ mod ops {
         let x: Tile<f32, { [1, D] }> = convert_tile(x.partition(shape![1, D]).load([row, 0]));
         let sum: Tile<f32, { [1] }> = reduce_sum(x * x, 1);
         let mean = sum.reshape(shape![1, 1]) / width.broadcast(shape![1, 1]);
-        let n: Tile<bf16, { [1, D] }> = convert_tile(
+        let n: Tile<T, { [1, D] }> = convert_tile(
             x * rsqrt(mean + eps.broadcast(shape![1, 1]), ftz::Disabled).broadcast(shape![1, D]),
         );
         let n: Tile<f32, { [1, D] }> = convert_tile(n);
         let z: Tile<f32, { [1, D] }> = convert_tile(z.partition(shape![1, D]).load([row, 0]));
 
-        let result: Tile<bf16, { [1, D] }> = convert_tile(
+        let result: Tile<T, { [1, D] }> = convert_tile(
             n * w.partition(shape![D]).load([0]).reshape(shape![1, D]) * z / (one + exp(zero - z)),
         );
         out.store(result);
@@ -504,7 +504,7 @@ mod ops {
         );
         let absolute_position: f32 = convert_scalar(position + row);
         let angle = freq * absolute_position.broadcast(shape![D]);
-        // Match BF16 RoPE operands/products, including the final rounded sum.
+        // Match storage-dtype RoPE operands/products, including the final rounded sum.
         let c: Tile<T, { [D] }> = convert_tile(cos(angle));
         let sn: Tile<T, { [D] }> = convert_tile(sin(angle));
         let c: Tile<f32, { [D] }> = convert_tile(c);
@@ -536,13 +536,21 @@ mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn gqa_attention<const D: i32, const QH: i32, const KVH: i32>(
-        out: &mut Tensor<bf16, { [1, D] }>,
-        q: &Tensor<bf16, { [-1, -1] }>,
-        k: &Tensor<bf16, { [-1, -1] }>,
-        v: &Tensor<bf16, { [-1, -1] }>,
-        q_gate: &Tensor<bf16, { [-1, -1] }>,
+    pub(super) unsafe fn gqa_attention<
+        T: ElementType,
+        const D: i32,
+        const QH: i32,
+        const KVH: i32,
+        const POOLED: bool,
+    >(
+        out: &mut Tensor<T, { [1, D] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        q_gate: &Tensor<T, { [-1, -1] }>,
         start: i32,
+        table: *const i32,
+        table_offset: i32,
     ) {
         let zero_vector: Tile<f32, { [D] }> = constant(0.0f32, shape![D]);
         let one: Tile<f32, { [D] }> = constant(1.0f32, shape![D]);
@@ -559,10 +567,30 @@ mod ops {
 
         let mut acc: Tile<f32, { [D] }> = constant(0.0f32, shape![D]);
         for t in 0..(start + row + 1) {
-            let key: Tile<f32, { [D] }> =
-                convert_tile(k.partition(shape![1, D]).load([t, kh]).reshape(shape![D]));
-            let value: Tile<f32, { [D] }> =
-                convert_tile(v.partition(shape![1, D]).load([t, kh]).reshape(shape![D]));
+            let mut slot = t;
+            if POOLED {
+                let address = pointer_to_tile(table).offset(table_offset + t);
+                let (mapped, _token): (Tile<i32, { [] }>, Token) = load_ptr_tko(
+                    address,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    None,
+                    None,
+                    Latency::<1>,
+                );
+                slot = tile_to_scalar(mapped);
+            }
+            let key: Tile<f32, { [D] }> = convert_tile(
+                k.partition(shape![1, D])
+                    .load([slot, kh])
+                    .reshape(shape![D]),
+            );
+            let value: Tile<f32, { [D] }> = convert_tile(
+                v.partition(shape![1, D])
+                    .load([slot, kh])
+                    .reshape(shape![D]),
+            );
             let dot: Tile<f32, { [1] }> = reduce_sum(q * key, 0);
             let dot = dot.reshape(shape![1]);
             let score = dot
@@ -578,7 +606,7 @@ mod ops {
             denom = denom * alpha + p;
             m = next_m;
         }
-        let y: Tile<bf16, { [D] }> = convert_tile(acc / denom.broadcast(shape![D]));
+        let y: Tile<T, { [D] }> = convert_tile(acc / denom.broadcast(shape![D]));
         let y: Tile<f32, { [D] }> = convert_tile(y);
         let gate: Tile<f32, { [D] }> = convert_tile(
             q_gate
@@ -587,9 +615,9 @@ mod ops {
                 .reshape(shape![D]),
         );
 
-        let sigmoid: Tile<bf16, { [D] }> = convert_tile(one / (one + exp(zero_vector - gate)));
+        let sigmoid: Tile<T, { [D] }> = convert_tile(one / (one + exp(zero_vector - gate)));
         let sigmoid: Tile<f32, { [D] }> = convert_tile(sigmoid);
-        let result: Tile<bf16, { [1, D] }> = convert_tile((y * sigmoid).reshape(shape![1, D]));
+        let result: Tile<T, { [1, D] }> = convert_tile((y * sigmoid).reshape(shape![1, D]));
         out.store(result);
     }
 
@@ -731,9 +759,9 @@ mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn expert_swiglu<const I: i32>(
-        out: &mut Tensor<bf16, { [1, POINTWISE_COLUMNS] }>,
-        x: &Tensor<bf16, { [-1, -1] }>,
+    pub(super) fn expert_swiglu<T: ElementType, const I: i32>(
+        out: &mut Tensor<T, { [1, POINTWISE_COLUMNS] }>,
+        x: &Tensor<T, { [-1, -1] }>,
     ) {
         let one: Tile<f32, { [1, POINTWISE_COLUMNS] }> =
             constant(1.0f32, shape![1, POINTWISE_COLUMNS]);
@@ -747,20 +775,20 @@ mod ops {
                 .load([p.0, I / POINTWISE_COLUMNS + p.1]),
         );
 
-        let activated: Tile<bf16, { [1, POINTWISE_COLUMNS] }> =
+        let activated: Tile<T, { [1, POINTWISE_COLUMNS] }> =
             convert_tile(g / (one + exp(zero - g)));
         let activated: Tile<f32, { [1, POINTWISE_COLUMNS] }> = convert_tile(activated);
-        let result: Tile<bf16, { [1, POINTWISE_COLUMNS] }> = convert_tile(activated * u);
+        let result: Tile<T, { [1, POINTWISE_COLUMNS] }> = convert_tile(activated * u);
         out.store(result);
     }
 
     #[cutile::entry()]
-    pub(super) fn moe_merge<const TOP: i32>(
-        out: &mut Tensor<bf16, { [1, POINTWISE_COLUMNS] }>,
-        routed: &Tensor<bf16, { [-1, -1] }>,
-        scores: &Tensor<bf16, { [-1, TOP] }>,
-        shared: &Tensor<bf16, { [-1, -1] }>,
-        gate: &Tensor<bf16, { [-1, 1] }>,
+    pub(super) fn moe_merge<T: ElementType, const TOP: i32>(
+        out: &mut Tensor<T, { [1, POINTWISE_COLUMNS] }>,
+        routed: &Tensor<T, { [-1, -1] }>,
+        scores: &Tensor<T, { [-1, TOP] }>,
+        shared: &Tensor<T, { [-1, -1] }>,
+        gate: &Tensor<T, { [-1, 1] }>,
     ) {
         let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
         let zero_vector: Tile<f32, { [1, 1] }> = constant(0.0f32, shape![1, 1]);
@@ -776,12 +804,12 @@ mod ops {
             );
             let score: Tile<f32, { [1, 1] }> =
                 convert_tile(scores.partition(shape![1, 1]).load([p.0, rank]));
-            let weighted: Tile<bf16, { [1, POINTWISE_COLUMNS] }> =
+            let weighted: Tile<T, { [1, POINTWISE_COLUMNS] }> =
                 convert_tile(v * score.broadcast(shape![1, POINTWISE_COLUMNS]));
             let weighted: Tile<f32, { [1, POINTWISE_COLUMNS] }> = convert_tile(weighted);
             sum = sum + weighted;
         }
-        let sum: Tile<bf16, { [1, POINTWISE_COLUMNS] }> = convert_tile(sum);
+        let sum: Tile<T, { [1, POINTWISE_COLUMNS] }> = convert_tile(sum);
         let sum: Tile<f32, { [1, POINTWISE_COLUMNS] }> = convert_tile(sum);
         let shared: Tile<f32, { [1, POINTWISE_COLUMNS] }> = convert_tile(
             shared
@@ -790,12 +818,12 @@ mod ops {
         );
         let gate: Tile<f32, { [1, 1] }> = convert_tile(gate.partition(shape![1, 1]).load([p.0, 0]));
 
-        let sigmoid: Tile<bf16, { [1, 1] }> = convert_tile(one / (one + exp(zero_vector - gate)));
+        let sigmoid: Tile<T, { [1, 1] }> = convert_tile(one / (one + exp(zero_vector - gate)));
         let sigmoid: Tile<f32, { [1, 1] }> = convert_tile(sigmoid);
-        let shared: Tile<bf16, { [1, POINTWISE_COLUMNS] }> =
+        let shared: Tile<T, { [1, POINTWISE_COLUMNS] }> =
             convert_tile(shared * sigmoid.broadcast(shape![1, POINTWISE_COLUMNS]));
         let shared: Tile<f32, { [1, POINTWISE_COLUMNS] }> = convert_tile(shared);
-        let result: Tile<bf16, { [1, POINTWISE_COLUMNS] }> = convert_tile(sum + shared);
+        let result: Tile<T, { [1, POINTWISE_COLUMNS] }> = convert_tile(sum + shared);
         out.store(result);
     }
 }

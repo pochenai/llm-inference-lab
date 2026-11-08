@@ -51,6 +51,11 @@ pub trait KVPool: Sized + Send + Sync {
     where
         Self: 'a;
 
+    /// Whether committed state can be split and reused by the radix prefix cache.
+    fn supports_prefix_cache(&self) -> bool {
+        true
+    }
+
     fn max_seq_len(&self) -> usize;
     fn alloc_state(&self) -> Result<Self::ContextState>;
 
@@ -116,9 +121,36 @@ pub trait KVPool: Sized + Send + Sync {
         v: TensorView<'_, Self::Element>,
     ) -> Result<()>;
 
+    /// Confirm backend metadata only after the append's GPU work succeeds.
+    /// In-place updates are not rolled back on failure; callers discard failed contexts.
+    fn commit_append(
+        &self,
+        _state: &mut Self::ContextState,
+        _positions: Range<usize>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Drop context ownership; in-flight submission leases delay actual row/slot reuse.
     fn release_state(&self, state: Self::ContextState);
     fn metrics(&self) -> KVPoolMetrics;
+}
+
+/// Optional typed execution resources for backends with state beyond append-only KV.
+pub trait ExecutionStatePool: KVPool {
+    type ExecutionView<'a>
+    where
+        Self: 'a;
+
+    /// Expose only this pending append's resources; retain GPU owners on exec
+    /// before any GPU access, including accesses after the CPU view is dropped.
+    fn execution_view<'a>(
+        &'a self,
+        state: &'a mut Self::ContextState,
+        positions: Range<usize>,
+        tokens: &[u32],
+        exec: &'a ExecutionContext,
+    ) -> Result<Self::ExecutionView<'a>>;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -428,10 +460,18 @@ impl<P: KVPool> KVContext<P> {
     /// layers, e.g. after the outer scheduled operation is awaited or sync_on succeeds.
     pub(in crate::runner) fn commit_append(&mut self) -> ContextResult<()> {
         let _range = crate::profiling::ScopedRange::new(c"commit_append");
-        self.ready_len = self
+        let end = self
             .pending_ends
-            .pop_front()
+            .front()
+            .copied()
             .ok_or_else(|| KVContextError::InvalidState("no pending KV append".into()))?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| KVContextError::InvalidState("context is invalidated".into()))?;
+        self.pool.commit_append(state, self.ready_len..end)?;
+        self.pending_ends.pop_front();
+        self.ready_len = end;
         Ok(())
     }
 
@@ -464,6 +504,37 @@ impl<P: KVPool> KVContext<P> {
     /// Release ownership, including failed pending appends. Pool leases protect GPU work.
     pub fn release(self) {
         drop(self);
+    }
+}
+
+impl<P: ExecutionStatePool> KVContext<P> {
+    /// Borrow execution resources only for an existing pending append. A view
+    /// does not commit progress; GPU completion must precede commit_append.
+    ///
+    /// ```compile_fail,E0499
+    /// use engine::runner::{kv_pool::{KVContext, KVContextError}, model::Qwen3_5StatePool};
+    /// use cuda_async::device_operation::ExecutionContext;
+    /// fn overlapping_views(kv: &mut KVContext<Qwen3_5StatePool>, tokens: &[u32], exec: &ExecutionContext)
+    ///     -> Result<(), KVContextError> {
+    ///     let first = kv.execution_view(tokens, exec)?;
+    ///     let second = kv.execution_view(tokens, exec)?;
+    ///     drop((first, second));
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn execution_view<'a>(
+        &'a mut self,
+        tokens: &[u32],
+        exec: &'a ExecutionContext,
+    ) -> ContextResult<P::ExecutionView<'a>> {
+        let positions = self
+            .pending_range()
+            .ok_or_else(|| KVContextError::InvalidState("no pending state append".into()))?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| KVContextError::InvalidState("context is invalidated".into()))?;
+        Ok(self.pool.execution_view(state, positions, tokens, exec)?)
     }
 }
 

@@ -207,6 +207,11 @@ impl<MF, PF, SF> RunnerBuilder<MF, PF, SF> {
             let policy = (self.policy_factory)()?;
             let model = self.model_factory.create(()).await?;
             let pool = self.pool_factory.create(policy.clone()).await?;
+            if self.prefix_cache_config.is_some() && !pool.supports_prefix_cache() {
+                return Err(EngineError::InvalidInput(
+                    "this state pool does not support prefix caching".into(),
+                ));
+            }
             let mut runner = ModelRunner::new(command_rx, batch_reply_tx, model, pool, policy);
             runner.max_batch_tokens = self.max_batch_tokens;
             runner.overlap = self.overlap;

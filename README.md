@@ -43,7 +43,7 @@ GPUs. Multi-GPU and PD experiments require the corresponding GPU allocation.
 
 | Week / unit | Brief content | Status |
 | --- | --- | --- |
-| 10 | [Qwen3.5-35B-A3B BF16 text engine](rust/engine/examples/qwen3_5.md), target-specific state/operators, and GPU sampling | 🚧 Standalone BF16 engine implemented; sampling/runtime integration pending |
+| 10 | [Qwen3.5-35B-A3B BF16 text engine](rust/engine/examples/qwen3_5.md), target-specific state/operators, and GPU sampling | 🚧 BF16 engine and single-GPU Runner integration implemented; GPU sampling pending |
 | 11 | Execution domains, model parallelism and replica routing | ⬜ Planned; TP/external DP, PP/EP where required |
 | 12 | Prefill/decode disaggregation and whole-state handoff | ⬜ Planned; homogeneous layout and partition shape first |
 | 13 | Official Qwen3.5-35B-A3B-FP8 execution | ⬜ Planned; block scales, dynamic activation quantization, memory/quality/performance validation |
@@ -61,8 +61,8 @@ and [the proposed parallelism/PD architecture](design/parallelism_routing.md) se
 required mechanisms from future capabilities. Week labels are milestones, not dates.
 
 The [W10 experiment](rust/engine/examples/qwen3_5.md) adds the BF16 text engine,
-reference checks and hybrid state budget. Runtime integration and GPU sampling
-follow the standalone engine correctness baseline. W13 adds the official FP8 checkpoint
+reference checks and hybrid state budget. Single-GPU Runner integration builds on the standalone engine correctness
+baseline; GPU sampling remains pending. W13 adds the official FP8 checkpoint
 against this baseline; INT4/AWQ/GGUF support is optional. FP8 alone does not make the
 35B model fit a 24 GiB GPU.
 

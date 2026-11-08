@@ -1,4 +1,4 @@
-//! BF16 text-only Qwen3.5 MoE decoder with explicit per-session hybrid state.
+//! Typed text-only Qwen3.5 MoE decoder with explicit per-session hybrid state.
 //!
 //! Qwen3.5-35B-A3B (T = number of uncached input tokens):
 //! ```text
@@ -48,11 +48,11 @@
 
 use std::{path::Path, sync::Arc};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
-    core::bf16,
+    core::{bf16, ElementType},
     tensor::{PartitionMut, Reshape, Tensor},
     tile_kernel::TileKernel,
     DType,
@@ -63,97 +63,75 @@ use super::{
     config::{Qwen3_5Config, Qwen3_5LayerType},
     constants::*,
     kernels,
+    state::{retained_pointer, Qwen3_5Context, Qwen3_5ExecutionView},
+    Qwen3_5StatePool,
 };
 use crate::runner::{
+    kv_pool::NaiveKVPoolConfig,
     loader::{EosTokenId, WeightElement, WeightLoader},
-    model::qwen2::kernels as shared,
+    model::{
+        qwen2::kernels as shared, readback::Readback, CausalModel, ModelError, ModelInput,
+        NextToken,
+    },
 };
 
-type Weight = Arc<Tensor<bf16>>;
+type Weight<T> = Arc<Tensor<T>>;
 type Norm = Arc<Tensor<f32>>;
 
-struct Delta {
-    qkv: Weight,
-    z: Weight,
-    a: Weight,
-    b: Weight,
-    out: Weight,
-    conv: Weight,
+struct Delta<T: DType> {
+    qkv: Weight<T>,
+    z: Weight<T>,
+    a: Weight<T>,
+    b: Weight<T>,
+    out: Weight<T>,
+    conv: Weight<T>,
     a_log: Norm,
     dt: Norm,
     norm: Norm,
 }
-struct Attention {
-    q: Weight,
-    k: Weight,
-    v: Weight,
-    out: Weight,
+struct Attention<T: DType> {
+    q: Weight<T>,
+    k: Weight<T>,
+    v: Weight<T>,
+    out: Weight<T>,
     q_norm: Norm,
     k_norm: Norm,
 }
-enum Mixer {
-    Delta(Delta),
-    Attention(Attention),
+enum Mixer<T: DType> {
+    Delta(Delta<T>),
+    Attention(Attention<T>),
 }
-struct Layer {
+struct Layer<T: DType> {
     input_norm: Norm,
     post_norm: Norm,
-    mixer: Mixer,
-    router: Weight,
-    gate_up: Weight,
-    down: Weight,
-    shared_gate: Weight,
-    shared_up: Weight,
-    shared_down: Weight,
-    shared_router: Weight,
+    mixer: Mixer<T>,
+    router: Weight<T>,
+    gate_up: Weight<T>,
+    down: Weight<T>,
+    shared_gate: Weight<T>,
+    shared_up: Weight<T>,
+    shared_down: Weight<T>,
+    shared_router: Weight<T>,
 }
-enum LayerState {
-    Delta {
-        conv: Tensor<bf16>,
-        recurrent: Tensor<f32>,
-    },
-    Attention {
-        k: Tensor<bf16>,
-        v: Tensor<bf16>,
-    },
-}
-
-/// Exclusive, append-only hybrid state. A failed/cancelled forward invalidates it.
-/// Recurrent state cannot be sliced or shared as a KV prefix.
-pub struct Qwen3_5Context {
-    owner: Arc<()>,
-    layers: Vec<LayerState>,
-    history: Vec<u32>,
-    /// Maximum total token history for this session, including prompt and generated tokens.
-    max_seq_len: usize,
-    valid: bool,
-}
-impl Qwen3_5Context {
-    pub fn ready_len(&self) -> usize {
-        self.history.len()
-    }
-    pub fn is_valid(&self) -> bool {
-        self.valid
-    }
-}
-
-/// BF16 text backbone with cuTile operators and explicit per-session hybrid state.
-pub struct Qwen3_5Engine {
+/// Typed text backbone; T selects floating-point weight/activation/state storage.
+/// Norm metadata, reductions, recurrence and diagnostic logits remain FP32.
+pub struct Qwen3_5Engine<T: DType = bf16> {
     config: Qwen3_5Config,
     tokenizer: Tokenizer,
-    embedding: Weight,
-    layers: Vec<Layer>,
+    embedding: Weight<T>,
+    layers: Vec<Layer<T>>,
     norm: Norm,
-    lm_head: Weight,
+    lm_head: Weight<T>,
     frequencies: Norm,
     eos: Vec<u32>,
     policy: Arc<dyn SchedulingPolicy>,
-    owner: Arc<()>,
+    pub(super) owner: Arc<()>,
     weight_bytes: usize,
     readbacks: crate::runner::model::readback::ReadbackCache<f32>,
+    token_readbacks: crate::runner::model::readback::ReadbackCache<i32>,
 }
 
-impl Qwen3_5Engine {
+impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
     pub async fn load(path: &Path, policy: &Arc<dyn SchedulingPolicy>) -> Result<Self> {
         let loader = WeightLoader::new(path)?;
         let config: Qwen3_5Config = loader.config()?;
@@ -161,20 +139,20 @@ impl Qwen3_5Engine {
         let c = &config.text_config;
         let tokenizer = loader.tokenizer()?;
         let mut weight_bytes = 0;
-        async fn weight<T: WeightElement>(
+        async fn weight<W: WeightElement>(
             loader: &WeightLoader,
             name: &str,
             shape: &[usize],
             policy: &Arc<dyn SchedulingPolicy>,
             bytes: &mut usize,
-        ) -> Result<Arc<Tensor<T>>> {
-            let host = loader.load_host::<T>(name)?;
+        ) -> Result<Arc<Tensor<W>>> {
+            let host = loader.load_host::<W>(name)?;
             ensure!(
                 host.shape == shape,
                 "{name}: expected {shape:?}, got {:?}",
                 host.shape
             );
-            *bytes += host.data.len() * size_of::<T>();
+            *bytes += host.data.len() * size_of::<W>();
             Ok(Arc::new(
                 api::copy_host_vec_to_device(&Arc::new(host.data))
                     .schedule(policy)?
@@ -205,19 +183,18 @@ impl Qwen3_5Engine {
             let mixer = match kind {
                 Qwen3_5LayerType::LinearAttention => {
                     // Transpose the small convolution once to make channel tiles contiguous.
-                    let host =
-                        loader.load_host::<bf16>(&format!("{p}.linear_attn.conv1d.weight"))?;
+                    let host = loader.load_host::<T>(&format!("{p}.linear_attn.conv1d.weight"))?;
                     ensure!(
                         host.shape == [channels, 1, CONV_KERNEL_SIZE],
                         "invalid convolution weight shape"
                     );
-                    let mut transposed: Vec<bf16> = Vec::with_capacity(host.data.len());
+                    let mut transposed: Vec<T> = Vec::with_capacity(host.data.len());
                     transposed.extend(
                         (0..CONV_KERNEL_SIZE)
                             .flat_map(|tap| (0..channels).map(move |channel| (tap, channel)))
                             .map(|(tap, channel)| host.data[channel * CONV_KERNEL_SIZE + tap]),
                     );
-                    weight_bytes += host.data.len() * size_of::<bf16>();
+                    weight_bytes += host.data.len() * size_of::<T>();
                     let conv = Arc::new(
                         api::copy_host_vec_to_device(&Arc::new(transposed))
                             .schedule(policy)?
@@ -263,11 +240,12 @@ impl Qwen3_5Engine {
                     k_norm: load!(format!("{p}.self_attn.k_norm.weight"), [ATTENTION_HEAD_DIM]),
                 }),
             };
-            let gu: Weight = load!(
+            let gu: Weight<T> = load!(
                 format!("{p}.mlp.experts.gate_up_proj"),
                 [c.num_experts, 2 * i, h]
             );
-            let down: Weight = load!(format!("{p}.mlp.experts.down_proj"), [c.num_experts, h, i]);
+            let down: Weight<T> =
+                load!(format!("{p}.mlp.experts.down_proj"), [c.num_experts, h, i]);
             layers.push(Layer {
                 input_norm: load!(format!("{p}.input_layernorm.weight"), [h]),
                 post_norm: load!(format!("{p}.post_attention_layernorm.weight"), [h]),
@@ -319,6 +297,7 @@ impl Qwen3_5Engine {
             owner: Arc::new(()),
             weight_bytes,
             readbacks: Default::default(),
+            token_readbacks: Default::default(),
         })
     }
 
@@ -335,8 +314,7 @@ impl Qwen3_5Engine {
         self.weight_bytes
     }
 
-    /// Allocate session state for at most max_seq_len total tokens (prompt plus generation).
-    pub async fn new_context(&self, max_seq_len: usize) -> Result<Qwen3_5Context> {
+    fn validate_max_seq_len(&self, max_seq_len: usize) -> Result<()> {
         let c = &self.config.text_config;
         ensure!(
             max_seq_len > 0
@@ -346,136 +324,102 @@ impl Qwen3_5Engine {
                     .is_some_and(|n| n <= i32::MAX as usize),
             "invalid maximum session sequence length"
         );
-        let layers = with_context(|exec| {
-            value((|| -> Result<_> {
-                let mut states = Vec::with_capacity(self.layers.len());
-                for layer in &self.layers {
-                    // SAFETY: allocation operations are completed before returning the context.
-                    states.push(unsafe {
-                        match layer.mixer {
-                            Mixer::Delta(_) => LayerState::Delta {
-                                conv: api::zeros(&[
-                                    CONV_HISTORY_LEN,
-                                    c.linear_num_key_heads * GDN_QK_CHANNELS_PER_HEAD
-                                        + c.linear_num_value_heads * GDN_VALUE_HEAD_DIM,
-                                ])
-                                .execute(exec)?,
-                                recurrent: api::zeros(&[
-                                    c.linear_num_value_heads * GDN_KEY_HEAD_DIM,
-                                    GDN_VALUE_HEAD_DIM,
-                                ])
-                                .execute(exec)?,
-                            },
-                            Mixer::Attention(_) => LayerState::Attention {
-                                k: api::zeros(&[
-                                    max_seq_len,
-                                    c.num_key_value_heads * ATTENTION_HEAD_DIM,
-                                ])
-                                .execute(exec)?,
-                                v: api::zeros(&[
-                                    max_seq_len,
-                                    c.num_key_value_heads * ATTENTION_HEAD_DIM,
-                                ])
-                                .execute(exec)?,
-                            },
-                        }
-                    });
-                }
-                Ok(states)
-            })())
-        })
-        .schedule(&self.policy)?
-        .await??;
-        Ok(Qwen3_5Context {
-            owner: self.owner.clone(),
-            layers,
-            history: Vec::with_capacity(max_seq_len),
+        Ok(())
+    }
+
+    pub fn kv_pool_config(&self, max_seq_len: usize) -> Result<NaiveKVPoolConfig> {
+        self.validate_max_seq_len(max_seq_len)?;
+        Ok(NaiveKVPoolConfig {
+            num_layers: self
+                .config
+                .text_config
+                .layer_types
+                .iter()
+                .filter(|&&kind| kind == Qwen3_5LayerType::FullAttention)
+                .count(),
+            num_slots: max_seq_len,
+            max_rows: 1,
             max_seq_len,
-            valid: true,
+            head_dim: self.config.text_config.num_key_value_heads * ATTENTION_HEAD_DIM,
         })
     }
 
-    /// Append the uncached suffix of a complete token history and return next-token logits.
-    /// All GPU updates complete before the committed history advances.
+    /// Allocate standalone state for at most max_seq_len total tokens.
+    pub async fn new_context(&self, max_seq_len: usize) -> Result<Qwen3_5Context<T>> {
+        self.validate_max_seq_len(max_seq_len)?;
+        with_context(|exec| {
+            value(unsafe {
+                Qwen3_5Context::allocate(
+                    &self.config.text_config,
+                    self.owner.clone(),
+                    max_seq_len,
+                    false,
+                    exec,
+                )
+            })
+        })
+        .schedule(&self.policy)?
+        .await?
+    }
+
+    /// Append the uncached suffix, completing GPU work before publishing history.
     pub async fn step_with_logits(
         &self,
         tokens: &[u32],
-        state: &mut Qwen3_5Context,
+        state: &mut Qwen3_5Context<T>,
     ) -> Result<(u32, Vec<f32>)> {
-        ensure!(
-            Arc::ptr_eq(&state.owner, &self.owner),
-            "context belongs to another engine"
-        );
-        ensure!(
-            state.valid,
-            "context was invalidated by a cancelled or failed forward"
-        );
-        ensure!(
-            tokens.len() > state.history.len()
-                && tokens.len() <= state.max_seq_len
-                && tokens.starts_with(&state.history),
-            "expected an extending history within the maximum session sequence length"
-        );
-        ensure!(
-            tokens
-                .iter()
-                .all(|id| (*id as usize) < self.config.text_config.vocab_size),
-            "token outside vocabulary"
-        );
-        state.valid = false;
-        let start_pos = state.history.len();
-        let suffix = Arc::new(tokens[start_pos..].to_vec());
-        let logits =
-            with_context(|exec| value(unsafe { self.submit(&suffix, start_pos, state, exec) }))
-                .schedule(&self.policy)?
-                .await??;
-        let logits = logits.as_slice().to_vec();
-        ensure!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
-        let next = logits
-            .iter()
-            .enumerate()
-            .max_by(|(ia, a), (ib, b)| a.total_cmp(b).then_with(|| ib.cmp(ia)))
-            .context("empty logits")?
-            .0 as u32;
-        state.history.extend_from_slice(&tokens[start_pos..]);
-        state.valid = true;
-        Ok((next, logits))
+        self.validate_input(tokens)?;
+        state.validate(&self.owner, tokens)?;
+        let suffix = Arc::new(tokens[state.ready_len()..].to_vec());
+        state
+            .execute(
+                &self.owner,
+                tokens,
+                &self.policy,
+                |view, exec| unsafe { self.submit(&suffix, view, exec) },
+                |(logits, token)| {
+                    let next = validate_prediction(token.as_slice()[0], logits.as_slice())?;
+                    Ok((next, logits.as_slice().to_vec()))
+                },
+            )
+            .await
     }
 
     unsafe fn submit(
         &self,
         suffix: &Arc<Vec<u32>>,
-        start_pos: usize,
-        state: &mut Qwen3_5Context,
+        state: &mut Qwen3_5ExecutionView<'_, T>,
         exec: &ExecutionContext,
-    ) -> Result<crate::runner::model::readback::Readback<f32>> {
+    ) -> Result<(Readback<f32>, Readback<i32>)> {
         let c = &self.config.text_config;
+        let start_pos = state.start_pos();
         let rows = suffix.len();
         let h = c.hidden_size;
         let ids = api::copy_host_vec_to_device(suffix).execute(exec)?;
-        let mut x = api::zeros::<bf16>(&[rows, h]).execute(exec)?;
+        let mut x = api::zeros::<T>(&[rows, h]).execute(exec)?;
         shared::embedding(
             (&mut x).partition([1, SHARED_POINTWISE_COLUMNS]),
             &ids,
             self.embedding.clone(),
         )
-        .generics(vec![bf16::DTYPE.to_string()])
+        .generics(vec![T::DTYPE.to_string()])
         .execute(exec)?;
-        for (layer, state) in self.layers.iter().zip(&mut state.layers) {
+        for (index, layer) in self.layers.iter().enumerate() {
             let n = normalize(&x, layer.input_norm.clone(), c.rms_norm_eps, exec)?;
-            let mixed = match (&layer.mixer, state) {
-                (Mixer::Delta(w), LayerState::Delta { conv, recurrent }) => {
+            let mixed = match &layer.mixer {
+                Mixer::Delta(w) => {
+                    let delta = state.delta(index)?;
                     let qkv = linear(&n, w.qkv.clone(), exec)?;
                     let mut convolved =
-                        api::zeros::<bf16>(&[rows, qkv.shape()[1] as usize]).execute(exec)?;
+                        api::zeros::<T>(&[rows, qkv.shape()[1] as usize]).execute(exec)?;
 
                     kernels::conv(
-                        output_pointer(&mut convolved, exec)?,
-                        output_pointer(conv, exec)?,
+                        retained_pointer(&mut convolved, exec)?,
+                        delta.conv,
                         &qkv,
                         w.conv.clone(),
                     )
-                    .generics(vec![bf16::DTYPE.to_string(), qkv.shape()[1].to_string()])
+                    .generics(vec![T::DTYPE.to_string(), qkv.shape()[1].to_string()])
                     .grid((1, (qkv.shape()[1] as usize / POINTWISE_COLUMNS) as u32, 1))
                     .execute(exec)?;
                     let a = linear(&n, w.a.clone(), exec)?;
@@ -483,11 +427,11 @@ impl Qwen3_5Engine {
                     let z = linear(&n, w.z.clone(), exec)?;
                     let vh = c.linear_num_value_heads;
                     let mut core =
-                        api::zeros::<bf16>(&[rows, vh * GDN_VALUE_HEAD_DIM]).execute(exec)?;
+                        api::zeros::<T>(&[rows, vh * GDN_VALUE_HEAD_DIM]).execute(exec)?;
 
                     kernels::delta(
-                        output_pointer(&mut core, exec)?,
-                        output_pointer(recurrent, exec)?,
+                        retained_pointer(&mut core, exec)?,
+                        delta.recurrent,
                         &convolved,
                         &a,
                         &b,
@@ -495,7 +439,7 @@ impl Qwen3_5Engine {
                         w.dt.clone(),
                     )
                     .generics(vec![
-                        bf16::DTYPE.to_string(),
+                        T::DTYPE.to_string(),
                         c.linear_num_key_heads.to_string(),
                         vh.to_string(),
                         GDN_KEY_HEAD_DIM.to_string(),
@@ -510,7 +454,7 @@ impl Qwen3_5Engine {
                     let core = core.reshape(&[rows * vh, GDN_VALUE_HEAD_DIM])?;
                     let z = z.reshape(&[rows * vh, GDN_VALUE_HEAD_DIM])?;
                     let mut gated =
-                        api::zeros::<bf16>(&[rows * vh, GDN_VALUE_HEAD_DIM]).execute(exec)?;
+                        api::zeros::<T>(&[rows * vh, GDN_VALUE_HEAD_DIM]).execute(exec)?;
 
                     kernels::gated_norm(
                         (&mut gated).partition([1, GDN_VALUE_HEAD_DIM]),
@@ -519,7 +463,7 @@ impl Qwen3_5Engine {
                         w.norm.clone(),
                         c.rms_norm_eps,
                     )
-                    .generics(vec![GDN_VALUE_HEAD_DIM.to_string()])
+                    .generics(vec![T::DTYPE.to_string(), GDN_VALUE_HEAD_DIM.to_string()])
                     .execute(exec)?;
                     linear(
                         &gated.reshape(&[rows, vh * GDN_VALUE_HEAD_DIM])?,
@@ -527,16 +471,16 @@ impl Qwen3_5Engine {
                         exec,
                     )?
                 }
-                (Mixer::Attention(w), LayerState::Attention { k, v }) => {
+                Mixer::Attention(w) => {
                     let qg = linear(&n, w.q.clone(), exec)?;
                     let raw_k = linear(&n, w.k.clone(), exec)?;
                     let raw_v = linear(&n, w.v.clone(), exec)?;
                     let mut q =
-                        api::zeros::<bf16>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
+                        api::zeros::<T>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
                             .execute(exec)?;
 
                     kernels::qk(
-                        output_pointer(&mut q, exec)?,
+                        retained_pointer(&mut q, exec)?,
                         &qg,
                         w.q_norm.clone(),
                         self.frequencies.clone(),
@@ -546,7 +490,7 @@ impl Qwen3_5Engine {
                         0,
                     )
                     .generics(vec![
-                        bf16::DTYPE.to_string(),
+                        T::DTYPE.to_string(),
                         ATTENTION_HEAD_DIM.to_string(),
                         ROTARY_DIM.to_string(),
                         "true".into(),
@@ -554,18 +498,21 @@ impl Qwen3_5Engine {
                     .grid((rows as u32, c.num_attention_heads as u32, 1))
                     .execute(exec)?;
 
+                    let mut rotated_k =
+                        api::zeros::<T>(&[rows, c.num_key_value_heads * ATTENTION_HEAD_DIM])
+                            .execute(exec)?;
                     kernels::qk(
-                        output_pointer(k, exec)?,
+                        retained_pointer(&mut rotated_k, exec)?,
                         &raw_k,
                         w.k_norm.clone(),
                         self.frequencies.clone(),
                         c.rms_norm_eps,
                         start_pos as i32,
                         c.num_key_value_heads as i32,
-                        start_pos as i32,
+                        0,
                     )
                     .generics(vec![
-                        bf16::DTYPE.to_string(),
+                        T::DTYPE.to_string(),
                         ATTENTION_HEAD_DIM.to_string(),
                         ROTARY_DIM.to_string(),
                         "false".into(),
@@ -573,34 +520,35 @@ impl Qwen3_5Engine {
                     .grid((rows as u32, c.num_key_value_heads as u32, 1))
                     .execute(exec)?;
 
-                    kernels::cache_v(output_pointer(v, exec)?, &raw_v, start_pos as i32)
-                        .generics(vec![
-                            bf16::DTYPE.to_string(),
-                            ATTENTION_HEAD_DIM.to_string(),
-                        ])
-                        .grid((rows as u32, c.num_key_value_heads as u32, 1))
-                        .execute(exec)?;
                     let mut attended =
-                        api::zeros::<bf16>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
+                        api::zeros::<T>(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM])
                             .execute(exec)?;
-
-                    kernels::gqa_attention(
-                        (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
-                        &q,
-                        &*k,
-                        &*v,
-                        &qg,
-                        start_pos as i32,
-                    )
-                    .generics(vec![
+                    let generics = vec![
+                        T::DTYPE.to_string(),
                         ATTENTION_HEAD_DIM.to_string(),
                         c.num_attention_heads.to_string(),
                         c.num_key_value_heads.to_string(),
-                    ])
+                    ];
+                    let cache = state.attention(index, &rotated_k, &raw_v)?;
+                    kernels::gqa_attention(
+                        (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
+                        &q,
+                        cache.k,
+                        cache.v,
+                        &qg,
+                        start_pos as i32,
+                        cache.table,
+                        cache.table_offset as i32,
+                    )
+                    .generics(
+                        generics
+                            .into_iter()
+                            .chain([cache.pooled.to_string()])
+                            .collect(),
+                    )
                     .execute(exec)?;
                     linear(&attended, w.out.clone(), exec)?
                 }
-                _ => anyhow::bail!("hybrid layer/state mismatch"),
             };
             x = add(&x, &mixed, exec)?;
             let n = normalize(&x, layer.post_norm.clone(), c.rms_norm_eps, exec)?;
@@ -608,7 +556,7 @@ impl Qwen3_5Engine {
             let top = c.num_experts_per_tok;
             let i = c.moe_intermediate_size;
             let mut selected = api::zeros::<i32>(&[rows, top]).execute(exec)?;
-            let mut scores = api::zeros::<bf16>(&[rows, top]).execute(exec)?;
+            let mut scores = api::zeros::<T>(&[rows, top]).execute(exec)?;
 
             kernels::route(
                 (&mut selected).partition([1, top]),
@@ -616,13 +564,13 @@ impl Qwen3_5Engine {
                 &logits,
             )
             .generics(vec![
-                bf16::DTYPE.to_string(),
+                T::DTYPE.to_string(),
                 c.num_experts.to_string(),
                 top.to_string(),
             ])
             .grid((rows as u32, 1, 1))
             .execute(exec)?;
-            let mut gu = api::zeros::<bf16>(&[rows * top, 2 * i]).execute(exec)?;
+            let mut gu = api::zeros::<T>(&[rows * top, 2 * i]).execute(exec)?;
 
             kernels::expert(
                 (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
@@ -632,18 +580,18 @@ impl Qwen3_5Engine {
                 top as i32,
             )
             .generics(vec![
-                bf16::DTYPE.to_string(),
+                T::DTYPE.to_string(),
                 h.to_string(),
                 (2 * i).to_string(),
                 top.to_string(),
             ])
             .execute(exec)?;
-            let mut activated = api::zeros::<bf16>(&[rows * top, i]).execute(exec)?;
+            let mut activated = api::zeros::<T>(&[rows * top, i]).execute(exec)?;
 
             kernels::expert_swiglu((&mut activated).partition([1, POINTWISE_COLUMNS]), &gu)
-                .generics(vec![i.to_string()])
+                .generics(vec![T::DTYPE.to_string(), i.to_string()])
                 .execute(exec)?;
-            let mut routed = api::zeros::<bf16>(&[rows * top, h]).execute(exec)?;
+            let mut routed = api::zeros::<T>(&[rows * top, h]).execute(exec)?;
 
             kernels::expert(
                 (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
@@ -653,7 +601,7 @@ impl Qwen3_5Engine {
                 1,
             )
             .generics(vec![
-                bf16::DTYPE.to_string(),
+                T::DTYPE.to_string(),
                 i.to_string(),
                 h.to_string(),
                 top.to_string(),
@@ -662,17 +610,17 @@ impl Qwen3_5Engine {
             let gate = linear(&n, layer.shared_gate.clone(), exec)?;
             let up = linear(&n, layer.shared_up.clone(), exec)?;
             let mut shared_act =
-                api::zeros::<bf16>(&[rows, c.shared_expert_intermediate_size]).execute(exec)?;
+                api::zeros::<T>(&[rows, c.shared_expert_intermediate_size]).execute(exec)?;
             shared::swiglu(
                 (&mut shared_act).partition([1, SHARED_POINTWISE_COLUMNS]),
                 &gate,
                 &up,
             )
-            .generics(vec![bf16::DTYPE.to_string()])
+            .generics(vec![T::DTYPE.to_string()])
             .execute(exec)?;
             let shared_out = linear(&shared_act, layer.shared_down.clone(), exec)?;
             let shared_gate = linear(&n, layer.shared_router.clone(), exec)?;
-            let mut merged = api::zeros::<bf16>(&[rows, h]).execute(exec)?;
+            let mut merged = api::zeros::<T>(&[rows, h]).execute(exec)?;
 
             kernels::moe_merge(
                 (&mut merged).partition([1, POINTWISE_COLUMNS]),
@@ -681,47 +629,80 @@ impl Qwen3_5Engine {
                 &shared_out,
                 &shared_gate,
             )
-            .generics(vec![top.to_string()])
+            .generics(vec![T::DTYPE.to_string(), top.to_string()])
             .execute(exec)?;
             x = add(&x, &merged, exec)?;
         }
-        let mut last = api::zeros::<bf16>(&[1, h]).execute(exec)?;
+        let mut last = api::zeros::<T>(&[1, h]).execute(exec)?;
 
-        kernels::last_row((&mut last).partition([1, POINTWISE_COLUMNS]), &x).execute(exec)?;
+        kernels::last_row((&mut last).partition([1, POINTWISE_COLUMNS]), &x)
+            .generics(vec![T::DTYPE.to_string()])
+            .execute(exec)?;
         let n = normalize(&last, self.norm.clone(), c.rms_norm_eps, exec)?;
         let logits = linear_f32(&n, self.lm_head.clone(), exec)?;
-        Ok(self.readbacks.enqueue(logits, exec)?)
+        let blocks = c.vocab_size.div_ceil(shared::ARGMAX_TILE);
+        let mut maxima = api::zeros::<f32>(&[1, blocks]).execute(exec)?;
+        let mut indices = api::zeros::<i32>(&[1, blocks]).execute(exec)?;
+        let mut token = api::zeros::<i32>(&[1]).execute(exec)?;
+        shared::argmax_blocks(
+            (&mut maxima).partition([1, 1]),
+            (&mut indices).partition([1, 1]),
+            &logits,
+            c.vocab_size as i32,
+        )
+        .generics(vec![shared::ARGMAX_TILE.to_string()])
+        .execute(exec)?;
+        shared::argmax_final(
+            (&mut token).partition([1]),
+            &maxima,
+            &indices,
+            blocks as i32,
+        )
+        .generics(vec![shared::ARGMAX_FINAL_TILE.to_string()])
+        .execute(exec)?;
+        Ok((
+            self.readbacks.enqueue(logits, exec)?,
+            self.token_readbacks.enqueue(Arc::new(token), exec)?,
+        ))
     }
 }
 
-unsafe fn normalize(
-    x: &Tensor<bf16>,
+unsafe fn normalize<T: DType>(
+    x: &Tensor<T>,
     w: Norm,
     eps: f32,
     exec: &ExecutionContext,
-) -> Result<Tensor<bf16>> {
+) -> Result<Tensor<T>> {
     let rows = x.shape()[0] as usize;
     let d = x.shape()[1] as usize;
-    let mut out = api::zeros::<bf16>(&[rows, d]).execute(exec)?;
+    let mut out = api::zeros::<T>(&[rows, d]).execute(exec)?;
 
     kernels::norm((&mut out).partition([1, d]), x, w, eps)
-        .generics(vec![d.to_string(), "true".into()])
+        .generics(vec![T::DTYPE.to_string(), d.to_string(), "true".into()])
         .execute(exec)?;
     Ok(out)
 }
-unsafe fn linear(x: &Tensor<bf16>, w: Weight, exec: &ExecutionContext) -> Result<Tensor<bf16>> {
-    project(x, w, exec)
-}
-unsafe fn linear_f32(x: &Tensor<bf16>, w: Weight, exec: &ExecutionContext) -> Result<Tensor<f32>> {
-    project(x, w, exec)
-}
-unsafe fn project<T: DType>(
-    x: &Tensor<bf16>,
-    w: Weight,
+unsafe fn linear<T: DType>(
+    x: &Tensor<T>,
+    w: Weight<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<T>> {
-    let mut out = api::zeros::<T>(&[x.shape()[0] as usize, w.shape()[0] as usize]).execute(exec)?;
-    let bias = api::zeros::<bf16>(&[1]).execute(exec)?;
+    project(x, w, exec)
+}
+unsafe fn linear_f32<T: DType>(
+    x: &Tensor<T>,
+    w: Weight<T>,
+    exec: &ExecutionContext,
+) -> Result<Tensor<f32>> {
+    project(x, w, exec)
+}
+unsafe fn project<T: DType, O: DType>(
+    x: &Tensor<T>,
+    w: Weight<T>,
+    exec: &ExecutionContext,
+) -> Result<Tensor<O>> {
+    let mut out = api::zeros::<O>(&[x.shape()[0] as usize, w.shape()[0] as usize]).execute(exec)?;
+    let bias = api::zeros::<T>(&[1]).execute(exec)?;
     shared::linear(
         (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
         x,
@@ -729,8 +710,8 @@ unsafe fn project<T: DType>(
         &bias,
     )
     .generics(vec![
-        bf16::DTYPE.to_string(),
         T::DTYPE.to_string(),
+        O::DTYPE.to_string(),
         x.shape()[1].to_string(),
         "false".into(),
         LINEAR_TILE_ROWS.to_string(),
@@ -740,21 +721,100 @@ unsafe fn project<T: DType>(
     .execute(exec)?;
     Ok(out)
 }
-unsafe fn add(a: &Tensor<bf16>, b: &Tensor<bf16>, exec: &ExecutionContext) -> Result<Tensor<bf16>> {
-    let mut out =
-        api::zeros::<bf16>(&[a.shape()[0] as usize, a.shape()[1] as usize]).execute(exec)?;
+unsafe fn add<T: DType>(
+    a: &Tensor<T>,
+    b: &Tensor<T>,
+    exec: &ExecutionContext,
+) -> Result<Tensor<T>> {
+    let mut out = api::zeros::<T>(&[a.shape()[0] as usize, a.shape()[1] as usize]).execute(exec)?;
     shared::add((&mut out).partition([1, SHARED_POINTWISE_COLUMNS]), a, b)
-        .generics(vec![bf16::DTYPE.to_string(), "1".into()])
+        .generics(vec![T::DTYPE.to_string(), "1".into()])
         .execute(exec)?;
     Ok(out)
 }
 
-/// Keep raw destinations alive through completion, including cancellation. The
-/// caller owns exclusive state/scratch and orders every access on this exec.
-unsafe fn output_pointer<T: DType>(
-    tensor: &mut Tensor<T>,
-    exec: &ExecutionContext,
-) -> Result<cuda_async::device_buffer::DevicePointer<T>> {
-    exec.retain(tensor.into_shared_alias())?;
-    Ok(tensor.device_pointer())
+fn validate_prediction(token: i32, logits: &[f32]) -> Result<u32> {
+    ensure!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
+    ensure!(
+        token >= 0 && (token as usize) < logits.len(),
+        "invalid greedy prediction"
+    );
+    Ok(token as u32)
+}
+
+impl<T: WeightElement + ElementType> CausalModel<Qwen3_5StatePool<T>> for Qwen3_5Engine<T> {
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+    fn is_eos(&self, token: u32) -> bool {
+        self.is_eos(token)
+    }
+    fn validate_input(&self, tokens: &[u32]) -> Result<(), ModelError> {
+        if tokens
+            .iter()
+            .any(|&id| id as usize >= self.config.text_config.vocab_size)
+        {
+            return Err(ModelError::InvalidInput("token outside vocabulary".into()));
+        }
+        Ok(())
+    }
+    async fn forward(
+        &self,
+        batch: &mut [ModelInput<'_, Qwen3_5StatePool<T>>],
+        policy: Arc<dyn SchedulingPolicy>,
+    ) -> Vec<Result<NextToken, ModelError>> {
+        let mut outputs = Vec::with_capacity(batch.len());
+        // shortcut: serial sessions and host token feedback, use packed kernels and
+        // submission-first GPU predictions when optimizing Runner throughput.
+        for input in batch {
+            let mut submitted = false;
+            let result: Result<NextToken, ModelError> = async {
+                if !input.kv.has_owned_pool_state() {
+                    return Err(ModelError::InvalidInput(
+                        "context has been invalidated".into(),
+                    ));
+                }
+                let tokens = input.token_ids.host()?;
+                self.validate_input(tokens)?;
+                if input.kv.is_pending()
+                    || tokens.len() <= input.kv.ready_len()
+                    || tokens.len() > input.kv.max_seq_len()
+                {
+                    return Err(ModelError::InvalidInput(
+                        "expected an idle context and extending history".into(),
+                    ));
+                }
+                input
+                    .kv
+                    .state()
+                    .validate(&self.owner, tokens, input.kv.ready_len())?;
+                let start_pos = input.kv.ready_len();
+                let suffix = Arc::new(tokens[start_pos..].to_vec());
+                let (logits, token) = Self::execute_append_batch(
+                    std::slice::from_mut(input),
+                    &policy,
+                    |batch, exec| {
+                        submitted = true;
+                        let mut view = batch[0]
+                            .kv
+                            .execution_view(batch[0].token_ids.host()?, exec)?;
+                        // SAFETY: view grants this append's resources and retains GPU owners.
+                        Ok(unsafe { self.submit(&suffix, &mut view, exec)? })
+                    },
+                )
+                .await?;
+                let next = validate_prediction(token.as_slice()[0], logits.as_slice())?;
+                Ok(NextToken::Host(next))
+            }
+            .await;
+            if result.is_err()
+                && input.kv.has_owned_pool_state()
+                && (input.kv.is_pending() || submitted)
+            {
+                input.kv.invalidate();
+            }
+            outputs.push(result);
+        }
+        outputs
+    }
 }

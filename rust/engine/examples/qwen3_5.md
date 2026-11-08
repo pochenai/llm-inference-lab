@@ -11,12 +11,54 @@ Source lives in `rust/engine/src/runner/model/qwen3_5/`, alongside the existing
 Qwen2 engine. `config.rs` validates supported checkpoint features and computes
 state budgets; `constants.rs` names architecture dimensions and launch tiles,
 sharing fixed GPU tile constants with `kernels.rs`; `engine.rs`
-loads weights and owns execution. Embedding, BF16/FP32 projections, residual
+loads weights and owns execution. `state.rs` owns hybrid storage, typed execution
+views and standalone state transitions; `pool.rs` integrates those resources
+with Runner's incremental KV allocation and commit lifecycle. Embedding, BF16/FP32 projections, residual
 addition and SwiGLU reuse Qwen2's operators without changing their math.
 
-## Execution and state
+The engine, context, state pool and execution view are generic over floating-point
+storage `T`, defaulting to `bf16`, like the existing Qwen2 implementation. `T`
+selects weight, activation, GQA KV and convolution-history storage; norm metadata,
+reductions, DeltaNet recurrent matrices and diagnostic logits stay FP32. The
+example explicitly selects BF16. A reduced fixture also exercises `f32` through
+the same standalone and Runner paths. Checkpoint `dtype` describes source weights,
+not the requested execution type; WeightLoader performs the existing conversion.
+This change does not add quantized checkpoint support.
 
-`Qwen3_5Engine::load` loads the sharded checkpoint and tokenizer. Allocate one
+## Runner execution and state
+
+The `qwen3_5` example uses Scheduler -> ModelRunner -> CausalModel, with chunked
+prefill, greedy decoding, EOS and normal session cleanup. `--max-batch-tokens`
+controls Runner chunking (`--chunk-size` remains an alias). `--repeat 2` checks
+independent requests and state release.
+
+`Qwen3_5StatePool<T>` wraps the existing `NaiveKVPool<T>`: shared backing buffers
+are allocated at startup, while each prefill chunk reserves only its new token
+slots and each decode appends one slot. Mapping rows, token slots and maximum
+sequence length remain separate capacities. Only full-attention layers occupy
+KV storage; their model layer IDs map to compact pool layer IDs. DeltaNet
+convolution/recurrent buffers have fixed size per session, are initialized on
+first forward and released with the context. MoE weights remain engine-owned.
+The pool delegates admission, slot mapping, K/V views and in-flight slot leases
+to NaiveKVPool. Prefix caching is rejected during Runner construction because
+recurrent state snapshots are not implemented.
+
+Models do not receive mutable session metadata. The optional `ExecutionStatePool`
+extension supplies a backend-specific `ExecutionView` for an already pending
+append through `KVContext::execution_view(tokens, exec)`. Qwen3.5's view provides
+per-layer DeltaNet update pointers and GQA cache access, retaining GPU buffers and
+slot leases before GPU access. It cannot replace session storage or modify history,
+validity or logical progress. Context commit calls the backend only after GPU
+success; abandoning a submission without commit leaves the update uncommitted
+and unusable. Qwen2
+keeps its existing KV views and the default backend commit operation is a no-op.
+
+The current CausalModel forward processes sessions serially and returns completed
+host predictions from Qwen2's shared GPU argmax kernels. The example disables overlap; packed execution and
+submission-first GPU feedback remain future optimizations.
+
+`Qwen3_5Engine::load` loads the sharded checkpoint and tokenizer. The standalone
+logits API remains available for diagnostics. Allocate one
 exclusive `Qwen3_5Context` per session with `new_context(max_seq_len)`.
 `step_with_logits(history, &mut context)` consumes the uncached suffix of a
 complete token history and returns a greedy token ID plus final-position FP32
@@ -24,7 +66,8 @@ logits. `max_seq_len` limits the session's total token history, including prompt
 and generated tokens. Histories must extend the committed prefix and remain
 within this limit.
 Separate contexts may execute independently; a context cannot be used with a
-different engine. The engine uses its loading policy for all submissions.
+different engine. Standalone execution uses the loading policy; CausalModel
+forwards use the policy supplied by Runner.
 
 Full-attention layers store rotated BF16 K/V, with per-head zero-centered
 RMSNorm, 64 rotary channels of each 256-channel head, and a sigmoid output gate.
@@ -37,9 +80,8 @@ stay on the GPU; tied router scores choose the lowest expert index.
 Successful GPU completion commits the history. Errors or cancellation during
 submission invalidate the context, which must then be discarded. Input errors
 before submission leave it usable. Recurrent states are exclusive and cannot
-be split into arbitrary cached prefixes. Runner/CausalModel integration,
-recurrent snapshots, prefix caching, CUDA Graphs, packed batches and sampling
-remain subsequent work; this engine does not declare W10 complete.
+be split into arbitrary cached prefixes. Recurrent snapshots, prefix caching,
+CUDA Graphs, packed batches and GPU sampling remain subsequent work; this engine does not declare W10 complete.
 
 This is a correctness baseline: prefill uses sequential DeltaNet recurrence,
 attention scans causal history, and selected-expert projections use direct FP32
@@ -47,7 +89,8 @@ reductions. Scratch is allocated per forward/layer. Submission can block on JIT/
 loading, allocations or pageable H2D; submission-first overlap and a fully warmed
 gated cancellation check require workspace/input reuse and remain unvalidated. These choices need tuning before
 serving performance comparisons. The vocabulary head runs only for the last
-input position. Greedy selection currently reads diagnostic logits to the CPU.
+input position. Greedy selection reuses Qwen2's two-stage GPU argmax. Logits are still copied
+to the CPU for finite-value validation; token feedback waits for completion.
 
 ## Memory
 
@@ -57,7 +100,9 @@ resident weight bytes (64.56 GiB), including FP32 norm/gating metadata.
 `engine.weight_bytes()` reports the tensors actually loaded. BF16 full-attention K/V costs 20,480 bytes/token
 across ten layers. Each of the thirty DeltaNet layers has 2,097,152 bytes of
 recurrent state and 49,152 bytes of convolution history. At a maximum sequence length of 4096 tokens,
-`config.text_config.state_bytes(4096)` is 148,275,200 bytes/request.
+`config.text_config.state_bytes::<bf16>(4096)` is 148,275,200 bytes for a full
+4096-token history plus recurrent state. In the Runner pool this is an occupied
+state budget, not an upfront per-session KV reservation.
 Weights, context storage, live scratch, the CUDA allocator and JIT overhead all
 need to fit; the checkpoint's active-parameter count does not describe residency.
 
@@ -68,11 +113,11 @@ From the repository root, with CUDA 13.2 and `tileiras` available:
 ```bash
 cargo run --manifest-path rust/Cargo.toml --offline --release -p engine --example qwen3_5 -- \
   --model-dir ../models/Qwen3.5-35B-A3B --prompt 'What is a language model?' \
-  --chunk-size 32 --max-new-tokens 16
+  --max-batch-tokens 32 --max-new-tokens 16 --repeat 2
 ```
 
-The example formats one user turn with thinking disabled, supports chunked
-prefill and EOS, and optionally writes first-step logits with `--logits PATH`.
+The example formats one user turn with thinking disabled. `--logits PATH`
+optionally runs a separate standalone diagnostic prefill before Runner generation.
 The FP8 checkpoint is rejected; native FP8 execution belongs to W13.
 
 ## Independent checks
@@ -105,7 +150,10 @@ QWEN35_TEST_REFERENCE="$PWD/rust/engine/artifacts/qwen3_5/real/reference.f32" \
 
 The reference fixture uses IDs `[1,7,9,3,12]`. GPU tests compare independent
 logits/argmax, full prefill against chunks of 1/2/3/4 tokens (including decode),
-and input/capacity validation.
+and input/capacity validation. The `pooled_state_and_runner_match_standalone`
+test checks interleaved slot mappings, chunk/decode token parity, invalid peers,
+capacity recovery, persistent-session continuation, repeated stateless requests
+and rejection of prefix caching.
 A separate GPU test checks tied router indices and selected-score normalization. Config tests reject unsupported models and FP8.
 
 See [validation results](qwen3_5_validation.md) for measured errors, exact chunking results,

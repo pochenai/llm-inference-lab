@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use cutile::core::bf16;
+use cutile::DType;
 use serde::Deserialize;
 
 use super::constants::*;
@@ -204,8 +204,8 @@ impl Qwen3_5Config {
 
 impl Qwen3_5TextConfig {
     /// Session-state bytes for max_seq_len total tokens (prompt plus generation).
-    /// Includes BF16 K/V, FP32 recurrence and BF16 convolution history.
-    pub fn state_bytes(&self, max_seq_len: usize) -> Option<usize> {
+    /// Includes T-typed K/V and convolution history, with FP32 recurrence.
+    pub fn state_bytes<T: DType>(&self, max_seq_len: usize) -> Option<usize> {
         let full = self
             .layer_types
             .iter()
@@ -216,7 +216,7 @@ impl Qwen3_5TextConfig {
             .checked_mul(self.num_key_value_heads)?
             .checked_mul(self.head_dim)?
             .checked_mul(2)?
-            .checked_mul(size_of::<bf16>())?
+            .checked_mul(size_of::<T>())?
             .checked_mul(full)?;
         let recurrent = self
             .linear_num_value_heads
@@ -236,7 +236,7 @@ impl Qwen3_5TextConfig {
                 recurrent.checked_add(
                     channels
                         .checked_mul(CONV_HISTORY_LEN)?
-                        .checked_mul(size_of::<bf16>())?,
+                        .checked_mul(size_of::<T>())?,
                 )?,
             )?,
         )
@@ -302,7 +302,12 @@ mod tests {
                 .count(),
             10
         );
-        assert_eq!(c.text_config.state_bytes(4096), Some(148275200));
+        assert_eq!(
+            c.text_config.state_bytes::<cutile::core::bf16>(4096),
+            Some(148275200)
+        );
+        assert_eq!(c.text_config.state_bytes::<f32>(4096), Some(233635840));
+        assert_eq!(c.text_config.state_bytes::<f32>(usize::MAX), None);
     }
 
     #[test]
