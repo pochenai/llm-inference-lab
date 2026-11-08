@@ -5,6 +5,7 @@ mod graph;
 mod kernels;
 mod pool;
 mod state;
+mod weights;
 mod workspace;
 
 pub use config::{

@@ -25,6 +25,7 @@ Profile timings must not be compared directly with native timings.
 - [x] Fuse shared expert gate/up/SwiGLU with consistent BF16 arithmetic.
 - [x] Optimize scalar and MoE router projections while preserving GDN a/b MMA.
 - [x] Pack GDN a/b weights and reuse one MMA projection, preserving accumulation.
+- [x] Remove remaining immutable-weight replay bookkeeping with typed ownership.
 - [ ] Re-profile GQA and host validation after the large GEMM changes; only
   optimize material end-to-end costs while decode parity remains outstanding.
 - [ ] Overlap shared and routed expert work with explicit stream dependencies.
@@ -230,5 +231,39 @@ Decode -3.05%, e2e -2.38%, prefill -0.79%; every paired process improves all
 metrics. No warm allocations/recaptures, IDs match, KV releases. Weight bytes
 unchanged69,321,574,912; scratch allocations126->122 and bytes10,594,684->10,594,680.
 Raw confirmation: `rust/profiling/qwen3_5/packed-ab-20261109/`.
-Commit: this update accompanies the packed a/b implementation.
+Commit: `0c5dcc0`.
 Next: refresh profiling before choosing the largest remaining e2e cost.
+
+### 6. Frozen capture-owned weights (done)
+
+Refreshed profile: replay prelaunch CPU median0.290ms, post-readback tail0.226ms,
+full finite scan0.312ms, GQA GPU0.341ms. 817kernels/decode; experts1.770ms now
+match SGLang's earlier1.772ms sum. Profile durations are not native latency.
+Artifacts: `rust/profiling/qwen3_5/post-packed-profile-20261109/`.
+
+A private immutable weight type has one factory: upload fresh data and await
+completion. It exposes no tensor/buffer/mutable accessor and cannot inherit a
+pre-existing captured writer. Eager input retention delegates to normal cuTile
+tracking. Capture validates actual context and retains the tensor for the
+whole graph lifetime, eliminating repeated weight read leases; all mutable
+state/scratch/KV tracking remains unchanged. No GPU math/ABI changes.
+
+Two focused tests pass (default completion and a forced notification run):
+Gate proves frozen weights survive dropping CPU weight+graph owners until GPU
+completion, then release; a separate valid CUDA context on ordinal0 is rejected
+for eager and capture. A rescue allocation/drain guard makes failed assertions
+safe. Full20-test regression, real BF16 check and native comparison follow.
+
+Full20-test regression and real BF16 reference passed unchanged (max0.56865,
+RMS0.11685,ID3636, all chunk max0), plus all-target check.
+
+| Variant | Prefill ms | Decode ms/token | Total8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `0c5dcc0` | 33.249 | 8.504 | 92.600 |
+| Frozen weights | 33.368 | 8.111 | 90.146 |
+
+Decode -4.62%, e2e -2.65%, prefill +0.36%. Every paired process improves
+ decode/e2e; IDs match and weight/scratch/graph accounting is unchanged, with
+zero warm allocation/recapture. No samples excluded. Raw results:
+`rust/profiling/qwen3_5/frozen-weights-20261109/`.
+Commit: this update accompanies immutable-weight ownership.
