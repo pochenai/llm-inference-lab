@@ -1024,3 +1024,94 @@ async fn bf16_skinny_vector_matches_cpu_with_scalar_and_masked_outputs() -> Resu
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn bf16_packed_a_b_preserves_mma_accumulators() -> Result<()> {
+    use super::super::qwen2::kernels as shared;
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{PartitionMut, Reshape, ToHostVec},
+        tile_kernel::TileKernel,
+        DType,
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    for (rows, k, vh) in [
+        (1usize, 2048usize, 32usize),
+        (3, 2048, 32),
+        (32, 2048, 32),
+        (3, 128, 2),
+    ] {
+        let values = |len: usize, seed: u32| -> Arc<Vec<bf16>> {
+            Arc::new(
+                (0..len)
+                    .map(|j| {
+                        let bits = (j as u32)
+                            .wrapping_mul(0x9e3779b9)
+                            .wrapping_add(seed)
+                            .rotate_left(13);
+                        bf16::from_f32(((bits & 0xffff) as f32 / 65535.0 - 0.5) * 0.2)
+                    })
+                    .collect(),
+            )
+        };
+        let input = values(rows * k, 17);
+        let a = values(vh * k, 31);
+        let b = values(vh * k, 71);
+        let mut packed = Vec::with_capacity(2 * vh * k);
+        packed.extend_from_slice(&a);
+        packed.extend_from_slice(&b);
+        let x = api::copy_host_vec_to_device(&input)
+            .schedule(&policy)?
+            .await?
+            .reshape(&[rows, k])?;
+        let mut weights = Vec::new();
+        for (data, n) in [(a, vh), (b, vh), (Arc::new(packed), 2 * vh)] {
+            weights.push(Arc::new(
+                api::copy_host_vec_to_device(&data)
+                    .schedule(&policy)?
+                    .await?
+                    .reshape(&[n, k])?,
+            ));
+        }
+        let bias = api::zeros::<bf16>(&[1]).schedule(&policy)?.await?;
+        let mut outputs = Vec::new();
+        for (index, n) in [vh, vh, 2 * vh].into_iter().enumerate() {
+            let mut out = api::zeros::<f32>(&[rows, n]).schedule(&policy)?.await?;
+            shared::linear(
+                (&mut out).partition([16, 64]),
+                &x,
+                weights[index].clone(),
+                &bias,
+            )
+            .generics(vec![
+                bf16::DTYPE.to_string(),
+                f32::DTYPE.to_string(),
+                k.to_string(),
+                "false".into(),
+                "16".into(),
+                "64".into(),
+                "64".into(),
+            ])
+            .schedule(&policy)?
+            .await?;
+            outputs.push(out.to_host_vec().schedule(&policy)?.await?);
+        }
+        for row in 0..rows {
+            for column in 0..vh {
+                assert_eq!(
+                    outputs[2][row * 2 * vh + column].to_bits(),
+                    outputs[0][row * vh + column].to_bits(),
+                    "a: M={rows}, K={k}, VH={vh}, row={row}, column={column}"
+                );
+                assert_eq!(
+                    outputs[2][row * 2 * vh + vh + column].to_bits(),
+                    outputs[1][row * vh + column].to_bits(),
+                    "b: M={rows}, K={k}, VH={vh}, row={row}, column={column}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

@@ -24,7 +24,7 @@ Profile timings must not be compared directly with native timings.
   2.376 ms/decode step in the graph profile, before narrower projection roles.
 - [x] Fuse shared expert gate/up/SwiGLU with consistent BF16 arithmetic.
 - [x] Optimize scalar and MoE router projections while preserving GDN a/b MMA.
-- [ ] Pack GDN a/b weights and reuse one MMA projection, preserving accumulation.
+- [x] Pack GDN a/b weights and reuse one MMA projection, preserving accumulation.
 - [ ] Re-profile GQA and host validation after the large GEMM changes; only
   optimize material end-to-end costs while decode parity remains outstanding.
 - [ ] Overlap shared and routed expert work with explicit stream dependencies.
@@ -205,4 +205,30 @@ Decode -3.65%, e2e -2.42%; prefill +0.22% (+0.073 ms). Every paired process
 improves decode/e2e, IDs match, scratch/graph counts remain fixed with no warm
 allocation/recapture. All observations retained. Native confirmation and checks:
 `rust/profiling/qwen3_5/router-vectors-20261109/`.
-Commit: this update accompanies the scalar/router implementation.
+Commit: `d66bf6c`.
+
+### 5. Packed GDN a/b MMA (done)
+
+Concatenate a/b weights on the host during loading, upload one [2*VH,H] tensor,
+and reuse the existing [16,64,64] MMA projection. Borrow a/b column views with
+the packed row stride; force MMA so other configurations cannot accidentally
+select the router vector bucket. Original file shapes are still validated and
+total weight bytes remain unchanged. No new device kernel or extra weights.
+The precision oracle compares all FP32 accumulator bits with the two separate
+BF16-input MMA calls at real/tiny geometries and rows 1/3/32.
+
+All 2316 FP32 accumulator bits match the old separate BF16-input MMA calls.
+All 18 Qwen3.5 regressions and all-target checks pass. Real BF16 reference is
+unchanged (max0.56865/RMS0.11685/ID3636; chunk1/2/3/4 all max0).
+
+| Variant | Prefill ms | Decode ms/token | Total 8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `d66bf6c` | 33.282 | 8.671 | 94.220 |
+| Packed a/b | 33.018 | 8.406 | 91.975 |
+
+Decode -3.05%, e2e -2.38%, prefill -0.79%; every paired process improves all
+metrics. No warm allocations/recaptures, IDs match, KV releases. Weight bytes
+unchanged69,321,574,912; scratch allocations126->122 and bytes10,594,684->10,594,680.
+Raw confirmation: `rust/profiling/qwen3_5/packed-ab-20261109/`.
+Commit: this update accompanies the packed a/b implementation.
+Next: refresh profiling before choosing the largest remaining e2e cost.

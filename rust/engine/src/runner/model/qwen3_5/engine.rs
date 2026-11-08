@@ -89,8 +89,7 @@ type Norm = Arc<Tensor<f32>>;
 struct Delta<T: DType> {
     qkv: Weight<T>,
     z: Weight<T>,
-    a: Weight<T>,
-    b: Weight<T>,
+    ab: Weight<T>,
     out: Weight<T>,
     conv: Weight<T>,
     a_log: Norm,
@@ -213,14 +212,35 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
                             .await?
                             .reshape(&[CONV_KERNEL_SIZE, channels])?,
                     );
+                    let a_name = format!("{p}.linear_attn.in_proj_a.weight");
+                    let b_name = format!("{p}.linear_attn.in_proj_b.weight");
+                    let mut a = loader.load_host::<T>(&a_name)?;
+                    let b = loader.load_host::<T>(&b_name)?;
+                    ensure!(
+                        a.shape == [vh, h],
+                        "{a_name}: expected [{vh}, {h}], got {:?}",
+                        a.shape
+                    );
+                    ensure!(
+                        b.shape == [vh, h],
+                        "{b_name}: expected [{vh}, {h}], got {:?}",
+                        b.shape
+                    );
+                    a.data.extend_from_slice(&b.data);
+                    weight_bytes += a.data.len() * size_of::<T>();
+                    let ab = Arc::new(
+                        api::copy_host_vec_to_device(&Arc::new(a.data))
+                            .schedule(policy)?
+                            .await?
+                            .reshape(&[2 * vh, h])?,
+                    );
                     Mixer::Delta(Delta {
                         qkv: load!(format!("{p}.linear_attn.in_proj_qkv.weight"), [channels, h]),
                         z: load!(
                             format!("{p}.linear_attn.in_proj_z.weight"),
                             [vh * GDN_VALUE_HEAD_DIM, h]
                         ),
-                        a: load!(format!("{p}.linear_attn.in_proj_a.weight"), [vh, h]),
-                        b: load!(format!("{p}.linear_attn.in_proj_b.weight"), [vh, h]),
+                        ab,
                         out: load!(
                             format!("{p}.linear_attn.out_proj.weight"),
                             [h, vh * GDN_VALUE_HEAD_DIM]
@@ -676,10 +696,11 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
                                 .execute(exec)?;
                         }
                     }
-                    let a = linear(scratch, &*n, w.a.clone(), exec)?;
-                    let b = linear(scratch, &*n, w.b.clone(), exec)?;
-                    let z = linear(scratch, &*n, w.z.clone(), exec)?;
                     let vh = c.linear_num_value_heads;
+                    let ab = linear_mma(scratch, &n, w.ab.clone(), exec)?;
+                    let a = ab.slice(&[0..rows, 0..vh])?;
+                    let b = ab.slice(&[0..rows, vh..2 * vh])?;
+                    let z = linear(scratch, &n, w.z.clone(), exec)?;
                     let mut core = scratch.activation(&[rows, vh * GDN_VALUE_HEAD_DIM], exec)?;
 
                     {
@@ -703,8 +724,8 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
                                 &data.metadata,
                                 index as i32,
                                 &*convolved,
-                                &*a,
-                                &*b,
+                                &a,
+                                &b,
                                 w.a_log.clone(),
                                 w.dt.clone(),
                             )
@@ -716,8 +737,8 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
                                 out,
                                 delta.as_ref().unwrap().recurrent,
                                 &*convolved,
-                                &*a,
-                                &*b,
+                                &a,
+                                &b,
                                 w.a_log.clone(),
                                 w.dt.clone(),
                             )
@@ -1135,6 +1156,18 @@ unsafe fn linear<T: DType + DeviceCopy>(
     let bias = scratch.activation(&[1], exec)?;
     project(out, x, w, &bias, exec)
 }
+unsafe fn linear_mma<T: DType + DeviceCopy>(
+    scratch: &mut Scratch<T>,
+    x: &Tensor<T>,
+    w: Weight<T>,
+    exec: &ExecutionContext,
+) -> Result<ScratchTensor<T, T>> {
+    let mut out = scratch.activation(&[x.shape()[0] as usize, w.shape()[0] as usize], exec)?;
+    let bias = scratch.activation(&[1], exec)?;
+    project_mma(&mut out, x, w, &bias, exec)?;
+    Ok(out)
+}
+
 unsafe fn linear_f32<T: DType + DeviceCopy>(
     scratch: &mut Scratch<T>,
     x: &Tensor<T>,
@@ -1152,10 +1185,10 @@ unsafe fn project<T: DType, O: DType>(
     bias: &Tensor<T>,
     exec: &ExecutionContext,
 ) -> Result<ScratchTensor<T, O>> {
-    let _range = ScopedRange::new(c"qwen3_5.linear");
     // Preserve GDN a/b MMA rounding; vectorize scalar and 256-way router shapes.
     // Keep the reduction tree independent of token count for chunked prefill.
     if T::DTYPE == bf16::DTYPE && O::DTYPE == bf16::DTYPE && matches!(w.shape()[0], 1 | 256) {
+        let _range = ScopedRange::new(c"qwen3_5.linear.vector");
         kernels::linear_vector((&mut out).partition([1, 4]), x, w)
             .generics(vec![
                 T::DTYPE.to_string(),
@@ -1164,25 +1197,37 @@ unsafe fn project<T: DType, O: DType>(
             ])
             .execute(exec)?;
     } else {
-        shared::linear(
-            (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
-            x,
-            w,
-            bias,
-        )
-        .generics(vec![
-            T::DTYPE.to_string(),
-            O::DTYPE.to_string(),
-            x.shape()[1].to_string(),
-            "false".into(),
-            LINEAR_TILE_ROWS.to_string(),
-            LINEAR_TILE_COLUMNS.to_string(),
-            LINEAR_TILE_REDUCTION.to_string(),
-        ])
-        .execute(exec)?;
+        project_mma(&mut out, x, w, bias, exec)?;
     }
     Ok(out)
 }
+unsafe fn project_mma<T: DType, O: DType>(
+    out: &mut Tensor<O>,
+    x: &Tensor<T>,
+    w: Weight<T>,
+    bias: &Tensor<T>,
+    exec: &ExecutionContext,
+) -> Result<()> {
+    let _range = ScopedRange::new(c"qwen3_5.linear");
+    shared::linear(
+        out.partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
+        x,
+        w,
+        bias,
+    )
+    .generics(vec![
+        T::DTYPE.to_string(),
+        O::DTYPE.to_string(),
+        x.shape()[1].to_string(),
+        "false".into(),
+        LINEAR_TILE_ROWS.to_string(),
+        LINEAR_TILE_COLUMNS.to_string(),
+        LINEAR_TILE_REDUCTION.to_string(),
+    ])
+    .execute(exec)?;
+    Ok(())
+}
+
 unsafe fn add<T: DType>(
     out: &mut Tensor<T>,
     a: &Tensor<T>,
