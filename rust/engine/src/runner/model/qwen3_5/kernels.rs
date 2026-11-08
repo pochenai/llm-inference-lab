@@ -226,7 +226,7 @@ mod ops {
         );
     }
 
-    #[cutile::entry()]
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) unsafe fn gqa_attention<
         T: ElementType,
         const D: i32,
@@ -243,10 +243,10 @@ mod ops {
         table: *const i32,
         offset: i32,
     ) {
-        gqa_attention_impl::<T, D, QH, KVH, POOLED>(out, q, k, v, gate, start, table, offset);
+        gqa_attention_impl::<T, D, QH, KVH, POOLED, 32>(out, q, k, v, gate, start, table, offset);
     }
 
-    #[cutile::entry()]
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) unsafe fn gqa_graph<T: ElementType, const D: i32, const QH: i32, const KVH: i32>(
         out: &mut Tensor<T, { [1, D] }>,
         q: &Tensor<T, { [-1, -1] }>,
@@ -256,7 +256,7 @@ mod ops {
         metadata: &Tensor<u64, { [-1] }>,
         table: *const i32,
     ) {
-        gqa_attention_impl::<T, D, QH, KVH, true>(
+        gqa_attention_impl::<T, D, QH, KVH, true, 32>(
             out,
             q,
             k,
@@ -737,6 +737,7 @@ mod ops {
         const QH: i32,
         const KVH: i32,
         const POOLED: bool,
+        const BK: i32,
     >(
         out: &mut Tensor<T, { [1, D] }>,
         q: &Tensor<T, { [-1, -1] }>,
@@ -747,72 +748,110 @@ mod ops {
         table: *const i32,
         table_offset: i32,
     ) {
-        let zero_vector: Tile<f32, { [D] }> = constant(0.0f32, shape![D]);
-        let one: Tile<f32, { [D] }> = constant(1.0f32, shape![D]);
-        let width: f32 = convert_scalar(D);
         let row = program_id(0);
-        let h = program_id(1);
-        let kh = h / (QH / KVH);
-        let q: Tile<f32, { [D] }> =
-            convert_tile(q.partition(shape![1, D]).load([row, h]).reshape(shape![D]));
-
-        let mut m: Tile<f32, { [1] }> = constant(f32::NEG_INFINITY, shape![1]);
-
-        let mut denom: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
-
-        let mut acc: Tile<f32, { [D] }> = constant(0.0f32, shape![D]);
-        for t in 0..(start + row + 1) {
-            let mut slot = t;
+        let head = program_id(1);
+        let kv_head = head / (QH / KVH);
+        let query: Tile<f32, { [1, D] }> =
+            convert_tile(q.partition(shape![1, D]).load([row, head]));
+        let query: Tile<f32, { [BK, D] }> = query.broadcast(shape![BK, D]);
+        let local: Tile<i32, { [BK] }> = iota(shape![BK]);
+        let columns: Tile<i32, { [D] }> = iota(shape![D]);
+        let columns = columns.reshape(shape![1, D]).broadcast(shape![BK, D]);
+        let zero_values: Tile<f32, { [BK, D] }> = constant(0.0f32, shape![BK, D]);
+        let negative_infinity: Tile<f32, { [BK] }> = constant(f32::NEG_INFINITY, shape![BK]);
+        let width: f32 = convert_scalar(D);
+        let divisor = sqrt(
+            width.broadcast(shape![BK]),
+            rounding::NearestEven,
+            ftz::Disabled,
+        );
+        let table_base = pointer_to_tile(table);
+        let table_base = table_base.offset(table_offset);
+        let table_base = table_base.reshape(shape![1]);
+        let table_base = table_base.broadcast(shape![BK]);
+        let kp = pointer_to_tile(k.as_ptr());
+        let kp = kp.reshape(shape![1, 1]);
+        let kp = kp.broadcast(shape![BK, D]);
+        let vp = pointer_to_tile(v.as_ptr());
+        let vp = vp.reshape(shape![1, 1]);
+        let vp = vp.broadcast(shape![BK, D]);
+        let mut maximum: Tile<f32, { [1, 1] }> = constant(f32::NEG_INFINITY, shape![1, 1]);
+        let mut denominator: Tile<f32, { [1, 1] }> = constant(0.0f32, shape![1, 1]);
+        let mut acc: Tile<f32, { [1, D] }> = constant(0.0f32, shape![1, D]);
+        let end = start + row + 1;
+        let blocks: i32 = (end + BK - 1) / BK;
+        for block in 0..blocks {
+            let positions = local + (block * BK).broadcast(shape![BK]);
+            let valid = lt_tile(positions, (start + row + 1).broadcast(shape![BK]));
+            let mut slots = positions;
             if POOLED {
-                let address = pointer_to_tile(table).offset(table_offset + t);
-                let (mapped, _token): (Tile<i32, { [] }>, Token) = load_ptr_tko(
-                    address,
+                let table_ptrs = table_base.offset_tile(positions);
+                let (mapped, _token): (Tile<i32, { [BK] }>, Token) = load_ptr_tko(
+                    table_ptrs,
                     ordering::Weak,
                     None::<scope::TileBlock>,
-                    None,
-                    None,
+                    Some(valid),
+                    Some(0i32),
                     None,
                     Latency::<1>,
                 );
-                slot = tile_to_scalar(mapped);
+                slots = mapped;
             }
-            let key: Tile<f32, { [D] }> = convert_tile(
-                k.partition(shape![1, D])
-                    .load([slot, kh])
-                    .reshape(shape![D]),
+            let offsets =
+                slots * k.shape()[1].broadcast(shape![BK]) + (kv_head * D).broadcast(shape![BK]);
+            let offsets = offsets.reshape(shape![BK, 1]).broadcast(shape![BK, D]) + columns;
+            let mask = valid.reshape(shape![BK, 1]).broadcast(shape![BK, D]);
+            let key_ptrs = kp.offset_tile(offsets);
+            let (keys, _token): (Tile<T, { [BK, D] }>, Token) = load_ptr_tko(
+                key_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None::<T>,
+                None,
+                Latency::<1>,
             );
-            let value: Tile<f32, { [D] }> = convert_tile(
-                v.partition(shape![1, D])
-                    .load([slot, kh])
-                    .reshape(shape![D]),
+            let keys: Tile<f32, { [BK, D] }> = convert_tile(keys);
+            let keys = select(mask, keys, zero_values);
+            let dots: Tile<f32, { [BK] }> = reduce_sum(keys * query, 1);
+            let dots = dots.reshape(shape![BK]);
+            let scores = select(valid, dots / divisor, negative_infinity);
+            let block_max: Tile<f32, { [1] }> = reduce_max(scores, 0);
+            let next = max_tile(maximum, block_max.reshape(shape![1, 1]));
+            let alpha = exp(maximum - next);
+            let probabilities = exp(scores - next.reshape(shape![1]).broadcast(shape![BK]));
+            let value_ptrs = vp.offset_tile(offsets);
+            let (values, _token): (Tile<T, { [BK, D] }>, Token) = load_ptr_tko(
+                value_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(mask),
+                None::<T>,
+                None,
+                Latency::<1>,
             );
-            let dot: Tile<f32, { [1] }> = reduce_sum(q * key, 0);
-            let dot = dot.reshape(shape![1]);
-            let score = dot
-                / sqrt(
-                    width.broadcast(shape![1]),
-                    rounding::NearestEven,
-                    ftz::Disabled,
-                );
-            let next_m = max_tile(m, score);
-            let alpha = exp(m - next_m);
-            let p = exp(score - next_m);
-            acc = acc * alpha.broadcast(shape![D]) + value * p.broadcast(shape![D]);
-            denom = denom * alpha + p;
-            m = next_m;
+            let values: Tile<f32, { [BK, D] }> = convert_tile(values);
+            let values = select(mask, values, zero_values);
+            let weighted = values
+                * probabilities
+                    .reshape(shape![BK, 1])
+                    .broadcast(shape![BK, D]);
+            let block_acc: Tile<f32, { [D] }> = reduce_sum(weighted, 0);
+            let block_sum: Tile<f32, { [1] }> = reduce_sum(probabilities, 0);
+            acc = acc * alpha.broadcast(shape![1, D]) + block_acc.reshape(shape![1, D]);
+            denominator = denominator * alpha + block_sum.reshape(shape![1, 1]);
+            maximum = next;
         }
-        let y: Tile<T, { [D] }> = convert_tile(acc / denom.broadcast(shape![D]));
-        let y: Tile<f32, { [D] }> = convert_tile(y);
-        let gate: Tile<f32, { [D] }> = convert_tile(
-            q_gate
-                .partition(shape![1, D])
-                .load([row, h * 2 + 1])
-                .reshape(shape![D]),
-        );
-
-        let sigmoid: Tile<T, { [D] }> = convert_tile(one / (one + exp(zero_vector - gate)));
-        let sigmoid: Tile<f32, { [D] }> = convert_tile(sigmoid);
-        let result: Tile<T, { [1, D] }> = convert_tile((y * sigmoid).reshape(shape![1, D]));
+        // Preserve the two BF16 boundaries before the output-gate multiplication.
+        let y: Tile<T, { [1, D] }> = convert_tile(acc / denominator.broadcast(shape![1, D]));
+        let y: Tile<f32, { [1, D] }> = convert_tile(y);
+        let gate: Tile<f32, { [1, D] }> =
+            convert_tile(q_gate.partition(shape![1, D]).load([row, head * 2 + 1]));
+        let one: Tile<f32, { [1, D] }> = constant(1.0f32, shape![1, D]);
+        let zero: Tile<f32, { [1, D] }> = constant(0.0f32, shape![1, D]);
+        let sigmoid: Tile<T, { [1, D] }> = convert_tile(one / (one + exp(zero - gate)));
+        let sigmoid: Tile<f32, { [1, D] }> = convert_tile(sigmoid);
+        let result: Tile<T, { [1, D] }> = convert_tile(y * sigmoid);
         out.store(result);
     }
 

@@ -1115,3 +1115,202 @@ async fn bf16_packed_a_b_preserves_mma_accumulators() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn bf16_gqa_matches_cpu_with_fragmented_causal_histories() -> Result<()> {
+    use super::kernels;
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{PartitionMut, Reshape, ToHostVec},
+        tile_kernel::TileKernel,
+        DType,
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    let (rows, qh, kvh, d, capacity, table_width) =
+        (3usize, 16usize, 2usize, 256usize, 79usize, 80usize);
+    let qhost = Arc::new(
+        (0..rows * qh * d)
+            .map(|j| bf16::from_f32(((j * 3 + 7) % 31) as f32 / 32.0 - 15.0 / 32.0))
+            .collect::<Vec<_>>(),
+    );
+    let mut gatehost = vec![bf16::NAN; rows * qh * 2 * d];
+    for row in 0..rows {
+        for head in 0..qh {
+            for column in 0..d {
+                gatehost[(row * qh * 2 + head * 2 + 1) * d + column] = bf16::from_f32(
+                    ((row * 3 + head * 7 + column) % 23) as f32 / 16.0 - 11.0 / 16.0,
+                );
+            }
+        }
+    }
+    let q = api::copy_host_vec_to_device(&qhost)
+        .schedule(&policy)?
+        .await?
+        .reshape(&[rows, qh * d])?;
+    let gatehost = Arc::new(gatehost);
+    let gate = api::copy_host_vec_to_device(&gatehost)
+        .schedule(&policy)?
+        .await?
+        .reshape(&[rows, qh * 2 * d])?;
+    let key_value = |time: usize, head: usize, col: usize| {
+        bf16::from_f32(((time * 5 + head * 7 + col * 3) % 29) as f32 / 64.0 - 14.0 / 64.0)
+    };
+    let value_value = |time: usize, head: usize, col: usize| {
+        bf16::from_f32(((time * 11 + head * 13 + col * 5) % 37) as f32 / 32.0 - 18.0 / 32.0)
+    };
+    for pooled in [false, true] {
+        for start in [0usize, 31, 32, 63, 64] {
+            let mut khost = vec![bf16::NAN; capacity * kvh * d];
+            let mut vhost = khost.clone();
+            let mut tablehost = vec![-1i32; 2 * table_width];
+            for time in 0..start + rows {
+                let slot = if pooled {
+                    (time * 13 + 7) % capacity
+                } else {
+                    time
+                };
+                tablehost[table_width + time] = slot as i32;
+                for head in 0..kvh {
+                    for column in 0..d {
+                        khost[(slot * kvh + head) * d + column] = key_value(time, head, column);
+                        vhost[(slot * kvh + head) * d + column] = value_value(time, head, column);
+                    }
+                }
+            }
+            let k = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(khost))
+                    .schedule(&policy)?
+                    .await?
+                    .reshape(&[capacity, kvh * d])?,
+            );
+            let v = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(vhost))
+                    .schedule(&policy)?
+                    .await?
+                    .reshape(&[capacity, kvh * d])?,
+            );
+            let table = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(tablehost))
+                    .schedule(&policy)?
+                    .await?,
+            );
+            let metadata =
+                api::copy_host_vec_to_device(&Arc::new(vec![start as u64, table_width as u64]))
+                    .schedule(&policy)?
+                    .await?;
+            let mut expected = vec![0f32; rows * qh * d];
+            for row in 0..rows {
+                for head in 0..qh {
+                    let visible = start + row + 1;
+                    let kv = head / (qh / kvh);
+                    let scores = (0..visible)
+                        .map(|time| {
+                            (0..d)
+                                .map(|col| {
+                                    qhost[(row * qh + head) * d + col].to_f32() as f64
+                                        * key_value(time, kv, col).to_f32() as f64
+                                })
+                                .sum::<f64>()
+                                / (d as f64).sqrt()
+                        })
+                        .collect::<Vec<_>>();
+                    let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let probabilities = scores
+                        .iter()
+                        .map(|x| (x - maximum).exp())
+                        .collect::<Vec<_>>();
+                    let denominator = probabilities.iter().sum::<f64>();
+                    for col in 0..d {
+                        let result = (0..visible)
+                            .map(|time| {
+                                probabilities[time] * value_value(time, kv, col).to_f32() as f64
+                            })
+                            .sum::<f64>()
+                            / denominator;
+                        let rounded = bf16::from_f32(result as f32).to_f32();
+                        let g = gatehost[(row * qh * 2 + head * 2 + 1) * d + col].to_f32();
+                        let sigmoid = bf16::from_f32(1.0 / (1.0 + (-g).exp())).to_f32();
+                        expected[(row * qh + head) * d + col] =
+                            bf16::from_f32(rounded * sigmoid).to_f32();
+                    }
+                }
+            }
+            let mut first = None;
+            for graph in [false, true] {
+                if graph && !pooled {
+                    continue;
+                }
+                let mut actual = api::zeros::<bf16>(&[rows, qh * d])
+                    .schedule(&policy)?
+                    .await?;
+                with_context(|exec| {
+                    value((|| unsafe {
+                        // Raw table pointers have an explicit submission owner, including errors.
+                        exec.retain(table.clone())?;
+                        let generics = vec![
+                            bf16::DTYPE.to_string(),
+                            d.to_string(),
+                            qh.to_string(),
+                            kvh.to_string(),
+                        ];
+                        if graph {
+                            kernels::gqa_graph(
+                                (&mut actual).partition([1, d]),
+                                &q,
+                                k.clone(),
+                                v.clone(),
+                                &gate,
+                                &metadata,
+                                table.device_pointer(),
+                            )
+                            .generics(generics)
+                            .execute(exec)?;
+                        } else {
+                            kernels::gqa_attention(
+                                (&mut actual).partition([1, d]),
+                                &q,
+                                k.clone(),
+                                v.clone(),
+                                &gate,
+                                start as i32,
+                                table.device_pointer(),
+                                table_width as i32,
+                            )
+                            .generics(generics.into_iter().chain([pooled.to_string()]).collect())
+                            .execute(exec)?;
+                        }
+                        // Make completion visible to sanitizer's CUDA timeline; the SDK's
+                        // host-polled flag is not an explicit cross-stream CUDA fence.
+                        exec.get_cuda_stream().synchronize()?;
+                        Ok::<_, anyhow::Error>(())
+                    })())
+                })
+                .schedule(&policy)?
+                .await??;
+                let actual = actual.to_host_vec().schedule(&policy)?.await?;
+                assert!(
+                    actual.iter().all(|x| x.to_f32().is_finite()),
+                    "pooled={pooled}, start={start}"
+                );
+                let error = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a.to_f32() - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    error <= 0.001,
+                    "pooled={pooled}, start={start}, graph={graph}, error={error}"
+                );
+                let bits = actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                if let Some(first) = &first {
+                    assert_eq!(&bits, first, "graph/eager start={start}");
+                } else {
+                    first = Some(bits);
+                }
+            }
+        }
+    }
+    Ok(())
+}

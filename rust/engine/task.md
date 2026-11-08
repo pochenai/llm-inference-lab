@@ -266,4 +266,41 @@ Decode -4.62%, e2e -2.65%, prefill +0.36%. Every paired process improves
  decode/e2e; IDs match and weight/scratch/graph accounting is unchanged, with
 zero warm allocation/recapture. No samples excluded. Raw results:
 `rust/profiling/qwen3_5/frozen-weights-20261109/`.
-Commit: this update accompanies immutable-weight ownership.
+Commit: `06aa36e`.
+
+Fresh trace confirms ownership attribution:817 kernels/decode and~7.10ms GPU
+sum unchanged, prelaunch CPU0.290->0.035ms, post-readback tail0.226->0.093ms;
+finite scan stays0.312ms. These are profile values, not native latency cells.
+Raw trace: `rust/profiling/qwen3_5/post-frozen-profile-20261109/`.
+
+### 7. Blocked GQA (done)
+
+Replace scalar-position KV walking with32-token tiles and stable block softmax,
+using the same implementation for eager/graph and all token counts. Preserve
+causal masks, physical slot indirection, FP32 accumulation and BF16 y/sigmoid
+rounding boundaries. CPU oracle covers grouped heads, fragmented slots, pooled
+and standalone addressing,31/32/63/64 boundaries, invalid/unmapped NaN tails,
+and graph/eager agreement. Existing model thresholds remain unchanged.
+
+Operator oracle passed all pooled/standalone cases and exact pooled graph/eager
+comparisons. Compute Sanitizer initially reported potential async-free ordering
+warnings with the round-robin global policy; the OLD kernel under the same oracle
+also reports them. Adding an explicit stream-completion fence to the oracle
+(host-polled SDK completion is not an explicit CUDA timeline fence for the tool)
+gives0 errors with the blocked kernel. No production synchronization was added.
+All logs preserved under `rust/profiling/qwen3_5/blocked-gqa-20261109/memcheck/`.
+Full21-test regression and real-model gate precede native paired timing.
+
+All21 regressions/all-target check pass. Real BF16 reference ID3636, max0.48618,
+RMS0.10955; all four chunk variants max0. No threshold changes.
+
+| Variant | Prefill ms | Decode ms/token | Total8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `06aa36e` | 33.242 | 8.090 | 89.900 |
+| Blocked GQA | 31.913 | 7.639 | 84.202 |
+
+Decode -5.57%, e2e -6.34%, prefill -4.00%; every paired process improves.
+Candidate decode range7.492-7.888ms is retained in full; no samples excluded.
+IDs/ownership/warm allocation/recapture checks pass, scratch counts unchanged.
+Raw confirmation: `rust/profiling/qwen3_5/blocked-gqa-20261109/`.
+Commit: this update accompanies blocked GQA.
