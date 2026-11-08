@@ -884,6 +884,18 @@ mod ops {
         result.reshape(shape![1, VECTOR_OUTPUT_COLUMNS])
     }
 
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn linear_vector<T: ElementType, O: ElementType, const K: i32>(
+        out: &mut Tensor<O, { [1, VECTOR_OUTPUT_COLUMNS] }>,
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+    ) {
+        let p = get_tile_block_id();
+        let result: Tile<O, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            convert_tile(vector_projection::<T, K>(x, w, p.0, p.1));
+        out.store(result);
+    }
+
     /// Shared expert: avoid padded token rows and intermediate gate/up stores.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) fn shared_gate_up_vector<T: ElementType, const K: i32>(

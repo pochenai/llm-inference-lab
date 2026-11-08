@@ -1153,22 +1153,34 @@ unsafe fn project<T: DType, O: DType>(
     exec: &ExecutionContext,
 ) -> Result<ScratchTensor<T, O>> {
     let _range = ScopedRange::new(c"qwen3_5.linear");
-    shared::linear(
-        (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
-        x,
-        w,
-        bias,
-    )
-    .generics(vec![
-        T::DTYPE.to_string(),
-        O::DTYPE.to_string(),
-        x.shape()[1].to_string(),
-        "false".into(),
-        LINEAR_TILE_ROWS.to_string(),
-        LINEAR_TILE_COLUMNS.to_string(),
-        LINEAR_TILE_REDUCTION.to_string(),
-    ])
-    .execute(exec)?;
+    // Preserve GDN a/b MMA rounding; vectorize scalar and 256-way router shapes.
+    // Keep the reduction tree independent of token count for chunked prefill.
+    if T::DTYPE == bf16::DTYPE && O::DTYPE == bf16::DTYPE && matches!(w.shape()[0], 1 | 256) {
+        kernels::linear_vector((&mut out).partition([1, 4]), x, w)
+            .generics(vec![
+                T::DTYPE.to_string(),
+                O::DTYPE.to_string(),
+                x.shape()[1].to_string(),
+            ])
+            .execute(exec)?;
+    } else {
+        shared::linear(
+            (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
+            x,
+            w,
+            bias,
+        )
+        .generics(vec![
+            T::DTYPE.to_string(),
+            O::DTYPE.to_string(),
+            x.shape()[1].to_string(),
+            "false".into(),
+            LINEAR_TILE_ROWS.to_string(),
+            LINEAR_TILE_COLUMNS.to_string(),
+            LINEAR_TILE_REDUCTION.to_string(),
+        ])
+        .execute(exec)?;
+    }
     Ok(out)
 }
 unsafe fn add<T: DType>(

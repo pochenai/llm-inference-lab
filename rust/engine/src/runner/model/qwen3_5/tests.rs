@@ -962,3 +962,65 @@ async fn bf16_shared_vector_matches_unfused_rounding_and_masked_tails() -> Resul
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn bf16_skinny_vector_matches_cpu_with_scalar_and_masked_outputs() -> Result<()> {
+    use super::kernels;
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{PartitionMut, Reshape, ToHostVec},
+        tile_kernel::TileKernel,
+        DType,
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    let k = 2048usize;
+    let inputs = Arc::new(
+        (0..3 * k)
+            .map(|j| bf16::from_f32(((j * 5 + 3) % 13) as f32 / 16.0 - 0.375))
+            .collect::<Vec<_>>(),
+    );
+    let x = api::copy_host_vec_to_device(&inputs)
+        .schedule(&policy)?
+        .await?
+        .reshape(&[3, k])?;
+    for n in [1usize, 32, 33, 256] {
+        let weights = Arc::new(
+            (0..n * k)
+                .map(|j| bf16::from_f32(((j * 3 + 7) % 17) as f32 / 64.0 - 0.125))
+                .collect::<Vec<_>>(),
+        );
+        let w = Arc::new(
+            api::copy_host_vec_to_device(&weights)
+                .schedule(&policy)?
+                .await?
+                .reshape(&[n, k])?,
+        );
+        let mut out = api::zeros::<bf16>(&[3, n]).schedule(&policy)?.await?;
+        kernels::linear_vector((&mut out).partition([1, 4]), &x, w)
+            .generics(vec![
+                bf16::DTYPE.to_string(),
+                bf16::DTYPE.to_string(),
+                k.to_string(),
+            ])
+            .schedule(&policy)?
+            .await?;
+        let actual = out.to_host_vec().schedule(&policy)?.await?;
+        for row in 0..3 {
+            for column in 0..n {
+                let expected = bf16::from_f32(
+                    (0..k)
+                        .map(|j| inputs[row * k + j].to_f32() * weights[column * k + j].to_f32())
+                        .sum::<f32>(),
+                );
+                assert_eq!(
+                    actual[row * n + column].to_bits(),
+                    expected.to_bits(),
+                    "N={n}, row={row}, column={column}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

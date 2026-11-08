@@ -22,8 +22,9 @@ Profile timings must not be compared directly with native timings.
 - [x] Reduce graph replay resource registration and completion cleanup overhead.
 - [x] Inspect emitted instructions and optimize routed expert GEMMs, which cost
   2.376 ms/decode step in the graph profile, before narrower projection roles.
-- [ ] Optimize small projections, starting with shared expert gate/up, GDN a/b
-  and router. Preserve large projections that already match SGLang.
+- [x] Fuse shared expert gate/up/SwiGLU with consistent BF16 arithmetic.
+- [x] Optimize scalar and MoE router projections while preserving GDN a/b MMA.
+- [ ] Pack GDN a/b weights and reuse one MMA projection, preserving accumulation.
 - [ ] Re-profile GQA and host validation after the large GEMM changes; only
   optimize material end-to-end costs while decode parity remains outstanding.
 - [ ] Overlap shared and routed expert work with explicit stream dependencies.
@@ -160,4 +161,48 @@ resident bytes 10,729,868 -> 10,594,684. IDs and ownership checks pass with
 zero warm recaptures/allocations. The prefill tradeoff is accepted for this
 workload; larger batch/context performance is unverified.
 Raw confirmation: `rust/profiling/qwen3_5/shared-gate-up-20261109/consistent-vector/`.
-Commit: this result update accompanies the shared-fusion implementation.
+Commit: `aa1fb74`.
+
+### 4. Scalar and MoE router vector projections (done)
+
+Reuse the shared fusion's full-K vector projection for BF16 outputs with
+N <= 256 (GDN a/b, router and scalar shared gate). Keep the same arithmetic
+across token counts; leave the competitive larger projections unchanged.
+The independent CPU oracle covers N=1/32/33/256, three distinct input rows and
+masked output tails. Then run tiny/real BF16 checks and native paired timing.
+
+- Operator CPU oracle and all 16 BF16 regressions passed.
+- Real 35B reference rejected the combined vector candidate: logit max 0.54415,
+  RMS 0.10929 satisfy the error budget, but first ID changes to 16 (reference
+  3636). The reference's top-two margin is 0.05652. Keep the existing first-ID
+  gate; no performance sampling or commit for this candidate.
+- A diagnostic-only test build loads weights once and independently toggles
+  scalar, GDN a/b and router projection families to locate the change. Restore
+  this temporary instrumentation before any production commit. If required,
+  keep MMA accumulation and optimize through fusion/tile settings instead.
+
+Precision screen isolated GDN a/b: baseline, scalar-only and router-only all
+produce identical reference logits/ID 3636; a/b-only and all-vector produce
+ID 16. Diagnostic source has been restored. Keep a/b MMA and select vector
+only for N=1 and N=256. Revalidate the combined scalar/router path; consider
+precision-preserving a/b MMA fusion as a separate iteration.
+Screen artifacts: `rust/profiling/qwen3_5/skinny-projections-20261109/precision-screen/`.
+
+The scalar+router candidate passed the full real reference: ID 3636, max
+0.56865 / RMS 0.11685 (same as preceding baseline), all four chunks exactly
+match full prefill. Diagnostic flags/tests have been removed. All 16 BF16 regressions and all-target check passed before three-process
+native confirmation. Final candidate
+artifacts: `rust/profiling/qwen3_5/router-vectors-20261109/`.
+
+Final native confirmation:
+
+| Variant | Prefill ms | Decode ms/token | Total 8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `aa1fb74` | 33.044 | 9.015 | 96.310 |
+| Scalar/router vector | 33.117 | 8.685 | 93.981 |
+
+Decode -3.65%, e2e -2.42%; prefill +0.22% (+0.073 ms). Every paired process
+improves decode/e2e, IDs match, scratch/graph counts remain fixed with no warm
+allocation/recapture. All observations retained. Native confirmation and checks:
+`rust/profiling/qwen3_5/router-vectors-20261109/`.
+Commit: this update accompanies the scalar/router implementation.
