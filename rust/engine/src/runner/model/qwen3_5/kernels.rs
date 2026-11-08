@@ -866,6 +866,50 @@ mod ops {
         scores.store(result);
     }
 
+    const VECTOR_OUTPUT_COLUMNS: i32 = 4;
+
+    fn vector_projection<T: ElementType, const K: i32>(
+        x: &Tensor<T, { [-1, K] }>,
+        w: &Tensor<T, { [-1, K] }>,
+        row: i32,
+        column: i32,
+    ) -> Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> {
+        let input: Tile<f32, { [1, K] }> = convert_tile(x.partition(shape![1, K]).load([row, 0]));
+        let weight: Tile<f32, { [VECTOR_OUTPUT_COLUMNS, K] }> = convert_tile(
+            w.partition(shape![VECTOR_OUTPUT_COLUMNS, K])
+                .load([column, 0]),
+        );
+        let product = weight * input.broadcast(shape![VECTOR_OUTPUT_COLUMNS, K]);
+        let result: Tile<f32, { [VECTOR_OUTPUT_COLUMNS] }> = reduce_sum(product, 1);
+        result.reshape(shape![1, VECTOR_OUTPUT_COLUMNS])
+    }
+
+    /// Shared expert: avoid padded token rows and intermediate gate/up stores.
+    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+    pub(super) fn shared_gate_up_vector<T: ElementType, const K: i32>(
+        out: &mut Tensor<T, { [1, VECTOR_OUTPUT_COLUMNS] }>,
+        x: &Tensor<T, { [-1, K] }>,
+        gate: &Tensor<T, { [-1, K] }>,
+        up: &Tensor<T, { [-1, K] }>,
+    ) {
+        let p = get_tile_block_id();
+        let g: Tile<T, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            convert_tile(vector_projection::<T, K>(x, gate, p.0, p.1));
+        let u: Tile<T, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            convert_tile(vector_projection::<T, K>(x, up, p.0, p.1));
+        let g: Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> = convert_tile(g);
+        let u: Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> = convert_tile(u);
+        let one: Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            constant(1.0f32, shape![1, VECTOR_OUTPUT_COLUMNS]);
+        let zero: Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            constant(0.0f32, shape![1, VECTOR_OUTPUT_COLUMNS]);
+        let activated: Tile<T, { [1, VECTOR_OUTPUT_COLUMNS] }> =
+            convert_tile(true_div(g, one + exp(zero - g)));
+        let activated: Tile<f32, { [1, VECTOR_OUTPUT_COLUMNS] }> = convert_tile(activated);
+        let result: Tile<T, { [1, VECTOR_OUTPUT_COLUMNS] }> = convert_tile(activated * u);
+        out.store(result);
+    }
+
     /// Each picked expert owns one CTA row; pad the token dimension to an MMA tile.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
     pub(super) unsafe fn expert_mma<T: ElementType, const K: i32, const N: i32, const TOP: i32>(

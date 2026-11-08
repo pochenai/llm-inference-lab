@@ -880,3 +880,85 @@ async fn bf16_expert_mma_matches_independent_cpu_and_simt() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn bf16_shared_vector_matches_unfused_rounding_and_masked_tails() -> Result<()> {
+    use super::{super::qwen2::kernels as shared, kernels};
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{PartitionMut, Reshape, ToHostVec},
+        tile_kernel::TileKernel,
+        DType,
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    for (k, n) in [(128usize, 128usize), (2048, 512), (2048, 513)] {
+        let inputs = Arc::new(
+            (0..k)
+                .map(|j| bf16::from_f32(((j * 5 + 3) % 13) as f32 / 16.0 - 0.375))
+                .collect::<Vec<_>>(),
+        );
+        let x = api::copy_host_vec_to_device(&inputs)
+            .schedule(&policy)?
+            .await?
+            .reshape(&[1, k])?;
+        let mut weights = Vec::new();
+        for salt in [7, 11] {
+            let values = Arc::new(
+                (0..n * k)
+                    .map(|j| bf16::from_f32(((j * 3 + salt) % 17) as f32 / 64.0 - 0.125))
+                    .collect::<Vec<_>>(),
+            );
+            weights.push(Arc::new(
+                api::copy_host_vec_to_device(&values)
+                    .schedule(&policy)?
+                    .await?
+                    .reshape(&[n, k])?,
+            ));
+        }
+        let mut gate = api::zeros::<bf16>(&[1, n]).schedule(&policy)?.await?;
+        let mut up = api::zeros::<bf16>(&[1, n]).schedule(&policy)?.await?;
+        let bias = api::zeros::<bf16>(&[1]).schedule(&policy)?.await?;
+        for (out, weight) in [
+            (&mut gate, weights[0].clone()),
+            (&mut up, weights[1].clone()),
+        ] {
+            shared::linear(out.partition([16, 64]), &x, weight, &bias)
+                .generics(vec![
+                    bf16::DTYPE.to_string(),
+                    bf16::DTYPE.to_string(),
+                    k.to_string(),
+                    "false".into(),
+                    "16".into(),
+                    "64".into(),
+                    "64".into(),
+                ])
+                .schedule(&policy)?
+                .await?;
+        }
+        let mut expected = api::zeros::<bf16>(&[1, n]).schedule(&policy)?.await?;
+        shared::swiglu((&mut expected).partition([1, 256]), &gate, &up)
+            .generics(vec![bf16::DTYPE.to_string()])
+            .schedule(&policy)?
+            .await?;
+        let mut actual = api::zeros::<bf16>(&[1, n]).schedule(&policy)?.await?;
+        kernels::shared_gate_up_vector(
+            (&mut actual).partition([1, 4]),
+            &x,
+            weights[0].clone(),
+            weights[1].clone(),
+        )
+        .generics(vec![bf16::DTYPE.to_string(), k.to_string()])
+        .schedule(&policy)?
+        .await?;
+        let expected = expected.to_host_vec().schedule(&policy)?.await?;
+        let actual = actual.to_host_vec().schedule(&policy)?.await?;
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "K={k}, N={n}"
+        );
+    }
+    Ok(())
+}

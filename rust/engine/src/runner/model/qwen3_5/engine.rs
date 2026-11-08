@@ -975,11 +975,21 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
             }
             let (shared_out, shared_gate) = {
                 let _range = ScopedRange::new(c"qwen3_5.moe.shared");
-                let gate = linear(scratch, &*n, layer.shared_gate.clone(), exec)?;
-                let up = linear(scratch, &*n, layer.shared_up.clone(), exec)?;
                 let mut shared_act =
                     scratch.activation(&[rows, c.shared_expert_intermediate_size], exec)?;
-                {
+                if T::DTYPE == bf16::DTYPE {
+                    let _range = ScopedRange::new(c"qwen3_5.moe.shared.gate_up_swiglu");
+                    kernels::shared_gate_up_vector(
+                        (&mut shared_act).partition([1, 4]),
+                        &*n,
+                        layer.shared_gate.clone(),
+                        layer.shared_up.clone(),
+                    )
+                    .generics(vec![T::DTYPE.to_string(), h.to_string()])
+                    .execute(exec)?;
+                } else {
+                    let gate = linear(scratch, &n, layer.shared_gate.clone(), exec)?;
+                    let up = linear(scratch, &n, layer.shared_up.clone(), exec)?;
                     let _range = ScopedRange::new(c"qwen3_5.moe.shared.swiglu");
                     shared::swiglu(
                         (&mut shared_act).partition([1, SHARED_POINTWISE_COLUMNS]),

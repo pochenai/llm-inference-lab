@@ -24,6 +24,8 @@ Profile timings must not be compared directly with native timings.
   2.376 ms/decode step in the graph profile, before narrower projection roles.
 - [ ] Optimize small projections, starting with shared expert gate/up, GDN a/b
   and router. Preserve large projections that already match SGLang.
+- [ ] Re-profile GQA and host validation after the large GEMM changes; only
+  optimize material end-to-end costs while decode parity remains outstanding.
 - [ ] Overlap shared and routed expert work with explicit stream dependencies.
 - [ ] Re-profile remaining gaps and repeat until native decode matches or beats
   the SGLang reference; check prefill and end-to-end latency too.
@@ -114,4 +116,48 @@ IDs match; warmed graph/scratch counts and bytes are unchanged. Raw results:
 `rust/profiling/qwen3_5/expert-mma-20261108/`. E2e is now lower than the earlier
 SGLang reference (119.244 ms), but decode still exceeds 7.049 ms/token. Continue
 with the major decode gaps; confirm the final cross-engine result freshly.
-Commit: this update accompanies the expert MMA implementation.
+Commit: `6ca209d`.
+
+### 3. Shared gate/up fusion (done)
+
+The SGLang B1 graph/eager mapping shows GEMV for shared gate/up; tensor cores
+are not a universal requirement for narrow one-token projections. Try four
+output channels per CTA over the full reduction, fuse both projections and
+SwiGLU, and preserve BF16 rounding at gate, up, activation and final output.
+The initial B1-only dispatch was rejected by real-model chunking validation.
+Try consistent BF16 arithmetic across token counts before timing.
+Validate against the unfused kernels at tiny/real geometry and a masked N tail,
+then compare against `6ca209d` with the same native protocol.
+
+- Operator test passed bitwise at K128/N128, K2048/N512 and K2048/N513.
+- Fifteen BF16-focused regressions passed, with exact tiny graph/eager logits
+  and chunking. Real-model B1-only vector validation failed: chunk=1 max
+  difference 0.31143212 exceeds 0.02. No timing or commit for that candidate.
+  Artifacts: `rust/profiling/qwen3_5/shared-gate-up-20261109/b1-only-*`.
+- Consistent vector arithmetic across all BF16 token counts passed validation.
+- Consistent variant passed the real 35B check: max error 0.56865, RMS 0.11685,
+  matching first ID, and zero difference for all four chunking variants.
+  One-process screen (not confirmation): prefill 32.900 ms, decode 8.986
+  ms/token, total 95.720 ms. Prefill is about 1.1 ms slower than the preceding
+  baseline, but seven decode steps save about 4 ms. The screen preceded the
+  independent confirmation below. Artifacts:
+  `rust/profiling/qwen3_5/shared-gate-up-20261109/consistent-vector/`.
+- A separate CPU-only prototype for the existing full-logit finite scan found
+  `.all` 0.189 ms versus non-short-circuit `.fold` 0.052 ms on 248,320 floats.
+  This is a hot-buffer microbenchmark, not native inference evidence, and no
+  production validation change has been made. Revisit after larger GPU costs.
+
+Final confirmation: all 15 BF16 regressions and all-target check passed.
+
+| Variant | Prefill ms | Decode ms/token | Total 8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `6ca209d` | 31.630 | 9.489 | 97.979 |
+| Consistent shared fusion | 33.009 | 8.995 | 96.035 |
+
+Decode -5.21%, e2e -1.98%, prefill +4.36% (+1.380 ms). All paired processes
+improve decode/e2e; no samples excluded. Scratch allocations 142 -> 126,
+resident bytes 10,729,868 -> 10,594,684. IDs and ownership checks pass with
+zero warm recaptures/allocations. The prefill tradeoff is accepted for this
+workload; larger batch/context performance is unverified.
+Raw confirmation: `rust/profiling/qwen3_5/shared-gate-up-20261109/consistent-vector/`.
+Commit: this result update accompanies the shared-fusion implementation.

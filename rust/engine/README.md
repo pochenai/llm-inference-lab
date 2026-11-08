@@ -1041,6 +1041,10 @@ benchmark documented in [the example guide](examples/qwen3_5.md).
 
 ## Qwen3.5 initial latency target
 
+The ongoing BF16 optimization plan, per-commit measurements and rejected
+experiments are tracked in [task.md](task.md). The tables below retain earlier
+baselines and their measurement protocols.
+
 The new `qwen3_5` benchmark calls the current pooled forward directly. On the
 same RTX 6000D and NUMA-local CPU cores, B1 with 32 repeated input tokens and
 8 fixed outputs produced the following medians of three independent processes
