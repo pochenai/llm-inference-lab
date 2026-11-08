@@ -1,4 +1,4 @@
-pub(super) use ops::*;
+pub(in crate::runner::model) use ops::*;
 
 /// Amortize reduction overhead; Qwen's vocabulary needs 38 partials/request.
 /// Warm 4K B1/B4: ~76%/83% less argmax GPU time in separate Nsight captures.
@@ -44,7 +44,7 @@ pub(super) mod ops {
     pub(in crate::runner::model::qwen2) const EMBEDDING_SOURCE_WIDTH: i32 = 2;
 
     #[cutile::entry()]
-    pub(super) fn embedding<T: ElementType>(
+    pub(in crate::runner::model) fn embedding<T: ElementType>(
         out: &mut Tensor<T, { [1, 256] }>,
         ids: &Tensor<u32, { [-1] }>,
         w: &Tensor<T, { [-1, -1] }>,
@@ -391,7 +391,7 @@ pub(super) mod ops {
     /// Optional projection bias is fused into the epilogue before the single store.
     /// BM token rows reuse weights; BN covers output channels independently of heads.
     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
-    pub(super) fn linear<
+    pub(in crate::runner::model) fn linear<
         T: ElementType,
         O: ElementType,
         const K: i32,
@@ -1452,7 +1452,7 @@ pub(super) mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn add<T: ElementType, const ROWS: i32>(
+    pub(in crate::runner::model) fn add<T: ElementType, const ROWS: i32>(
         out: &mut Tensor<T, { [ROWS, 256] }>,
         x: &Tensor<T, { [-1, -1] }>,
         y: &Tensor<T, { [-1, -1] }>,
@@ -1467,7 +1467,7 @@ pub(super) mod ops {
     }
 
     #[cutile::entry()]
-    pub(super) fn swiglu<T: ElementType>(
+    pub(in crate::runner::model) fn swiglu<T: ElementType>(
         out: &mut Tensor<T, { [1, 256] }>,
         gate: &Tensor<T, { [-1, -1] }>,
         up: &Tensor<T, { [-1, -1] }>,

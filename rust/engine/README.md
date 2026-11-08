@@ -975,3 +975,11 @@ from in-flight work. KV capacity must still return after closing sessions.
 The matrix driver reports Rust/SGLang eager and Graph modes separately. Capture
 must finish in warmup; no new captures are allowed during measured samples.
 Graph replay correctness does not imply a performance win in every shape.
+
+## Qwen3.5-35B-A3B text engine (W10)
+
+The standalone BF16 hybrid/MoE engine and explicit append-only session context live
+in `src/runner/model/qwen3_5/`. See the [W10 experiment](examples/qwen3_5.md)
+for architecture, state ownership, memory budget, reference checks and the
+`qwen3_5` example. Runner integration, prefix snapshots, batching and GPU sampling
+remain pending; W10 is not complete.

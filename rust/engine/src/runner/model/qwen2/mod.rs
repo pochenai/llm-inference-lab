@@ -1,6 +1,6 @@
 mod engine;
 mod graph;
-mod kernels;
+pub(in crate::runner::model) mod kernels;
 mod metrics;
 mod workspace;
 
