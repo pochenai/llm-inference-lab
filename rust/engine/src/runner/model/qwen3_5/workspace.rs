@@ -8,7 +8,7 @@ use cuda_async::{
 use cutile::{
     api,
     cuda_core::{Context, DType, DeviceCopy},
-    tensor::Tensor,
+    tensor::{Reshape, Tensor},
 };
 
 const MAX_IDLE: usize = 2;
@@ -24,9 +24,9 @@ pub struct WorkspaceMetrics {
 }
 
 struct Bank<T: DType> {
-    activations: Vec<Arc<Tensor<T>>>,
-    floats: Vec<Arc<Tensor<f32>>>,
-    integers: Vec<Arc<Tensor<i32>>>,
+    activations: Vec<Arc<Slot<T>>>,
+    floats: Vec<Arc<Slot<f32>>>,
+    integers: Vec<Arc<Slot<i32>>>,
 }
 
 struct Workspace<T: DType> {
@@ -148,21 +148,21 @@ impl<T: DType + DeviceCopy> Scratch<T> {
         &mut self,
         shape: &[usize],
         exec: &ExecutionContext,
-    ) -> Result<Tensor<T>> {
+    ) -> Result<ScratchTensor<T, T>> {
         self.get(shape, exec, 0, |bank| &mut bank.activations)
     }
     pub(super) unsafe fn float(
         &mut self,
         shape: &[usize],
         exec: &ExecutionContext,
-    ) -> Result<Tensor<f32>> {
+    ) -> Result<ScratchTensor<T, f32>> {
         self.get(shape, exec, 1, |bank| &mut bank.floats)
     }
     pub(super) unsafe fn integer(
         &mut self,
         shape: &[usize],
         exec: &ExecutionContext,
-    ) -> Result<Tensor<i32>> {
+    ) -> Result<ScratchTensor<T, i32>> {
         self.get(shape, exec, 2, |bank| &mut bank.integers)
     }
 
@@ -171,8 +171,8 @@ impl<T: DType + DeviceCopy> Scratch<T> {
         shape: &[usize],
         exec: &ExecutionContext,
         kind: usize,
-        select: impl FnOnce(&mut Bank<T>) -> &mut Vec<Arc<Tensor<O>>>,
-    ) -> Result<Tensor<O>> {
+        select: impl FnOnce(&mut Bank<T>) -> &mut Vec<Arc<Slot<O>>>,
+    ) -> Result<ScratchTensor<T, O>> {
         let index = self.cursors[kind];
         self.cursors[kind] += 1;
         let tensor = {
@@ -183,22 +183,18 @@ impl<T: DType + DeviceCopy> Scratch<T> {
                 let _range = crate::profiling::ScopedRange::new(c"qwen3_5.workspace.allocate");
                 // Initialize on a miss; later producers overwrite scratch. Scalar
                 // bias slots are read-only and retain their initial zero.
-                let tensor = Arc::new(api::zeros::<O>(shape).execute(exec)?);
+                let tensor = api::zeros::<O>(shape).execute(exec)?;
                 let bytes = tensor.num_bytes();
-                buffers.push(tensor);
+                buffers.push(Arc::new(Slot {
+                    shape: shape.to_vec(),
+                    tensor: Mutex::new(Some(tensor)),
+                }));
                 bytes
             } else {
                 0
             };
             let tensor = buffers[index].clone();
-            ensure!(
-                tensor
-                    .shape()
-                    .iter()
-                    .map(|&n| n as usize)
-                    .eq(shape.iter().copied()),
-                "scratch layout changed"
-            );
+            ensure!(tensor.shape == shape, "scratch layout changed");
             workspace.bytes += added;
             if added != 0 {
                 let mut state = self.lease.pool.state.lock().unwrap();
@@ -207,36 +203,95 @@ impl<T: DType + DeviceCopy> Scratch<T> {
             }
             tensor
         };
-        // SAFETY: each slot is disjoint within a layer. Reusing a bank between
-        // layers is ordered on this submission's stream. Owners retain the
-        // exclusive checkout, backing memory and actual context until completion.
-        Ok(Tensor::from_foreign(
-            Arc::new(Owner {
-                tensor: tensor.clone(),
-                _lease: self.lease.clone(),
-            }),
-            tensor.shape().to_vec(),
-            tensor.strides().to_vec(),
-        ))
+        let value = tensor
+            .tensor
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("scratch slot is still borrowed"))?;
+        Ok(ScratchTensor {
+            tensor: Some(value),
+            slot: tensor,
+            _lease: self.lease.clone(),
+        })
+    }
+
+    pub(super) fn retain(&self, exec: &ExecutionContext) -> Result<()> {
+        exec.retain(self.lease.clone())?;
+        Ok(())
     }
 }
 
-struct Owner<T: DType, O: DType> {
-    tensor: Arc<Tensor<O>>,
+struct Slot<O: DType> {
+    shape: Vec<usize>,
+    tensor: Mutex<Option<Tensor<O>>>,
+}
+
+/// Moves the sole user-visible tensor owner out of a slot until its last CPU use.
+/// Graph descriptors retain its storage without creating another mutable alias.
+pub(super) struct ScratchTensor<T: DType, O: DType> {
+    tensor: Option<Tensor<O>>,
+    slot: Arc<Slot<O>>,
     _lease: Arc<Lease<T>>,
 }
 
-// SAFETY: the backing tensor keeps its pointer, extent and context stable;
-// the lease prevents reuse by another submission while any view survives.
-unsafe impl<T: DType, O: DType> DeviceAllocation for Owner<T, O> {
+impl<T: DType, O: DType> std::ops::Deref for ScratchTensor<T, O> {
+    type Target = Tensor<O>;
+    fn deref(&self) -> &Self::Target {
+        self.tensor.as_ref().unwrap()
+    }
+}
+impl<T: DType, O: DType> std::ops::DerefMut for ScratchTensor<T, O> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.tensor.as_mut().unwrap()
+    }
+}
+impl<T: DType, O: DType> ScratchTensor<T, O> {
+    pub(super) fn reshape(mut self, shape: &[usize]) -> Result<Self> {
+        // Validate before taking so an invalid reshape still returns its slot.
+        ensure!(
+            shape.iter().product::<usize>() == self.size(),
+            "scratch reshape size mismatch"
+        );
+        self.tensor = Some(self.tensor.take().unwrap().reshape(shape)?);
+        Ok(self)
+    }
+
+    pub(super) unsafe fn escape(self) -> Tensor<O> {
+        let shape = self.shape().to_vec();
+        let strides = self.strides().to_vec();
+        // SAFETY: this owner holds both the unique slot and workspace checkout.
+        // It returns the original tensor only after every escaped view has gone.
+        Tensor::from_foreign(Arc::new(self), shape, strides)
+    }
+}
+impl<T: DType, O: DType> Drop for ScratchTensor<T, O> {
+    fn drop(&mut self) {
+        if let Some(tensor) = self.tensor.take() {
+            let tensor = if tensor.shape().iter().map(|&n| n as usize).eq(self
+                .slot
+                .shape
+                .iter()
+                .copied())
+            {
+                tensor
+            } else {
+                tensor.reshape(&self.slot.shape).unwrap()
+            };
+            *self.slot.tensor.lock().unwrap() = Some(tensor);
+        }
+    }
+}
+// SAFETY: the unique tensor and checkout own a stable allocation and context.
+unsafe impl<T: DType, O: DType> DeviceAllocation for ScratchTensor<T, O> {
     fn device_ptr(&self) -> u64 {
-        self.tensor.device_pointer().cu_deviceptr()
+        self.device_pointer().cu_deviceptr()
     }
     fn len_bytes(&self) -> usize {
-        self.tensor.num_bytes()
+        self.num_bytes()
     }
     fn context(&self) -> Arc<Context> {
-        self.tensor.context().clone()
+        Tensor::context(self).clone()
     }
 }
 
@@ -289,11 +344,12 @@ mod tests {
                         hidden.device_pointer().cu_deviceptr()
                     );
                     scratch.reset();
+                    assert!(scratch.activation(&[8], exec).is_err());
+                    let hidden_ptr = hidden.device_pointer().cu_deviceptr();
+                    drop((hidden, residual));
+                    scratch.reset();
                     let reused_hidden = scratch.activation(&[8], exec)?;
-                    assert_eq!(
-                        reused_hidden.device_pointer().cu_deviceptr(),
-                        hidden.device_pointer().cu_deviceptr()
-                    );
+                    assert_eq!(reused_hidden.device_pointer().cu_deviceptr(), hidden_ptr);
                     Ok(())
                 })()
             })
@@ -318,7 +374,11 @@ mod tests {
             value(unsafe {
                 (|| -> Result<Vec<Tensor<f32>>> {
                     (0..2)
-                        .map(|_| pool.acquire(1, exec)?.activation(&[8], exec))
+                        .map(|_| {
+                            pool.acquire(1, exec)?
+                                .activation(&[8], exec)
+                                .map(|t| t.escape())
+                        })
                         .collect()
                 })()
             })
@@ -335,8 +395,13 @@ mod tests {
         let first_expired = first_gate.expired.clone();
         let retained = pool.clone();
         let first = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
-            unsafe { retained.acquire(1, exec)?.activation(&[8], exec) }
-                .map_err(|e| ModelError::Execution(e.to_string()))
+            unsafe {
+                retained
+                    .acquire(1, exec)?
+                    .activation(&[8], exec)
+                    .map(|t| t.escape())
+            }
+            .map_err(|e| ModelError::Execution(e.to_string()))
         })
         .await?;
         let first_tensor = first.output?;
@@ -346,8 +411,13 @@ mod tests {
         let second_expired = second_gate.expired.clone();
         let retained = pool.clone();
         let second = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
-            unsafe { retained.acquire(1, exec)?.activation(&[8], exec) }
-                .map_err(|e| ModelError::Execution(e.to_string()))
+            unsafe {
+                retained
+                    .acquire(1, exec)?
+                    .activation(&[8], exec)
+                    .map(|t| t.escape())
+            }
+            .map_err(|e| ModelError::Execution(e.to_string()))
         })
         .await?;
         let second_tensor = second.output?;
