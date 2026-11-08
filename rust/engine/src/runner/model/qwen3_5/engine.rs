@@ -1226,7 +1226,10 @@ unsafe fn add<T: DType>(
 
 fn validate_prediction(token: i32, logits: &[f32]) -> Result<u32> {
     let _range = ScopedRange::new(c"qwen3_5.host_validation");
-    ensure!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
+    ensure!(
+        logits.iter().fold(true, |valid, v| valid & v.is_finite()),
+        "non-finite logits"
+    );
     ensure!(
         token >= 0 && (token as usize) < logits.len(),
         "invalid greedy prediction"
@@ -1312,5 +1315,38 @@ impl<T: WeightElement + ElementType> CausalModel<Qwen3_5StatePool<T>> for Qwen3_
             outputs.push(result);
         }
         outputs
+    }
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use super::validate_prediction;
+
+    #[test]
+    fn prediction_checks_cover_finite_classes_tails_and_token_bounds() {
+        for len in [1usize, 3, 4, 7, 8, 16, 19, 248320] {
+            let mut values = (0..len)
+                .map(|i| [0.0, -0.0, f32::from_bits(1), f32::MAX, f32::MIN][i % 5])
+                .collect::<Vec<_>>();
+            assert_eq!(validate_prediction(0, &values).unwrap(), 0);
+            assert_eq!(
+                validate_prediction((len - 1) as i32, &values).unwrap(),
+                (len - 1) as u32
+            );
+            assert!(validate_prediction(-1, &values).is_err());
+            assert!(validate_prediction(len as i32, &values).is_err());
+            for index in [0, len / 2, len - 1] {
+                let original = values[index];
+                for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    values[index] = invalid;
+                    assert!(
+                        validate_prediction(0, &values).is_err(),
+                        "len={len}, index={index}"
+                    );
+                }
+                values[index] = original;
+            }
+        }
+        assert!(validate_prediction(0, &[]).is_err());
     }
 }

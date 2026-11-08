@@ -303,4 +303,28 @@ Decode -5.57%, e2e -6.34%, prefill -4.00%; every paired process improves.
 Candidate decode range7.492-7.888ms is retained in full; no samples excluded.
 IDs/ownership/warm allocation/recapture checks pass, scratch counts unchanged.
 Raw confirmation: `rust/profiling/qwen3_5/blocked-gqa-20261109/`.
-Commit: this update accompanies blocked GQA.
+Commit: `a0cd88f`.
+
+### 8. Full-logit finite scan (done)
+
+Replace short-circuit `.all` with a non-short-circuit boolean reduction so LLVM
+can vectorize the complete scan. Every logit is still checked; NaN/Inf rejection,
+token range validation, full D2H and host feedback remain in the timed path.
+CPU contract cases cover signed zeros, subnormals, finite extremes, NaN and both
+infinities at first/middle/last positions, SIMD tails, empty logits and bad IDs.
+No GPU math or kernel code changes; use the contract test plus a model reference
+smoke check, then rotated native timing.
+
+Contract test, tiny reference/chunking smoke and all-target checks passed.
+GPU math unchanged; full D2H/finite/token validation remains inside timing.
+
+| Variant | Prefill ms | Decode ms/token | Total8 outputs ms |
+| --- | ---: | ---: | ---: |
+| `a0cd88f` | 32.541 | 7.892 | 87.783 |
+| Vectorizable finite scan | 32.499 | 7.705 | 86.433 |
+
+Decode -2.37%, e2e -1.54%; every paired process improves decode/e2e. All
+observations retained; first-pair prefill variance is visible and not entirely
+attributed to the scan. IDs/ownership/warm allocation/capture checks pass.
+Raw confirmation: `rust/profiling/qwen3_5/finite-scan-20261109/`.
+Commit: this update accompanies the full-scan reduction.
