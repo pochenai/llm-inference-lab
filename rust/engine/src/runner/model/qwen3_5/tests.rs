@@ -227,18 +227,26 @@ async fn convolution_preserves_three_distinct_history_planes() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires QWEN35_TEST_MODEL (the independent tiny fixture)"]
 async fn pooled_state_and_runner_match_standalone() -> Result<()> {
-    check_pooled_runner::<cutile::core::bf16>().await
+    check_pooled_runner::<cutile::core::bf16>(false).await
 }
 
 #[tokio::test]
 #[ignore = "requires QWEN35_TEST_MODEL (the independent tiny fixture)"]
 async fn fp32_pooled_state_and_runner_match_standalone() -> Result<()> {
-    check_pooled_runner::<f32>().await
+    check_pooled_runner::<f32>(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires QWEN35_TEST_MODEL (the independent tiny fixture)"]
+async fn graph_pooled_state_and_runner_match_standalone() -> Result<()> {
+    check_pooled_runner::<cutile::core::bf16>(true).await
 }
 
 async fn check_pooled_runner<
     T: crate::runner::loader::WeightElement + cutile::core::ElementType,
->() -> Result<()> {
+>(
+    cuda_graph: bool,
+) -> Result<()> {
     use crate::{
         runner::{
             kv_pool::{KVContext, KVPool},
@@ -258,6 +266,11 @@ async fn check_pooled_runner<
     let model =
         Qwen3_5Engine::<T>::load(&PathBuf::from(std::env::var("QWEN35_TEST_MODEL")?), &policy)
             .await?;
+    let model = if cuda_graph {
+        model.with_cuda_graphs()
+    } else {
+        model
+    };
     let mut config = model.kv_pool_config(32)?;
     config.max_rows = 2;
     config.num_slots = 12;
@@ -525,5 +538,249 @@ async fn check_pooled_runner<
         Err(crate::error::EngineError::InvalidInput(_))
     ));
 
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires QWEN35_TEST_MODEL (the independent tiny fixture)"]
+async fn decode_graph_matches_eager_logits_across_sessions() -> Result<()> {
+    use crate::runner::{
+        kv_pool::{KVContext, KVPool},
+        model::{CausalModel, ModelInput, Qwen3_5StatePool},
+    };
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    let engine = Qwen3_5Engine::<cutile::core::bf16>::load(
+        &PathBuf::from(std::env::var("QWEN35_TEST_MODEL")?),
+        &policy,
+    )
+    .await?
+    .with_cuda_graphs();
+    let mut config = engine.kv_pool_config(32)?;
+    config.max_rows = 2;
+    config.num_slots = 24;
+    let pool = Qwen3_5StatePool::new(&engine, config, &policy).await?;
+    let initial = pool.metrics();
+    let reference_pool = Qwen3_5StatePool::new(&engine, config, &policy).await?;
+    for round in 0..2 {
+        let mut a = KVContext::new(pool.clone())?;
+        let mut b = KVContext::new(pool.clone())?;
+        let mut reference_a = KVContext::new(reference_pool.clone())?;
+        let mut reference_b = KVContext::new(reference_pool.clone())?;
+        // Alternate rows and token values: physical slots and recurrent pointers differ.
+        for (first, ids) in [
+            (true, vec![1, 7]),
+            (false, vec![9, 3, 12]),
+            (true, vec![1, 7, 9]),
+            (false, vec![9, 3, 12, 8]),
+            (true, vec![1, 7, 9, 3]),
+            (false, vec![9, 3, 12, 8, 1]),
+        ] {
+            let (kv, reference) = if first {
+                (&mut a, &mut reference_a)
+            } else {
+                (&mut b, &mut reference_b)
+            };
+            let mut outputs = Vec::new();
+            for (kv, enabled) in [(reference, false), (kv, true)] {
+                let mut input = ModelInput {
+                    token_ids: ids.as_slice().into(),
+                    kv,
+                };
+                let graph = if enabled {
+                    engine.prepare_decode_graph(&input)?
+                } else {
+                    None
+                };
+                assert_eq!(graph.is_some(), enabled && input.kv.ready_len() > 0);
+                let suffix = Arc::new(ids[input.kv.ready_len()..].to_vec());
+                let (logits, token) = Qwen3_5Engine::execute_append_batch(
+                    std::slice::from_mut(&mut input),
+                    &policy,
+                    |batch, exec| {
+                        let mut view = batch[0]
+                            .kv
+                            .execution_view(batch[0].token_ids.host()?, exec)?;
+                        // SAFETY: this pending view grants and retains all addressed state.
+                        Ok(unsafe {
+                            engine.submit_pooled(&suffix, &mut view, graph.as_ref(), exec)?
+                        })
+                    },
+                )
+                .await?;
+                outputs.push((token.as_slice()[0], logits.as_slice().to_vec()));
+            }
+            let (expected_token, expected) = &outputs[0];
+            let (token, logits) = &outputs[1];
+            assert_eq!(token, expected_token);
+            let error = logits
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("round={round}, ids={ids:?}, pooled graph/eager max={error}");
+            ensure!(
+                error < 0.002,
+                "round={round}, ids={ids:?}, graph/eager error={error}"
+            );
+        }
+        a.release();
+        b.release();
+        reference_a.release();
+        reference_b.release();
+        assert_eq!(pool.metrics(), initial);
+        assert_eq!(reference_pool.metrics(), initial);
+        assert_eq!(engine.cuda_graph_metrics().captures, 1);
+        assert_eq!(engine.cuda_graph_metrics().replays, (round + 1) * 4);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_state_kernels_match_eager_real_geometry() -> Result<()> {
+    use super::{constants::*, kernels};
+    use cutile::{api, core::bf16, tensor::Reshape, tile_kernel::TileKernel};
+    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
+    let policy = cuda_async::device_context::global_policy(0)?;
+    let (conv_a, conv_b, delta_a, delta_b, state_a, state_b) = with_context(|exec| {
+        value((|| unsafe {
+            let width = 8192usize;
+            let data = |n: usize, seed: usize| {
+                Arc::new(
+                    (0..n)
+                        .map(|i| bf16::from_f32(((i * 17 + seed) % 101) as f32 / 100.0 - 0.5))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let x = Arc::new(
+                api::copy_host_vec_to_device(&data(width, 3))
+                    .execute(exec)?
+                    .reshape(&[1, width])?,
+            );
+            let weight = Arc::new(
+                api::copy_host_vec_to_device(&data(4 * width, 7))
+                    .execute(exec)?
+                    .reshape(&[4, width])?,
+            );
+            let cv = data(3 * width, 9);
+            let conv_state_a = Arc::new(api::copy_host_vec_to_device(&cv).execute(exec)?);
+            let conv_state_b = Arc::new(api::copy_host_vec_to_device(&cv).execute(exec)?);
+            let st = Arc::new(
+                (0..32 * 128 * 128)
+                    .map(|i| ((i * 13 % 71) as f32 - 35.0) / 128.0)
+                    .collect::<Vec<_>>(),
+            );
+            let state_a = Arc::new(api::copy_host_vec_to_device(&st).execute(exec)?);
+            let state_b = Arc::new(api::copy_host_vec_to_device(&st).execute(exec)?);
+            let metadata = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(vec![
+                    0u64,
+                    0,
+                    conv_state_b.device_pointer().cu_deviceptr(),
+                    state_b.device_pointer().cu_deviceptr(),
+                ]))
+                .execute(exec)?,
+            );
+            let out_a = Arc::new(api::zeros::<bf16>(&[1, width]).execute(exec)?);
+            let out_b = Arc::new(api::zeros::<bf16>(&[1, width]).execute(exec)?);
+            let generics = vec!["bf16".into(), width.to_string()];
+            let grid = (1, (width / POINTWISE_COLUMNS) as u32, 1);
+            kernels::conv(
+                out_a.device_pointer(),
+                conv_state_a.device_pointer(),
+                x.clone(),
+                weight.clone(),
+            )
+            .generics(generics.clone())
+            .grid(grid)
+            .execute(exec)?;
+            kernels::conv_graph(
+                out_b.device_pointer(),
+                metadata.clone(),
+                0,
+                x.clone(),
+                weight.clone(),
+            )
+            .generics(generics)
+            .grid(grid)
+            .execute(exec)?;
+            let conv_a = api::copy_device_to_host_vec(&out_a).execute(exec)?;
+            let conv_b = api::copy_device_to_host_vec(&out_b).execute(exec)?;
+            let a = Arc::new(
+                api::copy_host_vec_to_device(&data(32, 11))
+                    .execute(exec)?
+                    .reshape(&[1, 32])?,
+            );
+            let b = Arc::new(
+                api::copy_host_vec_to_device(&data(32, 13))
+                    .execute(exec)?
+                    .reshape(&[1, 32])?,
+            );
+            let al =
+                Arc::new(api::copy_host_vec_to_device(&Arc::new(vec![-1f32; 32])).execute(exec)?);
+            let dt =
+                Arc::new(api::copy_host_vec_to_device(&Arc::new(vec![0.1f32; 32])).execute(exec)?);
+            let core_a = Arc::new(api::zeros::<bf16>(&[1, 4096]).execute(exec)?);
+            let core_b = Arc::new(api::zeros::<bf16>(&[1, 4096]).execute(exec)?);
+            let generics = vec![
+                "bf16".into(),
+                "16".into(),
+                "32".into(),
+                "128".into(),
+                "128".into(),
+            ];
+            let grid = (32, (128 / DELTA_VALUE_COLUMNS) as u32, 1);
+            kernels::delta(
+                core_a.device_pointer(),
+                state_a.device_pointer(),
+                x.clone(),
+                a.clone(),
+                b.clone(),
+                al.clone(),
+                dt.clone(),
+            )
+            .generics(generics.clone())
+            .grid(grid)
+            .execute(exec)?;
+            kernels::delta_graph(core_b.device_pointer(), metadata, 0, x, a, b, al, dt)
+                .generics(generics)
+                .grid(grid)
+                .execute(exec)?;
+            Ok::<_, anyhow::Error>((
+                conv_a,
+                conv_b,
+                api::copy_device_to_host_vec(&core_a).execute(exec)?,
+                api::copy_device_to_host_vec(&core_b).execute(exec)?,
+                api::copy_device_to_host_vec(&state_a).execute(exec)?,
+                api::copy_device_to_host_vec(&state_b).execute(exec)?,
+            ))
+        })())
+    })
+    .schedule(&policy)?
+    .await??;
+    for (label, a, b) in [("conv", conv_a, conv_b), ("delta", delta_a, delta_b)] {
+        let count = a.iter().zip(&b).filter(|(a, b)| a != b).count();
+        let error = a
+            .iter()
+            .zip(&b)
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .fold(0f32, f32::max);
+        eprintln!("{label}: mismatches={count}, max={error}");
+        ensure!(count == 0, "{label} graph arithmetic differs");
+    }
+    let state_count = state_a.iter().zip(&state_b).filter(|(a, b)| a != b).count();
+    let state_error = state_a
+        .iter()
+        .zip(&state_b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!("state: mismatches={state_count}, max={state_error}");
+    ensure!(
+        state_a
+            .iter()
+            .zip(&state_b)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "graph changes recurrent arithmetic"
+    );
     Ok(())
 }

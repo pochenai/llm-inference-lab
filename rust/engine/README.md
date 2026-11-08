@@ -1139,3 +1139,53 @@ traces and validation logs are retained in the ignored
 uses stock/default MoE tuning and a GPU-sampling/graph boundary; Rust still uses
 host feedback and full-logit validation. Cross-engine output equivalence and
 broader batching/long-context serving performance are not established here.
+
+
+## Qwen3.5 BF16 CUDA Graph iteration
+
+`Qwen3_5Engine::with_cuda_graphs()` and `--cuda-graph` in the example/benchmark
+opt into pooled single-token continuation replay. Initial prefill and multi-token
+appends remain eager. The graph retains scratch and pool backing storage; each
+pending replay validates and retains the current request's state and KV leases.
+Token, position, table-row offset and recurrent/convolution addresses are uploaded
+before launch. Warmup uses private state and holds one exclusive scratch checkout
+through capture. Host token feedback and full-logit CPU validation are preserved.
+
+Fresh measurements use the previous iteration's B1 BF16 32-input/eight-output
+protocol: three rotated processes per engine, two warmups and three samples each,
+CPU cores 24–31, no profiling or GPU tests during native timing, and unlocked
+clocks. Values are medians of process aggregates; loading/JIT/capture are excluded.
+
+| Engine | Prefill ms | Decode ms/step | Total ms |
+| --- | ---: | ---: | ---: |
+| Committed workspace Rust eager | 52.882 | 12.404 | 140.965 |
+| Rust CUDA Graph | 55.362 | 10.654 | 131.103 |
+| SGLang graph reference | 69.120 | 7.049 | 119.244 |
+
+Decode improves 14.1% and total improves 7.0%; prefill regresses 4.7%, whose cause
+has not been isolated. This meets the iteration review threshold on decode.
+Rust graph decode remains 1.51x SGLang, with the same stock MoE setup and differing
+sampling/validation boundaries described above. Long-context, batching, serving
+throughput and cross-engine numerical equivalence are not established here.
+
+Each graph process captures once during warmup, with no measured recapture or
+scratch allocation. Session metrics return to their initial values. The cached
+graph keeps one workspace checked out; resident scratch stays at 10,729,868 bytes.
+`cuda_graph_metrics()` exposes capture/replay/cache counts. Dynamic state addresses
+retain eager's host-checked 16-byte alignment assumption; the arithmetic formulas
+are unchanged. A real-geometry operator regression checks BF16 outputs and FP32
+state bits, and a real 35B paired-history test observes zero logit difference in
+all twelve cases across interleaved and fresh sessions. The final release suite
+passes 14 Qwen3.5 tests, including Runner and Gate ownership regressions.
+
+A separate one-prefill/seven-decode profile has unchanged GPU kernel counts,
+while ordinary launches fall from 7,476 to 994 plus seven graph launches.
+NVTX validates one prefill, seven replay ranges, no capture or scratch miss during
+measurement, and balanced same-thread ranges. Profiled prefill kernel sums are
+nearly unchanged; decode kernel sums are 8.847/8.660 ms. These are attribution
+measurements, not the native latency table.
+
+Commands, raw samples, hashes, frozen binaries/source, numerical checks and
+separate profiles are retained under the ignored
+`rust/profiling/qwen3_5/cuda-graph-20261108/` directory. See the
+[CUDA Graph guide](examples/qwen3_5.md#cuda-graph-decode) for scope and NVTX semantics.

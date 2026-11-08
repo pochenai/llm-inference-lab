@@ -128,6 +128,11 @@ pub(super) struct Scratch<T: DType> {
 }
 
 impl<T: DType + DeviceCopy> Scratch<T> {
+    pub(super) fn reset(&mut self) {
+        self.bank = 2;
+        self.cursors = [0; 3];
+    }
+
     pub(super) fn layer(&mut self, delta: bool) {
         self.bank = usize::from(!delta);
         self.cursors = [0; 3];
@@ -281,6 +286,12 @@ mod tests {
                     let last = scratch.activation(&[8], exec)?;
                     assert_ne!(
                         last.device_pointer().cu_deviceptr(),
+                        hidden.device_pointer().cu_deviceptr()
+                    );
+                    scratch.reset();
+                    let reused_hidden = scratch.activation(&[8], exec)?;
+                    assert_eq!(
+                        reused_hidden.device_pointer().cu_deviceptr(),
                         hidden.device_pointer().cu_deviceptr()
                     );
                     Ok(())

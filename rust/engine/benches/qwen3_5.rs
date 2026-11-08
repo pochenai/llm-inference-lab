@@ -23,6 +23,8 @@ struct Args {
     warmup: usize,
     #[arg(long, default_value_t = 3)]
     iterations: usize,
+    #[arg(long)]
+    cuda_graph: bool,
     /// Capture only measured forwards with Nsight Systems.
     #[arg(long)]
     profile: bool,
@@ -51,11 +53,16 @@ async fn main() -> Result<()> {
         unsafe { driver.get::<unsafe extern "C" fn() -> i32>(b"cuProfilerStop\0")? };
     let policy = cuda_async::device_context::global_policy(0)?;
     let model = Qwen3_5Engine::<bf16>::load(&args.model_dir, &policy).await?;
+    let model = if args.cuda_graph {
+        model.with_cuda_graphs()
+    } else {
+        model
+    };
     let pool = Qwen3_5StatePool::new(&model, model.kv_pool_config(capacity)?, &policy).await?;
     let initial = pool.metrics();
     println!(
         "{}",
-        json!({"event":"loaded", "dtype":"bf16", "batch_size":1, "input_tokens":args.tokens, "output_tokens":args.output_tokens, "weight_bytes":model.weight_bytes(), "gpu_feedback":false, "logits_validation":true, "cuda_graph":false, "cpu_affinity":std::fs::read_to_string("/proc/self/status")?.lines().find(|line| line.starts_with("Cpus_allowed_list:")).unwrap_or("")})
+        json!({"event":"loaded", "dtype":"bf16", "batch_size":1, "input_tokens":args.tokens, "output_tokens":args.output_tokens, "weight_bytes":model.weight_bytes(), "gpu_feedback":false, "logits_validation":true, "cuda_graph":args.cuda_graph, "cpu_affinity":std::fs::read_to_string("/proc/self/status")?.lines().find(|line| line.starts_with("Cpus_allowed_list:")).unwrap_or("")})
     );
     let mut expected = None;
     for iteration in 0..samples {
@@ -64,6 +71,7 @@ async fn main() -> Result<()> {
             // SAFETY: warmup forwards and readbacks have completed.
             ensure!(unsafe { profiler_start() } == 0, "cuProfilerStart failed");
         }
+        let captures_before = model.cuda_graph_metrics().captures;
         let allocations_before = model.workspace_metrics().allocated_buffers;
         let mut kv = KVContext::new(pool.clone())?;
         let mut history = vec![9707u32; args.tokens];
@@ -98,10 +106,14 @@ async fn main() -> Result<()> {
         );
         let workspace = model.workspace_metrics();
         ensure!(
-            workspace.in_use_workspaces == 0,
+            workspace.in_use_workspaces == model.cuda_graph_metrics().cached_graphs,
             "workspace checkout was not released"
         );
         if iteration >= args.warmup && args.warmup > 0 {
+            ensure!(
+                model.cuda_graph_metrics().captures == captures_before,
+                "warm sample captured a graph"
+            );
             ensure!(
                 workspace.allocated_buffers == allocations_before,
                 "warm sample allocated scratch buffers"
@@ -109,7 +121,7 @@ async fn main() -> Result<()> {
         }
         println!(
             "{}",
-            json!({"event":"sample", "iteration":iteration, "warmup":iteration < args.warmup, "batch_size":1, "input_tokens":args.tokens, "forward_count":args.output_tokens, "prefill_seconds":times[0], "decode_step_seconds":&times[1..], "generated_ids":generated, "kv_released":true, "workspace":workspace, "workspace_allocations":workspace.allocated_buffers - allocations_before})
+            json!({"event":"sample", "iteration":iteration, "warmup":iteration < args.warmup, "batch_size":1, "input_tokens":args.tokens, "forward_count":args.output_tokens, "prefill_seconds":times[0], "decode_step_seconds":&times[1..], "generated_ids":generated, "kv_released":true, "workspace":workspace, "cuda_graph":model.cuda_graph_metrics(), "workspace_allocations":workspace.allocated_buffers - allocations_before})
         );
     }
     if args.profile {

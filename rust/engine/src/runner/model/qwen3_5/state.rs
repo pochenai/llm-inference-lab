@@ -208,6 +208,39 @@ impl<T: DType + DeviceCopy + ElementType> Qwen3_5ExecutionView<'_, T> {
         self.positions.start
     }
 
+    /// Validate pending write authority and retain this replay's session storage.
+    pub(super) unsafe fn graph_metadata(&mut self) -> Result<Vec<u64>> {
+        ensure!(
+            self.positions.len() == 1 && self.positions.start > 0,
+            "graph requires pooled decode"
+        );
+        let mut metadata = vec![0u64; 2 + self.layers.len() * 2];
+        metadata[0] = self.positions.start as u64;
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            match layer {
+                LayerState::Delta { conv, recurrent } => {
+                    metadata[2 + index * 2] = retained_pointer(conv, self.exec)?.cu_deviceptr();
+                    metadata[3 + index * 2] =
+                        retained_pointer(recurrent, self.exec)?.cu_deviceptr();
+                    ensure!(
+                        metadata[2 + index * 2] % 16 == 0 && metadata[3 + index * 2] % 16 == 0,
+                        "graph state requires 16-byte alignment"
+                    );
+                }
+                LayerState::PooledAttention { index } => {
+                    let (pool, state) = self.pooled.as_mut().context("missing graph KV pool")?;
+                    let _write =
+                        pool.write_view(state, *index, self.positions.clone(), self.exec)?;
+                    let view = pool.read_view(state, *index, 0..self.positions.end)?;
+                    view.retain(self.exec)?;
+                    metadata[1] = (view.row() * view.table_width()) as u64;
+                }
+                _ => anyhow::bail!("graphs require pooled attention storage"),
+            }
+        }
+        Ok(metadata)
+    }
+
     pub(super) fn delta(&mut self, layer: usize) -> Result<DeltaView<T>> {
         let Some(LayerState::Delta { conv, recurrent }) = self.layers.get_mut(layer) else {
             anyhow::bail!("expected DeltaNet state");

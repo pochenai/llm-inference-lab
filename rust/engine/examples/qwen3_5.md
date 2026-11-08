@@ -81,7 +81,7 @@ Successful GPU completion commits the history. Errors or cancellation during
 submission invalidate the context, which must then be discarded. Input errors
 before submission leave it usable. Recurrent states are exclusive and cannot
 be split into arbitrary cached prefixes. Recurrent snapshots, prefix caching,
-CUDA Graphs, packed batches and GPU sampling remain subsequent work; this engine does not declare W10 complete.
+packed batches and GPU sampling remain subsequent work; this engine does not declare W10 complete.
 
 This is a correctness baseline: prefill uses sequential DeltaNet recurrence,
 attention scans causal history, and selected-expert projections use direct FP32
@@ -94,6 +94,38 @@ acceptance focuses on native BF16; FP32 type regressions are numerical/lifecycle
 controls, not a performance comparison. The vocabulary head runs only for the last
 input position. Greedy selection reuses Qwen2's two-stage GPU argmax. Logits are still copied
 to the CPU for finite-value validation; token feedback waits for completion.
+
+## CUDA Graph decode
+
+Pass `--cuda-graph` to the example or benchmark, or call
+`Qwen3_5Engine::with_cuda_graphs()` before using the model in a Runner.
+The default remains eager. Pooled single-token decode uses a captured graph;
+initial prefill, multi-token appends and standalone `step_with_logits` remain eager.
+A one-token continuation can use the graph even when produced by Runner prefill
+chunking.
+BF16 storage, FP32 recurrent state/reductions, host feedback and full-logit
+finite validation are identical in both benchmark modes.
+
+Each replay uploads the token, logical position, table-row offset and current
+convolution/recurrent addresses. Capture owns only model weights, KV backing
+storage and a scratch workspace; it does not pin a session or its row/slot lease.
+The actual pending execution view validates write authority and retains the
+current session buffers until completion. Dynamic state addresses carry a host-checked
+16-byte alignment assumption, preserving eager pointer specialization and numerical
+behavior. Private state and KV storage warm
+kernels before capture so warmup cannot mutate a live request. Capture/JIT and
+fresh-state initialization remain cold-path costs.
+
+Up to four idle/busy graph instances are cached per model, keyed by KV table
+storage identity. An instance stays unavailable while a submission or escaped
+output owns it. Busy instances use independent staging/output/scratch storage;
+uncached overflow instances expire after use. `cuda_graph_metrics()` reports
+captures, replays and cached instances. A cached graph retains one workspace,
+which appears in `workspace_metrics().in_use_workspaces` even between requests.
+
+The benchmark rejects capture or scratch allocations in warmed samples. NVTX
+`qwen3_5.decode.graph_replay` marks host replay submission; layer ranges execute
+at capture time. Use Nsight `--cuda-graph-trace=node` to inspect replayed kernels.
 
 ## Memory
 
@@ -157,6 +189,14 @@ and input/capacity validation. The `pooled_state_and_runner_match_standalone`
 test checks interleaved slot mappings, chunk/decode token parity, invalid peers,
 capacity recovery, persistent-session continuation, repeated stateless requests
 and rejection of prefix caching.
+`decode_graph_matches_eager_logits_across_sessions` compares complete logits on
+common histories with alternating rows, fragmented slots and fresh recurrent
+allocations; it also checks that capture is reused after session release.
+`graph_pooled_state_and_runner_match_standalone` repeats the pooled/Runner
+regression with graphs enabled. `graph_state_kernels_match_eager_real_geometry` checks BF16 convolution/recurrence
+outputs and FP32 recurrent state with the actual model dimensions, including the
+metadata-pointer alignment assumption. A separate Gate test holds two replay submissions
+and an escaped output to verify exclusive graph/staging/output reuse.
 A separate GPU test checks tied router indices and selected-score normalization. Config tests reject unsupported models and FP8.
 
 See [validation results](qwen3_5_validation.md) for measured errors, exact chunking results,

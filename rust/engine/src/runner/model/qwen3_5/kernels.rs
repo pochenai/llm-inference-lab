@@ -43,7 +43,7 @@ mod ops {
     }
 
     unsafe fn store_f32<const M: i32, const N: i32>(
-        out: *mut f32,
+        out: PointerTile<*mut f32, { [] }>,
         value: Tile<f32, { [M, N] }>,
         row: i32,
         column: i32,
@@ -57,7 +57,7 @@ mod ops {
             + (columns + column.broadcast(shape![N]))
                 .reshape(shape![1, N])
                 .broadcast(shape![M, N]);
-        let base = pointer_to_tile(out);
+        let base = out;
         let base = base.reshape(shape![1, 1]);
         let base = base.broadcast(shape![M, N]);
         let destination = base.offset_tile(offsets);
@@ -108,11 +108,209 @@ mod ops {
         out.store(result);
     }
 
-    /// Keep the previous three raw projections; convolution precedes SiLU.
+    fn graph_word(metadata: &Tensor<u64, { [-1] }>, index: i32) -> i32 {
+        let value: Tile<i32, { [1] }> = trunci(
+            metadata.partition(shape![1]).load([index]),
+            overflow::NoUnsignedWrap,
+        );
+        tile_to_scalar(value.reshape(shape![]))
+    }
+
     #[cutile::entry()]
     pub(super) unsafe fn conv<T: ElementType, const C: i32>(
         out: *mut T,
         state: *mut T,
+        x: &Tensor<T, { [-1, C] }>,
+        weight: &Tensor<T, { [CONV_KERNEL_SIZE, C] }>,
+    ) {
+        conv_impl::<T, C>(out, pointer_to_tile(state), x, weight);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn conv_graph<T: ElementType, const C: i32>(
+        out: *mut T,
+        metadata: &Tensor<u64, { [-1] }>,
+        index: i32,
+        x: &Tensor<T, { [-1, C] }>,
+        weight: &Tensor<T, { [CONV_KERNEL_SIZE, C] }>,
+    ) {
+        let address = metadata
+            .partition(shape![1])
+            .load([2 + index * 2])
+            .reshape(shape![]);
+        // Match eager pointer specialization; the host validates allocated state alignment.
+        let address = assume_div_by::<_, 16>(address);
+        let state: PointerTile<*mut T, { [] }> = int_to_ptr(address);
+        conv_impl::<T, C>(out, state, x, weight);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn delta<
+        T: ElementType,
+        const KH: i32,
+        const VH: i32,
+        const K: i32,
+        const V: i32,
+    >(
+        out: *mut T,
+        state: *mut f32,
+        qkv: &Tensor<T, { [-1, -1] }>,
+        a: &Tensor<T, { [-1, VH] }>,
+        b: &Tensor<T, { [-1, VH] }>,
+        a_log: &Tensor<f32, { [VH] }>,
+        dt: &Tensor<f32, { [VH] }>,
+    ) {
+        delta_impl::<T, KH, VH, K, V>(out, pointer_to_tile(state), qkv, a, b, a_log, dt);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn delta_graph<
+        T: ElementType,
+        const KH: i32,
+        const VH: i32,
+        const K: i32,
+        const V: i32,
+    >(
+        out: *mut T,
+        metadata: &Tensor<u64, { [-1] }>,
+        index: i32,
+        qkv: &Tensor<T, { [-1, -1] }>,
+        a: &Tensor<T, { [-1, VH] }>,
+        b: &Tensor<T, { [-1, VH] }>,
+        a_log: &Tensor<f32, { [VH] }>,
+        dt: &Tensor<f32, { [VH] }>,
+    ) {
+        let address = metadata
+            .partition(shape![1])
+            .load([3 + index * 2])
+            .reshape(shape![]);
+        // Match eager pointer specialization; the host validates allocated state alignment.
+        let address = assume_div_by::<_, 16>(address);
+        let state: PointerTile<*mut f32, { [] }> = int_to_ptr(address);
+        delta_impl::<T, KH, VH, K, V>(out, state, qkv, a, b, a_log, dt);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn qk<T: ElementType, const D: i32, const R: i32, const GATED: bool>(
+        out: *mut T,
+        x: &Tensor<T, { [-1, -1] }>,
+        w: &Tensor<f32, { [D] }>,
+        frequencies: &Tensor<f32, { [R] }>,
+        eps: f32,
+        position: i32,
+        heads: i32,
+        destination: i32,
+    ) {
+        qk_impl::<T, D, R, GATED>(out, x, w, frequencies, eps, position, heads, destination);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn qk_graph<T: ElementType, const D: i32, const R: i32, const GATED: bool>(
+        out: *mut T,
+        x: &Tensor<T, { [-1, -1] }>,
+        w: &Tensor<f32, { [D] }>,
+        frequencies: &Tensor<f32, { [R] }>,
+        eps: f32,
+        metadata: &Tensor<u64, { [-1] }>,
+        heads: i32,
+    ) {
+        qk_impl::<T, D, R, GATED>(
+            out,
+            x,
+            w,
+            frequencies,
+            eps,
+            graph_word(metadata, 0),
+            heads,
+            0,
+        );
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn gqa_attention<
+        T: ElementType,
+        const D: i32,
+        const QH: i32,
+        const KVH: i32,
+        const POOLED: bool,
+    >(
+        out: &mut Tensor<T, { [1, D] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        gate: &Tensor<T, { [-1, -1] }>,
+        start: i32,
+        table: *const i32,
+        offset: i32,
+    ) {
+        gqa_attention_impl::<T, D, QH, KVH, POOLED>(out, q, k, v, gate, start, table, offset);
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn gqa_graph<T: ElementType, const D: i32, const QH: i32, const KVH: i32>(
+        out: &mut Tensor<T, { [1, D] }>,
+        q: &Tensor<T, { [-1, -1] }>,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        gate: &Tensor<T, { [-1, -1] }>,
+        metadata: &Tensor<u64, { [-1] }>,
+        table: *const i32,
+    ) {
+        gqa_attention_impl::<T, D, QH, KVH, true>(
+            out,
+            q,
+            k,
+            v,
+            gate,
+            graph_word(metadata, 0),
+            table,
+            graph_word(metadata, 1),
+        );
+    }
+
+    #[cutile::entry()]
+    pub(super) unsafe fn cache_decode<T: ElementType, const D: i32>(
+        out_k: *mut T,
+        out_v: *mut T,
+        k: &Tensor<T, { [-1, -1] }>,
+        v: &Tensor<T, { [-1, -1] }>,
+        table: &Tensor<i32, { [-1, -1] }>,
+        metadata: &Tensor<u64, { [-1] }>,
+    ) {
+        let offset = graph_word(metadata, 1) + graph_word(metadata, 0);
+        let base = pointer_to_tile(table.as_ptr());
+        let base = base.offset(offset);
+        let (slot, _token): (Tile<i32, { [] }>, Token) = load_ptr_tko(
+            base,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<1>,
+        );
+        let slot: i32 = tile_to_scalar(slot);
+        let head = program_id(1);
+        store_values::<T, 1, D>(
+            out_k,
+            k.partition(shape![1, D]).load([0, head]),
+            slot,
+            head * D,
+            k.shape()[1],
+        );
+        store_values::<T, 1, D>(
+            out_v,
+            v.partition(shape![1, D]).load([0, head]),
+            slot,
+            head * D,
+            v.shape()[1],
+        );
+    }
+
+    /// Keep the previous three raw projections; convolution precedes SiLU.
+    unsafe fn conv_impl<T: ElementType, const C: i32>(
+        out: *mut T,
+        state: PointerTile<*mut T, { [] }>,
         x: &Tensor<T, { [-1, C] }>,
         weight: &Tensor<T, { [CONV_KERNEL_SIZE, C] }>,
     ) {
@@ -122,7 +320,7 @@ mod ops {
             constant(0.0f32, shape![1, POINTWISE_COLUMNS]);
         let block = program_id(1);
         let channels: Tile<i32, { [POINTWISE_COLUMNS] }> = iota(shape![POINTWISE_COLUMNS]);
-        let base = pointer_to_tile(state);
+        let base = state;
         let base = base.reshape(shape![1]);
         let base = base.broadcast(shape![POINTWISE_COLUMNS]);
         let offsets = channels + (block * POINTWISE_COLUMNS).broadcast(shape![POINTWISE_COLUMNS]);
@@ -229,7 +427,7 @@ mod ops {
         )
         .reshape(shape![CONV_STATE_TILE_ROWS, 1])
         .broadcast(shape![CONV_STATE_TILE_ROWS, POINTWISE_COLUMNS]);
-        let destination = pointer_to_tile(state);
+        let destination = state;
         let destination = destination.reshape(shape![1, 1]);
         let destination = destination.broadcast(shape![CONV_STATE_TILE_ROWS, POINTWISE_COLUMNS]);
         let destination = destination.offset_tile(offsets);
@@ -261,8 +459,7 @@ mod ops {
 
     /// One head/value tile owns its FP32 recurrent state across the token loop.
     /// shortcut: sequential recurrence for prefill, add chunk GDN after the correctness baseline.
-    #[cutile::entry()]
-    pub(super) unsafe fn delta<
+    unsafe fn delta_impl<
         T: ElementType,
         const KH: i32,
         const VH: i32,
@@ -270,7 +467,7 @@ mod ops {
         const V: i32,
     >(
         out: *mut T,
-        state: *mut f32,
+        state: PointerTile<*mut f32, { [] }>,
         qkv: &Tensor<T, { [-1, -1] }>,
         a: &Tensor<T, { [-1, VH] }>,
         b: &Tensor<T, { [-1, VH] }>,
@@ -292,7 +489,7 @@ mod ops {
             + (values + (column * DELTA_VALUE_COLUMNS).broadcast(shape![DELTA_VALUE_COLUMNS]))
                 .reshape(shape![1, DELTA_VALUE_COLUMNS])
                 .broadcast(shape![K, DELTA_VALUE_COLUMNS]);
-        let base = pointer_to_tile(state);
+        let base = state;
         let base = base.reshape(shape![1, 1]);
         let base = base.broadcast(shape![K, DELTA_VALUE_COLUMNS]);
         let source = base.offset_tile(offsets);
@@ -420,8 +617,7 @@ mod ops {
     }
 
     /// Text positions share all three mRoPE axes, reducing to partial split-half RoPE.
-    #[cutile::entry()]
-    pub(super) unsafe fn qk<T: ElementType, const D: i32, const R: i32, const GATED: bool>(
+    unsafe fn qk_impl<T: ElementType, const D: i32, const R: i32, const GATED: bool>(
         out: *mut T,
         x: &Tensor<T, { [-1, -1] }>,
         w: &Tensor<f32, { [D] }>,
@@ -535,8 +731,7 @@ mod ops {
         store_values::<T, 1, D>(out, value, start + p.0, p.1 * D, x.shape()[1]);
     }
 
-    #[cutile::entry()]
-    pub(super) unsafe fn gqa_attention<
+    unsafe fn gqa_attention_impl<
         T: ElementType,
         const D: i32,
         const QH: i32,

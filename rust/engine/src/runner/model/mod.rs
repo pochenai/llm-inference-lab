@@ -12,9 +12,10 @@ pub use error::ModelError;
 pub use output::{GpuTokenPredictionHandle, ModelTokens, NextToken};
 pub use qwen2::{CudaGraphMetrics, Qwen2Config, Qwen2Engine, WorkspaceMetrics};
 pub use qwen3_5::{
-    Qwen3_5Config, Qwen3_5Context, Qwen3_5Dtype, Qwen3_5Engine, Qwen3_5ExecutionView,
-    Qwen3_5HiddenAct, Qwen3_5LayerType, Qwen3_5ModelType, Qwen3_5PrefixState, Qwen3_5RopeType,
-    Qwen3_5SessionState, Qwen3_5StatePool, Qwen3_5TextConfig, Qwen3_5WorkspaceMetrics,
+    Qwen3_5Config, Qwen3_5Context, Qwen3_5CudaGraphMetrics, Qwen3_5Dtype, Qwen3_5Engine,
+    Qwen3_5ExecutionView, Qwen3_5HiddenAct, Qwen3_5LayerType, Qwen3_5ModelType, Qwen3_5PrefixState,
+    Qwen3_5RopeType, Qwen3_5SessionState, Qwen3_5StatePool, Qwen3_5TextConfig,
+    Qwen3_5WorkspaceMetrics,
 };
 pub use simple_mlp::{SimpleMLPConfig, SimpleMLPEngine, INPUT_DIM};
 pub use submission::SubmittedGpuWorkWithCompletion;

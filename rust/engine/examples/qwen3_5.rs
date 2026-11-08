@@ -32,6 +32,9 @@ struct Args {
     /// Repeat independent requests to check state release and output equality.
     #[arg(long, default_value = "1")]
     repeat: NonZeroUsize,
+    /// Replay single-token pooled decode with CUDA Graphs.
+    #[arg(long)]
+    cuda_graph: bool,
     /// Write standalone first-step FP32 logits before running the Runner example.
     #[arg(long)]
     logits: Option<PathBuf>,
@@ -43,6 +46,11 @@ async fn main() -> Result<()> {
     let policy = cuda_async::device_context::global_policy(0)?;
     let started = Instant::now();
     let model = Qwen3_5Engine::<cutile::core::bf16>::load(&args.model_dir, &policy).await?;
+    let model = if args.cuda_graph {
+        model.with_cuda_graphs()
+    } else {
+        model
+    };
     eprintln!(
         "Loaded {} weight bytes in {:.2}s",
         model.weight_bytes(),
