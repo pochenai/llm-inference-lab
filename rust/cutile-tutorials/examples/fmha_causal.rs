@@ -1,5 +1,5 @@
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{randn, zeros};
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Tensor, ToHostVec};
@@ -166,7 +166,7 @@ fn causal_fmha_reference(
 }
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
 
     let (batch, heads, seq_len, head_dim) = (2usize, 4usize, 128usize, 64usize);

@@ -30,7 +30,13 @@ mod saxpy_module {
 use saxpy_module::saxpy;
 
 async fn execute<
-    T: DType + ElementType + Display + PartialEq + Mul<Output = T> + Add<Output = T>,
+    T: DType
+        + cuda_core::DeviceCopy
+        + ElementType
+        + Display
+        + PartialEq
+        + Mul<Output = T>
+        + Add<Output = T>,
 >(
     size: usize,
 ) -> Result<(), Error> {

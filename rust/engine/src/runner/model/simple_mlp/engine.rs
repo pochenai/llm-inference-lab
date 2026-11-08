@@ -656,7 +656,7 @@ impl SimpleMLPEngine {
         // a missing instance here on a dedicated stream, before scheduling replay.
         let lease = graphs.acquire(key.clone(), || {
             let capture_stream = exec
-                .device()
+                .context()
                 .new_stream()
                 .map_err(cuda_async::error::DeviceError::from)?;
             let input =

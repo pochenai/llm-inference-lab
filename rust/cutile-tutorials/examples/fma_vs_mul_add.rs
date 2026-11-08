@@ -59,7 +59,7 @@
 mod support;
 
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{linspace, zeros};
 use cutile::error::{tensor_error, Error};
 use cutile::tensor::{IntoPartition, Reshape, Tensor, ToHostVec};
@@ -157,7 +157,7 @@ mod arithmetic {
 fn main() -> Result<(), Error> {
     let args = Args::parse();
     assert!(args.chains == 1 || args.chains == 4);
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
     let input: Tensor<f32> = linspace(-0.9, 0.9, args.n).sync_on(&stream)?;
     let x = input.reshape(&[args.n, 1])?;

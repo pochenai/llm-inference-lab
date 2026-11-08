@@ -7,6 +7,12 @@ MLP run in f32. The toy backend rounds/clamps its scalar output into token IDs
 0..255; it exercises autoregressive history/KV management without a vocabulary head.
 Qwen2.5 provides the real language-model baseline. Only greedy generation is supported.
 
+The Rust workspace uses cuTile, cuda-core, and cuda-async 0.5.0 together.
+`cuda_core::Context` owns CUDA resources and creates streams; `Device` identifies
+physical hardware. Foreign workspace/upload allocations return their backing
+tensor's actual context. CUDA 13.2 remains sufficient for the existing kernels;
+0.5's preview tile libraries require CUDA 13.5 and are not used here.
+
 Run from the repository root:
 
 ```bash
@@ -617,8 +623,10 @@ RunnerBuilder::with_overlap(false), or Qwen --disable-overlap, provides a serial
 baseline: next_tokens returns CPU IDs, accepted in the same iteration without
 pending completion records. Only the overlap path retains pending results; the
 setting selects the path without inspecting prediction variants. Host-only
-SimpleMLP examples disable overlap explicitly. Cancellation uses cuda-async's existing drain-on-drop safety, which can
-block the host while in-flight GPU work finishes.
+SimpleMLP examples disable overlap explicitly. With cuda-async 0.5, cancelling
+a pending submission returns without draining its stream. Its retained owners
+are reclaimed asynchronously after GPU completion; cancellation does not make
+those buffers immediately reusable.
 
 The shared model/readback module provides GpuTokenReadback: an independent D2H
 stream, reusable pinned cache and deferred GPU token handles. The common submission

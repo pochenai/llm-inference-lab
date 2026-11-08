@@ -11,7 +11,7 @@ From this directory:
 cargo run --example hello_world
 ```
 
-The workspace uses cuTile 0.4.0 from Cargo's registry. A compatible CUDA Toolkit, `tileiras`,
+The workspace uses cuTile 0.5.0 from Cargo's registry. A compatible CUDA Toolkit, `tileiras`,
 NVIDIA driver, and CUDA GPU are required to compile and run kernels.
 
 ## Polynomial evaluation

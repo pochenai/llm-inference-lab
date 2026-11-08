@@ -802,7 +802,7 @@ impl<M: CausalModel<P> + 'static, P: KVPool + 'static> ModelRunner<M, P> {
             let policy = match &compute_policy {
                 Some(policy) => Ok(policy.clone()),
                 None => self.policy.next_stream().and_then(|stream| {
-                    SingleStream::new(stream.device()).map(|policy| {
+                    SingleStream::new(stream.context()).map(|policy| {
                         let policy: Policy = Arc::new(policy);
                         compute_policy = Some(policy.clone());
                         policy

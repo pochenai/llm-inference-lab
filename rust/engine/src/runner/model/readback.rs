@@ -10,7 +10,7 @@ use cuda_async::{
     scheduling_policies::{SchedulingPolicy, SingleStream},
 };
 use cutile::{
-    cuda_core::{memcpy_dtoh_async, CudaContext, DType, Device, DeviceCopy, PinnedHostBuffer},
+    cuda_core::{memcpy_dtoh_async, Context, DType, DeviceCopy, PinnedHostBuffer},
     tensor::Tensor,
 };
 
@@ -43,7 +43,7 @@ pub(super) struct GpuTokenReadback {
 }
 
 impl GpuTokenReadback {
-    pub(super) fn new(device: &Arc<Device>, duration: Histogram) -> Result<Self, DeviceError> {
+    pub(super) fn new(device: &Arc<Context>, duration: Histogram) -> Result<Self, DeviceError> {
         Ok(Self {
             cache: Arc::default(),
             policy: Arc::new(SingleStream::new(device)?),
@@ -123,10 +123,7 @@ impl<T: DeviceCopy + DType> ReadbackCache<T> {
             }) {
                 buffer
             } else {
-                let buffer = Arc::new(PinnedHostBuffer::zeroed(
-                    &CudaContext::new(exec.get_device_id())?,
-                    count,
-                )?);
+                let buffer = Arc::new(PinnedHostBuffer::zeroed(exec.context(), count)?);
                 // This limit counts cached entries, including idle buffers, not active users.
                 if idle.len() < MAX_CACHED_READBACKS {
                     // cache it

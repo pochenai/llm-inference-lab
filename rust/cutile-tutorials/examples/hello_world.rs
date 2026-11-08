@@ -4,6 +4,7 @@
 /// grid 划分的是执行单元（Tile Block 的数量与维度）; 具体每个tile block有多少threads由编译器决定
 /// program_id 是连接执行单元与数据切片的桥梁;
 /// 数据怎么切、加载哪一部分、甚至是重复加载，完全由你在 Kernel 函数里写的内存读取代码（如 load_tile）说了算
+use cuda_core::Context;
 use cutile::error::Error;
 use cutile::prelude::*;
 
@@ -35,7 +36,7 @@ mod hello_world_module {
 use hello_world_module::hello_world_kernel;
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
     let launcher = hello_world_kernel();
     launcher.grid((2, 2, 1)).sync_on(&stream)?;

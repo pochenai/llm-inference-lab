@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{ones, zeros};
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Tensor, ToHostVec};
@@ -26,7 +26,7 @@ mod vec_add_module {
 use vec_add_module::add;
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
 
     let x: Tensor<f32> = ones(&[32, 32]).sync_on(&stream)?.into();

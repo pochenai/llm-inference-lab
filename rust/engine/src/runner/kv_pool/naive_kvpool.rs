@@ -11,6 +11,7 @@ use cuda_async::{
 use cutile::{
     api,
     core::ElementType,
+    cuda_core::DeviceCopy,
     tensor::{Tensor, TensorView},
     tile_kernel::TileKernel,
     DType,
@@ -142,7 +143,7 @@ impl NaiveMappingPlan {
     }
 }
 
-impl<T: DType + ElementType> KVContext<NaiveKVPool<T>> {
+impl<T: DType + DeviceCopy + ElementType> KVContext<NaiveKVPool<T>> {
     /// Naive-only deferred reservation for packing mapping and model uploads.
     /// Submit the plan before K/V access; commit only after successful GPU completion.
     pub(in crate::runner) fn reserve_append_batch(
@@ -330,7 +331,7 @@ impl<T: DType> NaiveWriteView<'_, T> {
     }
 }
 
-impl<T: DType + ElementType> NaiveKVPool<T> {
+impl<T: DType + DeviceCopy + ElementType> NaiveKVPool<T> {
     /// Allocate backing buffers once; requests subsequently reserve rows and slots.
     pub async fn new(
         config: NaiveKVPoolConfig,
@@ -503,7 +504,7 @@ impl<T: DType + ElementType> NaiveKVPool<T> {
     }
 }
 
-impl<T: DType + ElementType> KVPool for NaiveKVPool<T> {
+impl<T: DType + DeviceCopy + ElementType> KVPool for NaiveKVPool<T> {
     type Element = T;
     type ContextState = NaiveContextState;
     type PrefixState = NaivePrefixState;

@@ -11,7 +11,7 @@ use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
 use cutile::{
     core::{bf16, ElementType},
-    cuda_core::Device,
+    cuda_core::Context,
 };
 use engine::runner::loader::WeightElement;
 use engine::runner::{
@@ -107,7 +107,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let max_new = max_new_tokens.get();
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let load_start = Instant::now();
     let model = Qwen2Engine::<T>::load(&model_dir, &policy).await?;

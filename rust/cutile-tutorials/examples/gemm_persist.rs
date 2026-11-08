@@ -1,5 +1,5 @@
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{full, zeros};
 use cutile::bench::{do_bench, BenchOptions};
 use cutile::error::Error;
@@ -52,7 +52,7 @@ mod persistent_module {
 use persistent_module::gemm_persistent;
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
 
     let d = 2048;

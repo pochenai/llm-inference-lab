@@ -118,6 +118,9 @@ unsafe impl DeviceAllocation for BufferOwner {
         self.tensor.num_bytes()
     }
 
+    fn context(&self) -> Arc<cutile::cuda_core::Context> {
+        self.tensor.context().clone()
+    }
     fn device_id(&self) -> usize {
         self.tensor.device_id()
     }

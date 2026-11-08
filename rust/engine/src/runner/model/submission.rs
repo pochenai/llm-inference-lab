@@ -98,7 +98,7 @@ pub(super) mod tests {
         model::{CausalModel, ModelInput, SimpleMLPEngine},
     };
     use cuda_async::scheduling_policies::SingleStream;
-    use cutile::cuda_core::{Device, Stream};
+    use cutile::cuda_core::{Context, Stream};
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -122,15 +122,13 @@ pub(super) mod tests {
             let done = completed.clone();
             let failed = expired.clone();
             // Callback only waits/signals CPU state; it never calls CUDA APIs.
-            unsafe {
-                stream.launch_host_function(move || {
-                    if wait.recv_timeout(Duration::from_secs(10)).is_ok() {
-                        done.store(true, Ordering::Release);
-                    } else {
-                        failed.store(true, Ordering::Release);
-                    }
-                })?;
-            }
+            stream.launch_host_function(move || {
+                if wait.recv_timeout(Duration::from_secs(10)).is_ok() {
+                    done.store(true, Ordering::Release);
+                } else {
+                    failed.store(true, Ordering::Release);
+                }
+            })?;
             Ok(Self {
                 release,
                 completed,
@@ -156,14 +154,18 @@ pub(super) mod tests {
     }
 
     /// Fail if a retained owner is destroyed before its queued GPU work completes.
-    struct AssertGpuCompletedBeforeOwnerDrop(Arc<AtomicBool>);
+    struct AssertGpuCompletedBeforeOwnerDrop {
+        gpu_done: Arc<AtomicBool>,
+        released: mpsc::Sender<()>,
+    }
 
     impl Drop for AssertGpuCompletedBeforeOwnerDrop {
         fn drop(&mut self) {
             assert!(
-                self.0.load(Ordering::Acquire),
+                self.gpu_done.load(Ordering::Acquire),
                 "owner released before GPU work completed"
             );
+            let _ = self.released.send(());
         }
     }
 
@@ -172,7 +174,7 @@ pub(super) mod tests {
     ) -> anyhow::Result<()> {
         use crate::runner::kv_pool::{NaiveKVPool, NaiveKVPoolConfig};
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let pool = NaiveKVPool::new(
             NaiveKVPoolConfig {
@@ -240,7 +242,7 @@ pub(super) mod tests {
     async fn owned_handoff_and_completion_do_not_wait_for_the_next_submission() -> anyhow::Result<()>
     {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let stream = policy.next_stream()?;
         // Initialize the library's completion machinery before blocking the stream.
@@ -284,7 +286,7 @@ pub(super) mod tests {
         assert_eq!(Arc::strong_count(&first_owner), 1);
         assert_eq!(Arc::strong_count(&second_owner), 2);
         second_gate.assert_held();
-        assert!(!unsafe { stream.query()? });
+        assert!(!stream.query()?);
         drop(second_gate);
         completions[1].clone().await?;
         assert!(!second_expired.load(Ordering::Acquire));
@@ -296,7 +298,7 @@ pub(super) mod tests {
     async fn partial_submission_and_cancelled_completion_keep_owners_until_safe(
     ) -> anyhow::Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let owner = Arc::new(());
         let retained = owner.clone();
@@ -316,19 +318,21 @@ pub(super) mod tests {
         let gate = Gate::arm(&stream)?;
         let expired = gate.expired.clone();
         let gpu_done = Arc::new(AtomicBool::new(false));
-        let checked_owner = Arc::new(AssertGpuCompletedBeforeOwnerDrop(gpu_done.clone()));
+        let (released, released_rx) = mpsc::channel();
+        let checked_owner = Arc::new(AssertGpuCompletedBeforeOwnerDrop {
+            gpu_done: gpu_done.clone(),
+            released,
+        });
         let weak_owner = Arc::downgrade(&checked_owner);
         let done = gpu_done.clone();
         cancelled = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
             exec.retain(checked_owner).unwrap();
             // This queued callback models work that still uses the retained owner.
-            unsafe {
-                exec.get_cuda_stream()
-                    .launch_host_function(move || {
-                        done.store(true, Ordering::Release);
-                    })
-                    .unwrap();
-            }
+            exec.get_cuda_stream()
+                .launch_host_function(move || {
+                    done.store(true, Ordering::Release);
+                })
+                .unwrap();
         })
         .await?;
         gate.assert_held();
@@ -348,13 +352,8 @@ pub(super) mod tests {
             finished.send(()).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(2))?;
-        // Give drop a chance to run while the test still owns the closed gate.
-        // Both a blocking drain and safe deferred cleanup must keep the owner alive.
-        if let Err(mpsc::RecvTimeoutError::Disconnected) =
-            finished_rx.recv_timeout(Duration::from_millis(50))
-        {
-            panic!("cancellation panicked before the GPU gate was released");
-        }
+        // cuda-async 0.5 defers in-flight reclamation instead of draining on drop.
+        finished_rx.recv_timeout(Duration::from_secs(2))?;
         gate.assert_held();
         assert!(
             weak_owner.upgrade().is_some(),
@@ -364,6 +363,7 @@ pub(super) mod tests {
         canceller
             .join()
             .expect("cancellation must not release owners early");
+        released_rx.recv_timeout(Duration::from_secs(2))?;
         assert!(!expired.load(Ordering::Acquire), "GPU gate expired");
         assert!(gpu_done.load(Ordering::Acquire));
         assert!(weak_owner.upgrade().is_none());

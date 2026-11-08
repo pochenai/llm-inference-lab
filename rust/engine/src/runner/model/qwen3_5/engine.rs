@@ -53,6 +53,7 @@ use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
     core::{bf16, ElementType},
+    cuda_core::DeviceCopy,
     tensor::{PartitionMut, Reshape, Tensor},
     tile_kernel::TileKernel,
     DType,
@@ -667,7 +668,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
     }
 }
 
-unsafe fn normalize<T: DType>(
+unsafe fn normalize<T: DType + DeviceCopy>(
     x: &Tensor<T>,
     w: Norm,
     eps: f32,
@@ -682,21 +683,21 @@ unsafe fn normalize<T: DType>(
         .execute(exec)?;
     Ok(out)
 }
-unsafe fn linear<T: DType>(
+unsafe fn linear<T: DType + DeviceCopy>(
     x: &Tensor<T>,
     w: Weight<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<T>> {
     project(x, w, exec)
 }
-unsafe fn linear_f32<T: DType>(
+unsafe fn linear_f32<T: DType + DeviceCopy>(
     x: &Tensor<T>,
     w: Weight<T>,
     exec: &ExecutionContext,
 ) -> Result<Tensor<f32>> {
     project(x, w, exec)
 }
-unsafe fn project<T: DType, O: DType>(
+unsafe fn project<T: DType + DeviceCopy, O: DType + DeviceCopy>(
     x: &Tensor<T>,
     w: Weight<T>,
     exec: &ExecutionContext,
@@ -721,7 +722,7 @@ unsafe fn project<T: DType, O: DType>(
     .execute(exec)?;
     Ok(out)
 }
-unsafe fn add<T: DType>(
+unsafe fn add<T: DType + DeviceCopy>(
     a: &Tensor<T>,
     b: &Tensor<T>,
     exec: &ExecutionContext,

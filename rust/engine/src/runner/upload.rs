@@ -7,7 +7,7 @@ use cuda_async::{
 };
 use cutile::{
     api,
-    cuda_core::{memcpy_htod_async, DType},
+    cuda_core::{memcpy_htod_async, DType, DeviceCopy},
     tensor::Tensor,
 };
 
@@ -20,7 +20,7 @@ pub(super) struct UploadPool<T: DType = i32> {
     host_idle: Mutex<Vec<Arc<Vec<T>>>>,
 }
 
-impl<T: DType> UploadPool<T> {
+impl<T: DType + DeviceCopy> UploadPool<T> {
     /// Pack values directly into reusable owned staging, without a temporary Vec.
     /// Only cache-exclusive buffers can be refilled; exec retains the source through
     /// completion. Cache hits reuse the Vec and its Arc, growing capacity as needed.
@@ -124,6 +124,9 @@ unsafe impl<T: DType> DeviceAllocation for UploadLease<T> {
     fn len_bytes(&self) -> usize {
         self.tensor.as_ref().unwrap().num_bytes()
     }
+    fn context(&self) -> Arc<cutile::cuda_core::Context> {
+        self.tensor.as_ref().unwrap().context().clone()
+    }
     fn device_id(&self) -> usize {
         self.tensor.as_ref().unwrap().device_id()
     }
@@ -208,6 +211,7 @@ mod tests {
                 value((|| -> Result<_, DeviceError> {
                     // SAFETY: upload/readback use one exec and outer completion is awaited.
                     let tensor = unsafe { pool.upload(Arc::new(data), &shape, exec)? };
+                    assert_eq!(tensor.context().cu_ctx(), exec.context().cu_ctx());
                     assert_eq!(
                         tensor.shape(),
                         shape.iter().map(|&n| n as i32).collect::<Vec<_>>()

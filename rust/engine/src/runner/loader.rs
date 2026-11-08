@@ -11,6 +11,7 @@ use cuda_async::{device_operation::DeviceOp, scheduling_policies::SchedulingPoli
 use cutile::{
     api,
     core::{bf16, f16},
+    cuda_core::DeviceCopy,
     tensor::{Reshape, Tensor},
     DType,
 };
@@ -53,7 +54,7 @@ pub struct HostTensor<T = f32> {
 /// A supported destination type for floating-point Safetensors weights.
 ///
 /// This contract covers weight decoding and device storage, not kernel support.
-pub trait WeightElement: DType {
+pub trait WeightElement: DType + DeviceCopy {
     /// Decode little-endian F16, BF16, F32, or F64 data into this type.
     /// Narrowing conversions may round or overflow to infinity.
     fn decode_weights(dtype: Dtype, bytes: &[u8]) -> Result<Vec<Self>>;

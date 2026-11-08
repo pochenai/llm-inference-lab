@@ -32,7 +32,7 @@ use clap::{Parser, ValueEnum};
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
 use cutile::{
     core::{bf16, ElementType},
-    cuda_core::Device,
+    cuda_core::Context,
 };
 use engine::{
     runner::{
@@ -472,7 +472,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run<T: WeightElement + ElementType>(args: Args, snapshotter: Snapshotter) -> Result<()> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
     let model = Qwen2Engine::<T>::load(&args.model_dir, &policy).await?;
     let model = Arc::new(if args.cuda_graph {

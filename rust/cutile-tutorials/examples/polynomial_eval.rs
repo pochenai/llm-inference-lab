@@ -6,7 +6,7 @@
 mod support;
 
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{copy_host_vec_to_device, linspace, zeros};
 use cutile::bench::{do_bench_paired, BenchOptions};
 use cutile::error::Error;
@@ -94,7 +94,7 @@ use polynomial_module::{horner, horner_fma, naive};
 
 fn main() -> Result<(), Error> {
     let args = Args::parse_with_tile(DEFAULT_TILE);
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
     let x: Tensor<f32> = linspace(-1.0, 1.0, args.n).sync_on(&stream)?;
     let x = x.reshape(&[args.n, 1])?;

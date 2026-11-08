@@ -19,7 +19,7 @@ use std::{
 use anyhow::{ensure, Result};
 use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
-use cutile::cuda_core::Device;
+use cutile::cuda_core::Context;
 use engine::{
     runner::{
         kv_pool::{KVPool, NaiveKVPool, NaiveKVPoolConfig},
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         options.warmup > 0 && options.iterations > 0,
         "warmup and iterations must be positive"
     );
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     // SAFETY: load the installed CUDA driver and its documented no-argument profiler APIs.
     // Dynamic loading avoids requiring a link-time libcuda.so search path under WSL.
     let driver = unsafe { libloading::Library::new("libcuda.so.1")? };

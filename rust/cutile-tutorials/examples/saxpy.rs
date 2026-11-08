@@ -1,5 +1,5 @@
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::arange;
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Reshape, Tensor, ToHostVec};
@@ -21,7 +21,7 @@ mod saxpy_module {
 use saxpy_module::saxpy;
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
 
     let input: Tensor<f32> = arange(32).sync_on(&stream)?.into();

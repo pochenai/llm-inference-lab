@@ -5,7 +5,7 @@
 use cuda_async::cuda_graph::{CudaGraph, Scope};
 use cuda_async::error::DeviceError;
 use cuda_async::prelude::DeviceOp;
-use cuda_core::{Device, DriverError, IntoResult, Stream};
+use cuda_core::{Context, DriverError, IntoResult, Stream};
 use cutile::api::zeros;
 use cutile::error::{tensor_error, Error};
 use cutile::tensor::Tensor;
@@ -118,9 +118,8 @@ impl Args {
     /// Apply the worker-warp hint when supplied, so both compared kernels use the same settings.
     pub fn options(&self) -> CompileOptions {
         let options = CompileOptions::new()
-            .device_debug(false)
             .opt_level(3)
-            .lineinfo(true);
+            .debug_info(cutile::tile_kernel::DebugInfoLevel::Line);
         match self.warps {
             Some(warps) => options.num_worker_warps_per_cta(warps),
             None => options,
@@ -144,8 +143,8 @@ impl TimedGraph {
     where
         F: FnMut(&Scope) -> Result<(), DeviceError>,
     {
-        let start = TimingEvent::new(stream.device())?;
-        let end = TimingEvent::new(stream.device())?;
+        let start = TimingEvent::new(stream.context())?;
+        let end = TimingEvent::new(stream.context())?;
         let graph = CudaGraph::scope(stream, |scope| {
             start.record_external(stream)?;
             for _ in 0..batch {
@@ -174,11 +173,11 @@ impl TimedGraph {
 /// EXTERNAL forces real event nodes, which are required for elapsed-time queries.
 struct TimingEvent {
     handle: cuda_core::sys::CUevent,
-    device: Arc<Device>,
+    device: Arc<Context>,
 }
 impl TimingEvent {
     /// Bind the CUDA device and create an owned event with timestamp recording enabled.
-    fn new(device: &Arc<Device>) -> Result<Self, DriverError> {
+    fn new(device: &Arc<Context>) -> Result<Self, DriverError> {
         device.bind_to_thread()?;
         let mut handle = std::ptr::null_mut();
         unsafe {
@@ -250,7 +249,7 @@ pub fn paired_samples(
     reps: usize,
     cold: bool,
 ) -> Result<(Samples, Samples), Error> {
-    let flush_bytes = (stream.device().l2_cache_size_bytes()? * 2).clamp(64 << 20, 512 << 20);
+    let flush_bytes = (stream.context().l2_cache_size_bytes()? * 2).clamp(64 << 20, 512 << 20);
     let flush_buffer: Option<Tensor<u8>> = if cold {
         Some(zeros(&[flush_bytes]).sync_on(stream)?)
     } else {

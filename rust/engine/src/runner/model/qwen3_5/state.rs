@@ -9,6 +9,7 @@ use cuda_async::{
 use cutile::{
     api,
     core::{bf16, ElementType},
+    cuda_core::DeviceCopy,
     tensor::Tensor,
     tile_kernel::TileKernel,
     DType,
@@ -46,7 +47,7 @@ pub struct Qwen3_5Context<T: DType = bf16> {
     valid: bool,
 }
 
-impl<T: DType + ElementType> Qwen3_5Context<T> {
+impl<T: DType + DeviceCopy + ElementType> Qwen3_5Context<T> {
     pub fn ready_len(&self) -> usize {
         self.history.len()
     }
@@ -201,7 +202,7 @@ pub(super) struct AttentionView<T: DType> {
     pub pooled: bool,
 }
 
-impl<T: DType + ElementType> Qwen3_5ExecutionView<'_, T> {
+impl<T: DType + DeviceCopy + ElementType> Qwen3_5ExecutionView<'_, T> {
     pub(super) fn start_pos(&self) -> usize {
         self.positions.start
     }

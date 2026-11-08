@@ -11,7 +11,7 @@ use cuda_async::{
 };
 use cutile::{
     api,
-    cuda_core::{memcpy_htod_async, sys, Device, DriverError, Stream},
+    cuda_core::{memcpy_htod_async, sys, Context, DriverError, Stream},
     tensor::Tensor,
 };
 
@@ -110,7 +110,7 @@ impl GraphLease {
                 "graph payload shape or device differs".into(),
             ));
         }
-        exec.device()
+        exec.context()
             .bind_to_thread()
             .map_err(cuda_async::error::DeviceError::from)?;
         exec.retain(self.clone())?;
@@ -176,7 +176,7 @@ pub(super) fn allocate(
     rows: usize,
     stream: &Arc<Stream>,
 ) -> Result<(Buffers<Tensor<f32>>, Arc<MappedOutput>), ModelError> {
-    let output = MappedOutput::new(rows, stream.device().clone())?;
+    let output = MappedOutput::new(rows, stream.context().clone())?;
     // Wrap the existing allocation and shape for cuTile. from_foreign neither
     // allocates another GPU buffer nor copies data; DeviceAllocation supplies
     // the GPU-visible address used by the kernel's output argument.
@@ -208,7 +208,7 @@ pub(super) struct MappedOutput {
     /// Device-visible alias passed to kernels; the allocation remains in RAM.
     device_pointer: u64,
     len: usize,
-    device: Arc<Device>,
+    device: Arc<Context>,
 }
 // SAFETY: pointers stay valid on the retained context; the exclusive graph lease
 // prevents CPU/GPU or batch/batch overlap. No safe host slice is exposed.
@@ -222,12 +222,15 @@ unsafe impl DeviceAllocation for MappedOutput {
     fn len_bytes(&self) -> usize {
         self.len * std::mem::size_of::<f32>()
     }
+    fn context(&self) -> Arc<Context> {
+        self.device.clone()
+    }
     fn device_id(&self) -> usize {
         self.device.ordinal()
     }
 }
 impl MappedOutput {
-    fn new(len: usize, device: Arc<Device>) -> Result<Arc<Self>, ModelError> {
+    fn new(len: usize, device: Arc<Context>) -> Result<Arc<Self>, ModelError> {
         device
             .bind_to_thread()
             .map_err(cuda_async::error::DeviceError::from)?;

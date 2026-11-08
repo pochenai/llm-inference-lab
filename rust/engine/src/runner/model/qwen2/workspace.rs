@@ -347,7 +347,7 @@ fn element_counts(
 /// allocations may still race this snapshot, so allocation errors remain fallible.
 unsafe fn check_available(required: usize, exec: &ExecutionContext) -> Result<(), ModelError> {
     exec.get_cuda_stream()
-        .device()
+        .context()
         .bind_to_thread()
         .map_err(cuda_async::error::DeviceError::from)?;
     let (mut free, mut total) = (0, 0);
@@ -416,6 +416,9 @@ unsafe impl<T: DType, E: DType> DeviceAllocation for BufferOwner<T, E> {
     }
     fn len_bytes(&self) -> usize {
         self.len * size_of::<T>()
+    }
+    fn context(&self) -> Arc<cutile::cuda_core::Context> {
+        self.tensor.context().clone()
     }
     fn device_id(&self) -> usize {
         self.tensor.device_id()

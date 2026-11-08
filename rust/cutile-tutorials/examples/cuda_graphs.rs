@@ -4,7 +4,7 @@
 //! replay it repeatedly. Capture and warmup are excluded from the timing.
 
 use cuda_async::prelude::DeviceOp;
-use cuda_core::Device;
+use cuda_core::Context;
 use cutile::api::{full, zeros};
 use cutile::error::Error;
 use cutile::tensor::{IntoPartition, Tensor, ToHostVec};
@@ -36,7 +36,7 @@ mod kernels {
 use kernels::gemm;
 
 fn main() -> Result<(), Error> {
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     let stream = device.new_stream()?;
     let (m, n, k) = (512usize, 512usize, 512usize);
     let (bm, bn, bk) = (16usize, 16usize, 8usize);

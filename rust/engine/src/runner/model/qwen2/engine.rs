@@ -63,6 +63,7 @@ use cuda_async::{device_operation::*, scheduling_policies::SchedulingPolicy};
 use cutile::{
     api,
     core::ElementType,
+    cuda_core::DeviceCopy,
     tensor::{PartitionMut, Reshape, Tensor},
     tile_kernel::TileKernel,
     DType,
@@ -408,7 +409,8 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         // SAFETY: query a static device attribute; this neither submits nor synchronizes GPU work.
         unsafe {
             use cutile::cuda_core::{sys, IntoResult};
-            let device = cutile::cuda_core::Device::raw_device(embedding.device_id())
+            let device = cutile::cuda_core::Device::new(embedding.device_id())
+                .map(|device| device.cu_device())
                 .map_err(cuda_async::error::DeviceError::from)?;
             sys::cuDeviceGetAttribute(
                 &mut sm_count,
@@ -429,7 +431,7 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
         Ok(Self {
             graphs: None,
             token_readback: GpuTokenReadback::new(
-                policy.next_stream()?.device(),
+                policy.next_stream()?.context(),
                 instruments.readback_duration.clone(),
             )?,
             instruments,
@@ -616,14 +618,12 @@ impl<T: WeightElement + ElementType> Qwen2Engine<T> {
                     buffers.logits.into_shared_alias(),
                 )
             };
-            let host_context = cutile::cuda_core::CudaContext::new(cache.table.device_id())
-                .map_err(cuda_async::error::DeviceError::from)?;
+            let host_context = cache.table.context();
             let host_metadata =
-                cutile::cuda_core::PinnedHostBuffer::zeroed(&host_context, count * 4)
+                cutile::cuda_core::PinnedHostBuffer::zeroed(host_context, count * 4)
                     .map_err(cuda_async::error::DeviceError::from)?;
-            let host_sources =
-                cutile::cuda_core::PinnedHostBuffer::zeroed(&host_context, count * 2)
-                    .map_err(cuda_async::error::DeviceError::from)?;
+            let host_sources = cutile::cuda_core::PinnedHostBuffer::zeroed(host_context, count * 2)
+                .map_err(cuda_async::error::DeviceError::from)?;
             Ok(DecodeGraph {
                 host_metadata,
                 host_sources,
@@ -1878,7 +1878,7 @@ impl GqaAttention {
     }
 }
 
-impl<T: DType + ElementType> AttentionBackend<NaiveKVPool<T>> for GqaAttention {
+impl<T: DType + DeviceCopy + ElementType> AttentionBackend<NaiveKVPool<T>> for GqaAttention {
     fn forward(
         &self,
         q: Weight<T>,
@@ -2275,9 +2275,9 @@ unsafe fn add<T: DType>(
 mod tests {
     use super::*;
     use crate::runner::kv_pool::KVPool;
-    use anyhow::Context;
+    use anyhow::Context as _;
     use cuda_async::scheduling_policies::SingleStream;
-    use cutile::cuda_core::Device;
+    use cutile::cuda_core::Context;
     use cutile::tensor::{IntoPartition, Unpartition};
     use std::sync::Mutex;
 
@@ -2422,7 +2422,7 @@ mod tests {
                 Ok(Qwen2Engine {
                     graphs: None,
                     token_readback: GpuTokenReadback::new(
-                        exec.get_cuda_stream().device(),
+                        exec.get_cuda_stream().context(),
                         instruments.readback_duration.clone(),
                     )?,
                     instruments,
@@ -2587,7 +2587,7 @@ mod tests {
         use futures::poll;
         use std::sync::atomic::Ordering;
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let model = tiny_model(&policy).await?;
         let pool = NaiveKVPool::new(model.kv_pool_config(16)?, &policy).await?;
@@ -2959,7 +2959,7 @@ mod tests {
     async fn qwen_graph_retains_inflight_instances_behind_a_stream_gate() -> anyhow::Result<()> {
         use crate::runner::model::submission::tests::Gate;
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let single = SingleStream::new(&device)?;
         let stream = single.stream().clone();
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(single);
@@ -3217,9 +3217,7 @@ mod tests {
         check_split_kv_attention::<bf16>(bf16::from_f32, bf16::to_f32, 2e-3).await
     }
 
-    async fn check_split_kv_attention<
-        T: WeightElement + ElementType + cutile::cuda_core::DeviceCopy,
-    >(
+    async fn check_split_kv_attention<T: WeightElement + ElementType>(
         encode: fn(f32) -> T,
         decode: fn(T) -> f32,
         tolerance: f64,
@@ -3918,7 +3916,7 @@ mod tests {
     #[tokio::test]
     async fn u32_embedding_and_async_token_readback() -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
-        let device = Device::new(0).map_err(cuda_async::error::DeviceError::from)?;
+        let device = Context::new(0).map_err(cuda_async::error::DeviceError::from)?;
         let policy: Arc<dyn SchedulingPolicy> =
             Arc::new(SingleStream::new(&device).map_err(cuda_async::error::DeviceError::from)?);
         let uploads = Arc::new(UploadPool::<u32>::default());
@@ -4200,7 +4198,7 @@ mod tests {
     async fn queued_gpu_feedback_matches_serial_and_commits_fifo() -> Result<(), ModelError> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let device =
-            cutile::cuda_core::Device::new(0).map_err(cuda_async::error::DeviceError::from)?;
+            cutile::cuda_core::Context::new(0).map_err(cuda_async::error::DeviceError::from)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let model = Arc::new(tiny_model(&policy).await?);
         let mut config = model.kv_pool_config(32)?;
@@ -4371,7 +4369,7 @@ mod tests {
     async fn check_teacher_forced_logits<T: WeightElement + ElementType>() -> anyhow::Result<()> {
         let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
         let model_dir = std::env::var("QWEN2_MODEL_DIR")?;
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let mut model = Qwen2Engine::<T>::load(Path::new(&model_dir), &policy).await?;
         let sm_count = model.attention.sm_count;
@@ -4460,7 +4458,7 @@ mod tests {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        let device = Device::new(0)?;
+        let device = Context::new(0)?;
         let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(&device)?);
         let model = Qwen2Engine::<f32>::load(Path::new(&model_dir), &policy).await?;
         let mut runner_config = model.kv_pool_config(tokens.len() + expected_ids.len() + 1)?;

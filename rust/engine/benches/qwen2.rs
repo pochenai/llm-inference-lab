@@ -25,7 +25,7 @@ use clap::Parser;
 use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
 use cutile::{
     core::{bf16, ElementType},
-    cuda_core::Device,
+    cuda_core::Context,
 };
 use engine::runner::loader::WeightElement;
 use engine::{
@@ -105,7 +105,7 @@ async fn run<T: WeightElement + ElementType>(args: Args) -> Result<()> {
         })
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let device = Device::new(0)?;
+    let device = Context::new(0)?;
     // SAFETY: reuse the installed driver's profiler API, as in simple_mlp_attn.
     let driver = unsafe { libloading::Library::new("libcuda.so.1")? };
     let profiler_start =
