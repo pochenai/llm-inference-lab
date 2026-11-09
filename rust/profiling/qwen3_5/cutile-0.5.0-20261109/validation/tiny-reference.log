@@ -1,0 +1,19 @@
+   Compiling cuda-bindings v0.5.0
+   Compiling cuda-core v0.5.0
+   Compiling cutile-compiler v0.5.0
+   Compiling cuda-async v0.5.0
+   Compiling cutile-macro v0.5.0
+   Compiling cutile v0.5.0
+   Compiling engine v0.0.1 (/root/autodl-tmp/now/llm-inference-lab/rust/engine)
+    Finished `release` profile [optimized] target(s) in 55.12s
+     Running unittests src/lib.rs (rust/target/release/deps/engine-f8870ca35359a86c)
+
+running 3 tests
+test runner::model::qwen3_5::tests::pooled_state_and_runner_match_standalone ... ok
+test runner::model::qwen3_5::tests::fp32_pooled_state_and_runner_match_standalone has been running for over 60 seconds
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation has been running for over 60 seconds
+test runner::model::qwen3_5::tests::fp32_pooled_state_and_runner_match_standalone ... ok
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 128.78s
+

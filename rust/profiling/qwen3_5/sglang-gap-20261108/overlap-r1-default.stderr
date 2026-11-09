@@ -1,0 +1,53 @@
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+[2026-11-08 22:51:50 TP0] Init torch distributed begin.
+[2026-11-08 22:51:51 TP0] Init torch distributed ends. elapsed=0.38 s, mem usage=0.10 GB
+[2026-11-08 22:51:51 TP0] Ignore import error when loading sglang.srt.models.glm_ocr: No module named 'transformers.models.glm_ocr'
+[2026-11-08 22:51:51 TP0] Ignore import error when loading sglang.srt.models.glm_ocr_nextn: No module named 'transformers.models.glm_ocr'
+[2026-11-08 22:51:51 TP0] Ignore import error when loading sglang.srt.models.glmasr: cannot import name 'GlmAsrConfig' from 'transformers' (/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/transformers/__init__.py)
+[2026-11-08 22:51:52 TP0] Load weight begin. avail mem=82.40 GB
+[2026-11-08 22:51:52 TP0] Multimodal attention backend not set. Use triton_attn.
+[2026-11-08 22:51:52 TP0] Using triton_attn as multimodal attention backend.
+`torch_dtype` is deprecated! Use `dtype` instead!
+[2026-11-08 22:51:52 TP0] using attn output gate!
+Loading safetensors checkpoint shards:   0% Completed | 0/14 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/14 [00:01<00:14,  1.15s/it]
+Loading safetensors checkpoint shards:  14% Completed | 2/14 [00:02<00:14,  1.24s/it]
+Loading safetensors checkpoint shards:  21% Completed | 3/14 [00:03<00:13,  1.27s/it]
+Loading safetensors checkpoint shards:  29% Completed | 4/14 [00:04<00:12,  1.24s/it]
+Loading safetensors checkpoint shards:  36% Completed | 5/14 [00:06<00:11,  1.22s/it]
+Loading safetensors checkpoint shards:  43% Completed | 6/14 [00:07<00:09,  1.22s/it]
+Loading safetensors checkpoint shards:  50% Completed | 7/14 [00:08<00:08,  1.24s/it]
+Loading safetensors checkpoint shards:  57% Completed | 8/14 [00:09<00:07,  1.23s/it]
+Loading safetensors checkpoint shards:  64% Completed | 9/14 [00:10<00:05,  1.19s/it]
+Loading safetensors checkpoint shards:  71% Completed | 10/14 [00:12<00:04,  1.20s/it]
+Loading safetensors checkpoint shards:  79% Completed | 11/14 [00:13<00:03,  1.18s/it]
+Loading safetensors checkpoint shards:  86% Completed | 12/14 [00:14<00:02,  1.16s/it]
+Loading safetensors checkpoint shards:  93% Completed | 13/14 [00:15<00:01,  1.13s/it]
+Loading safetensors checkpoint shards: 100% Completed | 14/14 [00:15<00:00,  1.14it/s]
+Loading safetensors checkpoint shards: 100% Completed | 14/14 [00:15<00:00,  1.13s/it]
+
+[2026-11-08 22:52:08 TP0] Load weight end. elapsed=15.97 s, type=Qwen3_5MoeForConditionalGeneration, dtype=torch.bfloat16, avail mem=16.91 GB, mem usage=65.49 GB.
+[2026-11-08 22:52:08 TP0] Using KV cache dtype: torch.bfloat16
+[2026-11-08 22:52:08 TP0] Mamba Cache is allocated. max_mamba_cache_size: 4, conv_state size: 0.01GB, ssm_state size: 0.29GB 
+[2026-11-08 22:52:08 TP0] KV Cache is allocated. #tokens: 128, K size: 0.00 GB, V size: 0.00 GB
+[2026-11-08 22:52:08 TP0] Memory pool end. avail mem=16.62 GB
+[2026-11-08 22:52:08 TP0] Using hybrid linear attention backend for hybrid GDN models.
+[2026-11-08 22:52:08 TP0] CuTe DSL GDN decode enabled: False
+[2026-11-08 22:52:08 TP0] Capture cuda graph begin. This can take up to several minutes. avail mem=16.59 GB
+[2026-11-08 22:52:08 TP0] Capture cuda graph bs [1]
+  0%|          | 0/1 [00:00<?, ?it/s]Capturing batches (bs=1 avail_mem=16.59 GB):   0%|          | 0/1 [00:00<?, ?it/s][2026-11-08 22:52:09 TP0] Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_RTX_6000D.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+[2026-11-08 22:52:09 TP0] Using MoE kernel config with down_moe=False. Performance might be sub-optimal! Config file not found at /root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_RTX_6000D_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+Capturing batches (bs=1 avail_mem=16.59 GB): 100%|██████████| 1/1 [00:01<00:00,  1.10s/it]Capturing batches (bs=1 avail_mem=16.59 GB): 100%|██████████| 1/1 [00:01<00:00,  1.10s/it]
+[2026-11-08 22:52:09 TP0] Capture cuda graph end. Time elapsed: 1.73 s. mem usage=0.02 GB. avail mem=16.57 GB.
+[2026-11-08 22:52:10 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:10 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:10 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[2026-11-08 22:52:11 TP0] Reset HybridReqToTokenPool
+[rank0]:[W1108 22:52:13.548611682 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

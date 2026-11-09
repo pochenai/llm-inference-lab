@@ -1,0 +1,35 @@
+{
+  "startup_to_loaded_seconds": 47.380244044121355,
+  "scope": "upper bound on model loading: process startup, CUDA context, weights and pool initialization; forward JIT excluded",
+  "weight_bytes": 69321574912,
+  "command": [
+    "taskset",
+    "-c",
+    "24-31",
+    "rust/profiling/qwen3_5/sglang-gap-20261108/rust-graph",
+    "--model-dir",
+    "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+    "--tokens",
+    "32",
+    "--output-tokens",
+    "8",
+    "--warmup",
+    "2",
+    "--iterations",
+    "1",
+    "--cuda-graph"
+  ],
+  "loaded_event": {
+    "batch_size": 1,
+    "cpu_affinity": "Cpus_allowed_list:\t24-31",
+    "cuda_graph": true,
+    "dtype": "bf16",
+    "event": "loaded",
+    "gpu_feedback": false,
+    "input_tokens": 32,
+    "logits_validation": true,
+    "output_tokens": 8,
+    "weight_bytes": 69321574912
+  },
+  "model_filesystem_cache": "existing warm host page cache; not evicted"
+}

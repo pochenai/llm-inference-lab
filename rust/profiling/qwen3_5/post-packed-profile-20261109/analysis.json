@@ -1,0 +1,244 @@
+{
+  "steps": 7,
+  "kernel_counts": [
+    817,
+    817,
+    817,
+    817,
+    817,
+    817,
+    817
+  ],
+  "kernel_sum_ms": [
+    7.108422,
+    7.108867,
+    7.106084,
+    7.095776,
+    7.086373,
+    7.095363,
+    7.100258
+  ],
+  "kernel_span_ms": [
+    8.572437,
+    8.189193,
+    8.053905,
+    7.978805,
+    8.0005,
+    8.014995,
+    8.022226
+  ],
+  "kernels": [
+    {
+      "name": "linear_entry",
+      "count_per_step": 201.0,
+      "ms_per_step": 3.6167241428571426
+    },
+    {
+      "name": "expert_mma_entry",
+      "count_per_step": 80.0,
+      "ms_per_step": 1.769908
+    },
+    {
+      "name": "gqa_graph_entry",
+      "count_per_step": 10.0,
+      "ms_per_step": 0.3411012857142857
+    },
+    {
+      "name": "shared_gate_up_vector_entry",
+      "count_per_step": 40.0,
+      "ms_per_step": 0.2307947142857143
+    },
+    {
+      "name": "linear_vector_entry",
+      "count_per_step": 80.0,
+      "ms_per_step": 0.1984435714285714
+    },
+    {
+      "name": "delta_graph_entry",
+      "count_per_step": 30.0,
+      "ms_per_step": 0.17559785714285714
+    },
+    {
+      "name": "moe_merge_entry",
+      "count_per_step": 40.0,
+      "ms_per_step": 0.14986185714285713
+    },
+    {
+      "name": "conv_graph_entry",
+      "count_per_step": 30.0,
+      "ms_per_step": 0.13342428571428572
+    },
+    {
+      "name": "norm_entry",
+      "count_per_step": 81.0,
+      "ms_per_step": 0.12769614285714284
+    },
+    {
+      "name": "route_entry",
+      "count_per_step": 40.0,
+      "ms_per_step": 0.1267997142857143
+    },
+    {
+      "name": "add_entry",
+      "count_per_step": 80.0,
+      "ms_per_step": 0.08139414285714286
+    },
+    {
+      "name": "gated_norm_entry",
+      "count_per_step": 30.0,
+      "ms_per_step": 0.05038842857142857
+    },
+    {
+      "name": "expert_swiglu_entry",
+      "count_per_step": 40.0,
+      "ms_per_step": 0.04526371428571428
+    },
+    {
+      "name": "qk_graph_entry",
+      "count_per_step": 20.0,
+      "ms_per_step": 0.03220928571428571
+    },
+    {
+      "name": "cache_decode_entry",
+      "count_per_step": 10.0,
+      "ms_per_step": 0.012525
+    },
+    {
+      "name": "argmax_blocks_entry",
+      "count_per_step": 1.0,
+      "ms_per_step": 0.0024591428571428572
+    },
+    {
+      "name": "embedding_entry",
+      "count_per_step": 1.0,
+      "ms_per_step": 0.0022947142857142858
+    },
+    {
+      "name": "argmax_final_entry",
+      "count_per_step": 1.0,
+      "ms_per_step": 0.0013074285714285714
+    },
+    {
+      "name": "bind_entry",
+      "count_per_step": 1.0,
+      "ms_per_step": 0.0011471428571428572
+    },
+    {
+      "name": "last_row_entry",
+      "count_per_step": 1.0,
+      "ms_per_step": 0.0008227142857142857
+    }
+  ],
+  "dense_roles": {
+    "gdn_qkv": {
+      "count_per_step": 30.0,
+      "ms_per_step": 0.842597
+    },
+    "gdn_ab": {
+      "count_per_step": 30.0,
+      "ms_per_step": 0.2121207142857143
+    },
+    "gdn_z": {
+      "count_per_step": 30.0,
+      "ms_per_step": 0.4628507142857143
+    },
+    "mixer_out": {
+      "count_per_step": 40.0,
+      "ms_per_step": 0.7379534285714285
+    },
+    "router": {
+      "count_per_step": 40.0,
+      "ms_per_step": 0.11186071428571429
+    },
+    "shared_gate_up": {
+      "count_per_step": 40.0,
+      "ms_per_step": 0.2307947142857143
+    },
+    "shared_down": {
+      "count_per_step": 40.0,
+      "ms_per_step": 0.1623085714285714
+    },
+    "shared_scalar": {
+      "count_per_step": 40.0,
+      "ms_per_step": 0.08658285714285714
+    },
+    "gqa_q": {
+      "count_per_step": 10.0,
+      "ms_per_step": 0.2841681428571428
+    },
+    "gqa_k": {
+      "count_per_step": 10.0,
+      "ms_per_step": 0.07486185714285715
+    },
+    "gqa_v": {
+      "count_per_step": 10.0,
+      "ms_per_step": 0.07611014285714285
+    },
+    "lm_head": {
+      "count_per_step": 1.0,
+      "ms_per_step": 0.7637535714285715
+    }
+  },
+  "replay_cpu": [
+    {
+      "metadata_preparation_ms": 0.400016,
+      "post_upload_prelaunch_ms": 0.423846,
+      "driver_launch_ms": 0.413729
+    },
+    {
+      "metadata_preparation_ms": 0.197256,
+      "post_upload_prelaunch_ms": 0.35087,
+      "driver_launch_ms": 0.312963
+    },
+    {
+      "metadata_preparation_ms": 0.181891,
+      "post_upload_prelaunch_ms": 0.28991,
+      "driver_launch_ms": 0.274701
+    },
+    {
+      "metadata_preparation_ms": 0.124656,
+      "post_upload_prelaunch_ms": 0.2826,
+      "driver_launch_ms": 0.273305
+    },
+    {
+      "metadata_preparation_ms": 0.172563,
+      "post_upload_prelaunch_ms": 0.275155,
+      "driver_launch_ms": 0.264362
+    },
+    {
+      "metadata_preparation_ms": 0.176447,
+      "post_upload_prelaunch_ms": 0.279075,
+      "driver_launch_ms": 0.261606
+    },
+    {
+      "metadata_preparation_ms": 0.171037,
+      "post_upload_prelaunch_ms": 0.293459,
+      "driver_launch_ms": 0.254202
+    }
+  ],
+  "replay_cpu_median": {
+    "metadata_preparation_ms": 0.176447,
+    "post_upload_prelaunch_ms": 0.28991,
+    "driver_launch_ms": 0.273305
+  },
+  "post_readback_tail_ms": [
+    0.273684,
+    0.239493,
+    0.225974,
+    0.226696,
+    0.220892,
+    0.224029,
+    0.223575
+  ],
+  "post_readback_tail_median_ms": 0.225974,
+  "validation_ms": [
+    0.315022,
+    0.311572,
+    0.311598,
+    0.31211,
+    0.311567,
+    0.311572,
+    0.322683
+  ],
+  "validation_median_ms": 0.311598
+}

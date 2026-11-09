@@ -1,0 +1,378 @@
+========= COMPUTE-SANITIZER
+
+running 1 test
+test runner::model::qwen3_5::tests::bf16_gqa_matches_cpu_with_fragmented_causal_histories ... ========= Use-after-free on allocation of size 640 bytes at 0x2c8a039800
+=========     Address 0x2c8a039800 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 16 bytes at 0x2c8a04d400
+=========     Address 0x2c8a04d400 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 640 bytes at 0x2c8a039c00
+=========     Address 0x2c8a039c00 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 16 bytes at 0x2c8a045c00
+=========     Address 0x2c8a045c00 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 640 bytes at 0x2c8a039800
+=========     Address 0x2c8a039800 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 16 bytes at 0x2c8a03a000
+=========     Address 0x2c8a03a000 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 16 bytes at 0x2c8a039c00
+=========     Address 0x2c8a039c00 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 640 bytes at 0x2c8a03fc00
+=========     Address 0x2c8a03fc00 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 16 bytes at 0x2c8a039800
+=========     Address 0x2c8a039800 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+========= Use-after-free on allocation of size 640 bytes at 0x2c8a045c00
+=========     Address 0x2c8a045c00 is potentially accessed after it is free'd
+=========     
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367aaa] in libcuda.so.1
+=========         Host Frame: _RNCNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB7_17AsyncKernelLaunch6launchs_0B9_ [0x142acc6] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtCs7dat1WLuxi3_10cuda_async6launchNtB6_16KernelArgStorage15with_param_ptrsINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCs51gJIoNHqS7_9cuda_core5error11DriverErrorENCNvMs5_B6_NtB6_17AsyncKernelLaunch6launchs_0EB8_ [0x1429d96] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs5_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_17AsyncKernelLaunch6launch [0x142b713] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvMs4_NtCs7dat1WLuxi3_10cuda_async6launchNtB5_24AsyncKernelLaunchBuilder7execute [0x142b23c] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsU_NtNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_57kernels3opsINtB5_8GqaGraphNtNtCs563UiJkRgBt_4half6bfloat4bf16RINtNtCsfIuyvwcq2Qv_6cutile6tensor6TensorB1m_EINtNtCsgFX3jaOk65H_5alloc4sync3ArcB1W_EB2F_B1V_RIB1X_yEINtB1Z_9PartitionQB1W_EINtNtB21_11tile_kernel10KernelArgsTINtB3Y_13PrepareOutputINtNtCs7dat1WLuxi3_10cuda_async16device_operation5ValueB3y_EB1m_EINtB3Y_12PrepareInputIB4R_B1V_EB1m_EIB5U_IB4R_B2F_EB1m_EB6t_B5T_IB5U_IB4R_B3q_EyEIB4R_INtNtB4V_13device_buffer13DevicePointerlEEEEENtB4T_8DeviceOp7executeBf_ [0x6d042e] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXsK_NtCs7dat1WLuxi3_10cuda_async16device_operationINtB5_15StreamOperationINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtB5_5ValueB1c_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0ENtB5_8DeviceOp7executeB2O_ [0x78cab0] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvXs3_NtCs7dat1WLuxi3_10cuda_async13device_futureINtB5_12DeviceFutureINtNtCskADBYZwJmSU_4core6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEINtNtB7_16device_operation15StreamOperationB16_INtB2g_5ValueB16_ENCNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0s4_0EENtNtNtB1b_6future6future6Future4pollB3u_ [0x87cef8] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories0Bb_.llvm.7031121673930312312 [0x944f29] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs1_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_7Context5enterINtNtNtCskADBYZwJmSU_4core4task4poll4PollINtNtB1u_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEENCNCINvMs7_B6_NtB6_9CoreGuard8block_onINtNtB1u_3pin3PinQIB3y_QDNtNtNtB1u_6future6future6Futurep6OutputB22_EL_EEE00ECs8cLa6FZBRXy_6engine [0x70ad47] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCINvMs7_NtB15_14current_threadNtB1G_9CoreGuard5enterNCINvB1C_8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB2H_QDNtNtNtB2L_6future6future6Futurep6OutputINtNtB2L_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEE0INtNtB2L_6option6OptionB3X_EE0TINtNtCsgFX3jaOk65H_5alloc5boxed3BoxNtB1G_4CoreEB4W_EECs8cLa6FZBRXy_6engine [0xbf3f16] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMs7_NtNtNtCsgSTPdjnBYiM_5tokio7runtime9scheduler14current_threadNtB6_9CoreGuard8block_onINtNtCskADBYZwJmSU_4core3pin3PinQIB1t_QDNtNtNtB1x_6future6future6Futurep6OutputINtNtB1x_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EEECs8cLa6FZBRXy_6engine [0x70caf8] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtNtCsgSTPdjnBYiM_5tokio7runtime7context7runtime13enter_runtimeNCINvMNtNtB6_9scheduler14current_threadNtB1b_13CurrentThread8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB2h_6future6future6Futurep6OutputINtNtB2h_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EE0B3n_ECs8cLa6FZBRXy_6engine [0xc1609d] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvMNtNtCsgSTPdjnBYiM_5tokio7runtime7runtimeNtB3_7Runtime8block_onINtNtCskADBYZwJmSU_4core3pin3PinQDNtNtNtB18_6future6future6Futurep6OutputINtNtB18_6result6ResultuNtCs2tBP0IsvQjV_6anyhow5ErrorEEL_EECs8cLa6FZBRXy_6engine [0x970c94] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55testss_53bf16_gqa_matches_cpu_with_fragmented_causal_histories [0x964faa] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvYNCNvNtNtNtNtCs8cLa6FZBRXy_6engine6runner5model7qwen3_55tests53bf16_gqa_matches_cpu_with_fragmented_causal_histories0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_onceBe_ [0xb2705e] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvCslTQyRuerOM8_4test28___rust_begin_short_backtraceINtNtCskADBYZwJmSU_4core6result6ResultuNtNtCsgFX3jaOk65H_5alloc6string6StringEFEBQ_EB2_ [0xc465ca] in engine-f8870ca35359a86c
+=========         Host Frame: _RNCNvCslTQyRuerOM8_4test8run_test0B3_ [0xc53c34] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslTQyRuerOM8_4test8run_tests_0uEB1b_ [0xc4cff3] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNvCslTQyRuerOM8_4test8run_tests_0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB17_ [0xc56d91] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+=========     
+=========     Saved host backtrace up to driver entry point at cudaFreeAsync time
+=========         Host Frame: cuMemFreeAsync [0x368ea9] in libcuda.so.1
+=========         Host Frame: _RNSNvYNCNvXs_NtCs51gJIoNHqS7_9cuda_core10allocationNtBb_10AllocationNtNtNtCskADBYZwJmSU_4core3ops4drop4Drop4drop0INtNtB18_8function6FnOnceuE9call_once6vtableBd_.llvm.11141128990503217073 [0x143a8b0] in engine-f8870ca35359a86c
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEB1f_ [0x143a521] in engine-f8870ca35359a86c
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCNCNvNtCs51gJIoNHqS7_9cuda_core10completion7enqueue00uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1b_ [0x1438dbc] in engine-f8870ca35359a86c
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start [0x149d898] in engine-f8870ca35359a86c
+=========         Host Frame: start_thread in pthread_create.c:442 [0x94a82] in libc.so.6
+=========         Host Frame: clone in clone.S:100 [0x125a93] in libc.so.6
+========= 
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 12.91s
+
+========= ERROR SUMMARY: 10 errors

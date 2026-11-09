@@ -1,0 +1,44 @@
+{
+  "format": "little-endian float32 logits",
+  "default_reference_prompt_ids": [
+    1,
+    7,
+    9,
+    3,
+    12
+  ],
+  "default_real_reference": "real-reference.f32",
+  "default_tiny_reference": "tiny-reference.f32",
+  "files": [
+    {
+      "file": "tiny-reference.f32",
+      "original_path": "rust/engine/artifacts/qwen3_5/tiny/reference.f32",
+      "bytes": 993280,
+      "sha256": "0ceb4c72a765128133a53fa70638e438bf08a9943e94a4078d1e3b2665c8e1c9"
+    },
+    {
+      "file": "real-reference-fp32acc.f32",
+      "original_path": "rust/engine/artifacts/qwen3_5/real/reference-fp32acc.f32",
+      "bytes": 993280,
+      "sha256": "214db4a011c85e310133c907dd6a9b36345aa143a6bc52faa99ad9aacf948c2e"
+    },
+    {
+      "file": "real-reference-stable.f32",
+      "original_path": "rust/engine/artifacts/qwen3_5/real/reference-stable.f32",
+      "bytes": 993280,
+      "sha256": "e6671e7d4b2a65423727dea97afb2940b0b02457e3ed2a9d6c26002991166006"
+    },
+    {
+      "file": "real-reference-torch-topk.f32",
+      "original_path": "rust/engine/artifacts/qwen3_5/real/reference-torch-topk.f32",
+      "bytes": 993280,
+      "sha256": "e6671e7d4b2a65423727dea97afb2940b0b02457e3ed2a9d6c26002991166006"
+    },
+    {
+      "file": "real-reference.f32",
+      "original_path": "rust/engine/artifacts/qwen3_5/real/reference.f32",
+      "bytes": 993280,
+      "sha256": "214db4a011c85e310133c907dd6a9b36345aa143a6bc52faa99ad9aacf948c2e"
+    }
+  ]
+}

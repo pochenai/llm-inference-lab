@@ -1,0 +1,42 @@
+{
+  "migration_commit": "cfe28b2d83fac76e912be7607849aee129b745d1",
+  "cpu_affinity": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "model": "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+  "model_config_sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+  "binary_sha256": "dae2343b653feef42c01b535b11f2bf3acfcaea8cb6fcb56efca7ffd6058b838",
+  "gpu": "name, driver_version, memory.total [MiB]\nNVIDIA RTX 6000D, 595.91.07, 85651 MiB\n",
+  "boundary": "Rust includes host token and complete-logit validation; SGLang uses GPU sampling; both eager, fixed output count, fresh state",
+  "versions": {
+    "sglang": "0.5.9",
+    "torch": "2.9.1",
+    "transformers": "4.57.1",
+    "flashinfer-python": "0.6.3"
+  },
+  "native_source_sha256": "0a8e1435c47ec17a21290e1f86224d71e0f09205e3a6415f069c00965a40b285",
+  "sglang_attention": "triton",
+  "sglang_ssm_dtype": "float32",
+  "notes": [
+    "SGLang uses stock fallback MoE configuration; no RTX 6000D tuning file",
+    "SGLang graph measurements are separate references",
+    "Native Rust binary/source are frozen before adding profiler control; profiling binary/source are retained separately"
+  ],
+  "profile_binary_sha256": "81f0b7b5af4b75d67037a0d44d89385e84eae4c79655a2721f0fa5e6632601e2",
+  "profile_source_sha256": "7d161774c11c70c915529e86baea4f4e40254f457cd8f7cc93e7bfc566ff82d7",
+  "validation": {
+    "tiny_reference_tests": 3,
+    "invalid_cli_cases": 5,
+    "all_targets": "passed",
+    "format": "passed",
+    "pyright": "blocked: offline cache lacks locked CPU PyTorch wheel"
+  },
+  "report_commit": "84df94848578a111fc9727e07ac05760c6561aac"
+}

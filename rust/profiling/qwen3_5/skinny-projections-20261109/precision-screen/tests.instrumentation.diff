@@ -1,0 +1,26 @@
+--- tests.rs
++++ tests.instrumented.rs
+@@ -1024,3 +1024,23 @@
+     }
+     Ok(())
+ }
++
++#[tokio::test]
++#[ignore = "diagnostic real-model precision screen"]
++async fn skinny_real_precision_screen() -> Result<()> {
++    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
++    let policy = cuda_async::device_context::global_policy(0)?;
++    let model=Qwen3_5Engine::<cutile::core::bf16>::load(&PathBuf::from(std::env::var("QWEN35_TEST_MODEL")?), &policy).await?;
++    let bytes=std::fs::read(std::env::var("QWEN35_TEST_REFERENCE")?)?;
++    let reference:Vec<f32>=bytes.chunks_exact(4).map(|v|f32::from_le_bytes(v.try_into().unwrap())).collect();
++    for (name,mask) in [("baseline",0),("scalar",1),("a_b",2),("router",4),("all",7)] {
++        super::engine::SKINNY_DIAGNOSTIC_ROLES.store(mask,std::sync::atomic::Ordering::Relaxed);
++        let mut state=model.new_context(16).await?;
++        let (token,logits)=model.step_with_logits(&[1,7,9,3,12],&mut state).await?;
++        let error=logits.iter().zip(&reference).map(|(a,b)|(a-b).abs()).fold(0f32,f32::max);
++        let rms=(logits.iter().zip(&reference).map(|(a,b)|(a-b)*(a-b)).sum::<f32>()/logits.len() as f32).sqrt();
++        eprintln!("role={name} token={token} reference_max={error} rms={rms} logits3636={} logits16={}",logits[3636],logits[16]);
++    }
++    super::engine::SKINNY_DIAGNOSTIC_ROLES.store(7,std::sync::atomic::Ordering::Relaxed);
++    Ok(())
++}

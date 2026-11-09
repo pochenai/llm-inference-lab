@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running unittests src/lib.rs (rust/target/release/deps/engine-f8870ca35359a86c)
+
+running 2 tests
+test runner::model::qwen3_5::workspace::tests::banks_reuse_storage_without_aliasing_hidden_or_other_mixers ... ok
+test runner::model::qwen3_5::workspace::tests::gated_checkouts_survive_completion_and_escaped_views ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.78s
+

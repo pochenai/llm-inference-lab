@@ -228,5 +228,30 @@ roadmap.md
 # graphify
 graphify-out/
 
-# 
+# Profiling artifacts are local by default; preserve Qwen3.5 experiment evidence.
 profiling/
+!rust/profiling/
+rust/profiling/*
+!rust/profiling/qwen3_5/
+!rust/profiling/qwen3_5/**
+
+# Rebuild host executables and temporary JIT caches on the destination machine.
+rust/profiling/qwen3_5/**/baseline
+rust/profiling/qwen3_5/**/candidate
+rust/profiling/qwen3_5/**/qwen3_5
+rust/profiling/qwen3_5/**/qwen3_5-profile
+rust/profiling/qwen3_5/**/rust-graph
+rust/profiling/qwen3_5/**/b1-only-rejected
+rust/profiling/qwen3_5/**/old-oracle
+rust/profiling/qwen3_5/**/jit-store/
+
+# SQLite exports can be regenerated from the versioned Nsight reports.
+rust/profiling/qwen3_5/**/*.sqlite
+rust/profiling/qwen3_5/**/*.sqlite-*
+
+# Never include local secret environment files with experiment evidence.
+rust/profiling/qwen3_5/**/.env
+rust/profiling/qwen3_5/**/*.env
+rust/profiling/qwen3_5/**/.env.*
+rust/profiling/qwen3_5/**/*.env.*
+!rust/profiling/qwen3_5/**/.env.example

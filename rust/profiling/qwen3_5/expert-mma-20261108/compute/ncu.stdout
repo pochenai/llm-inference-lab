@@ -1,0 +1,6 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::bf16_expert_mma_matches_independent_cpu_and_simt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out; finished in 3.65s
+

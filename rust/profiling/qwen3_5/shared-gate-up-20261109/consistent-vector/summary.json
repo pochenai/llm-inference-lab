@@ -1,0 +1,118 @@
+{
+  "processes": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "prefill_ms": 31.557752,
+      "decode_ms": 9.512205714285715,
+      "total_ms": 98.14319199999998,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 0,
+      "prefill_ms": 32.884361,
+      "decode_ms": 9.021999714285714,
+      "total_ms": 96.826552,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 1,
+      "prefill_ms": 33.108263,
+      "decode_ms": 8.995257142857142,
+      "total_ms": 96.034684,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "prefill_ms": 31.629710999999997,
+      "decode_ms": 9.489335428571428,
+      "total_ms": 97.97868199999999,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "prefill_ms": 31.871575999999997,
+      "decode_ms": 9.404194285714285,
+      "total_ms": 97.73690700000002,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 2,
+      "prefill_ms": 33.009487,
+      "decode_ms": 8.97973,
+      "total_ms": 95.85065300000001,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    }
+  ],
+  "median": {
+    "baseline": {
+      "prefill_ms": 31.629710999999997,
+      "decode_ms": 9.489335428571428,
+      "total_ms": 97.97868199999999
+    },
+    "candidate": {
+      "prefill_ms": 33.009487,
+      "decode_ms": 8.995257142857142,
+      "total_ms": 96.034684
+    }
+  }
+}

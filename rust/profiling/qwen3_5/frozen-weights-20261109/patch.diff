@@ -1,0 +1,109 @@
+diff --git a/rust/engine/src/runner/model/qwen3_5/engine.rs b/rust/engine/src/runner/model/qwen3_5/engine.rs
+index 70fc0a4..5efcd04 100644
+--- a/rust/engine/src/runner/model/qwen3_5/engine.rs
++++ b/rust/engine/src/runner/model/qwen3_5/engine.rs
+@@ -56,7 +56,7 @@ use cutile::{
+     api,
+     core::{bf16, ElementType},
+     cuda_core::DeviceCopy,
+-    tensor::{PartitionMut, Reshape, Tensor},
++    tensor::{PartitionMut, Tensor},
+     tile_kernel::TileKernel,
+     DType,
+ };
+@@ -71,6 +71,7 @@ use super::{
+     },
+     kernels,
+     state::{retained_pointer, AttentionView, Qwen3_5Context, Qwen3_5ExecutionView},
++    weights::FrozenWeight,
+     workspace::{Scratch, ScratchTensor, WorkspaceMetrics, WorkspacePool},
+     Qwen3_5StatePool,
+ };
+@@ -83,8 +84,8 @@ use crate::runner::{
+     },
+ };
+ 
+-type Weight<T> = Arc<Tensor<T>>;
+-type Norm = Arc<Tensor<f32>>;
++type Weight<T> = FrozenWeight<T>;
++type Norm = Weight<f32>;
+ 
+ struct Delta<T: DType> {
+     qkv: Weight<T>,
+@@ -156,7 +157,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+             shape: &[usize],
+             policy: &Arc<dyn SchedulingPolicy>,
+             bytes: &mut usize,
+-        ) -> Result<Arc<Tensor<W>>> {
++        ) -> Result<Weight<W>> {
+             let host = loader.load_host::<W>(name)?;
+             ensure!(
+                 host.shape == shape,
+@@ -164,12 +165,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                 host.shape
+             );
+             *bytes += host.data.len() * size_of::<W>();
+-            Ok(Arc::new(
+-                api::copy_host_vec_to_device(&Arc::new(host.data))
+-                    .schedule(policy)?
+-                    .await?
+-                    .reshape(shape)?,
+-            ))
++            Weight::from_host(host.data, shape, policy).await
+         }
+         macro_rules! load {
+             ($name:expr, $shape:expr) => {
+@@ -206,12 +202,8 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                             .map(|(tap, channel)| host.data[channel * CONV_KERNEL_SIZE + tap]),
+                     );
+                     weight_bytes += host.data.len() * size_of::<T>();
+-                    let conv = Arc::new(
+-                        api::copy_host_vec_to_device(&Arc::new(transposed))
+-                            .schedule(policy)?
+-                            .await?
+-                            .reshape(&[CONV_KERNEL_SIZE, channels])?,
+-                    );
++                    let conv = Weight::from_host(transposed, &[CONV_KERNEL_SIZE, channels], policy)
++                        .await?;
+                     let a_name = format!("{p}.linear_attn.in_proj_a.weight");
+                     let b_name = format!("{p}.linear_attn.in_proj_b.weight");
+                     let mut a = loader.load_host::<T>(&a_name)?;
+@@ -228,12 +220,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                     );
+                     a.data.extend_from_slice(&b.data);
+                     weight_bytes += a.data.len() * size_of::<T>();
+-                    let ab = Arc::new(
+-                        api::copy_host_vec_to_device(&Arc::new(a.data))
+-                            .schedule(policy)?
+-                            .await?
+-                            .reshape(&[2 * vh, h])?,
+-                    );
++                    let ab = Weight::from_host(a.data, &[2 * vh, h], policy).await?;
+                     Mixer::Delta(Delta {
+                         qkv: load!(format!("{p}.linear_attn.in_proj_qkv.weight"), [channels, h]),
+                         z: load!(
+@@ -298,11 +285,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                     .powf(-2.0 * j as f32 / ROTARY_DIM as f32)
+             })
+             .collect();
+-        let frequencies = Arc::new(
+-            api::copy_host_vec_to_device(&Arc::new(freq))
+-                .schedule(policy)?
+-                .await?,
+-        );
++        let frequencies = Weight::from_host(freq, &[ROTARY_DIM], policy).await?;
+         let mut eos = vec![c.eos_token_id];
+         if let Some(generation) = loader.generation_config()? {
+             if let Some(ids) = generation.eos_token_id {
+diff --git a/rust/engine/src/runner/model/qwen3_5/mod.rs b/rust/engine/src/runner/model/qwen3_5/mod.rs
+index 808a21c..172e7b7 100644
+--- a/rust/engine/src/runner/model/qwen3_5/mod.rs
++++ b/rust/engine/src/runner/model/qwen3_5/mod.rs
+@@ -5,6 +5,7 @@ mod graph;
+ mod kernels;
+ mod pool;
+ mod state;
++mod weights;
+ mod workspace;
+ 
+ pub use config::{

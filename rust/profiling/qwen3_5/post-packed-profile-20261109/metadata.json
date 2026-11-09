@@ -1,0 +1,9 @@
+{
+  "commit": "0c5dcc02f38252872c22a1d83d857b476f854f31",
+  "sha256": "e48c24f50b093fee4a9d3471d896de1930573dfa819b2f54004874d23e7d86b7",
+  "environment": {
+    "CUDA_HOME": "/usr/local/cuda",
+    "CUDA_ASYNC_HOST_SYNC": null,
+    "CUDA_ASYNC_SPIN_BUDGET_US": null
+  }
+}

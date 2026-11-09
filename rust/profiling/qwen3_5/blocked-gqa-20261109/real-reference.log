@@ -1,0 +1,11 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation ... reference max=0.48617673, rms=0.10954554, token=3636, expected=3636
+chunk=1 max=0, token=3636
+chunk=2 max=0, token=3636
+chunk=3 max=0, token=3636
+chunk=4 max=0, token=3636
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 113.28s
+

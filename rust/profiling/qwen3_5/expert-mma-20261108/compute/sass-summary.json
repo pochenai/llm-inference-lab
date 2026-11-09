@@ -1,0 +1,46 @@
+[
+  {
+    "key": "7216c5ffe78c5a2703aeaf6acb5547d2298eab5c0d5813e8a7dec69d3bffdbe4",
+    "function": [
+      "Function : expert_entry"
+    ],
+    "hmma_count": 0,
+    "sha256": "b0e34f958126cf45001b2c295e30c166f1200322722359ab058be6210eb8c86a",
+    "resource_lines": [
+      "REG:255 STACK:0 SHARED:1108 LOCAL:0 CONSTANT[0]:1152 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    ]
+  },
+  {
+    "key": "8284bfd6606689bc4ab45f026a84273bcf29a4d35eda58d9dfdd8451aa680b72",
+    "function": [
+      "Function : expert_mma_entry"
+    ],
+    "hmma_count": 20,
+    "sha256": "1f5d06571a64cb951d12de9dd29f7eb96f12db78f3a25d0b341bc8196d826537",
+    "resource_lines": [
+      "REG:128 STACK:32 SHARED:33956 LOCAL:0 CONSTANT[2]:12 CONSTANT[0]:1408 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    ]
+  },
+  {
+    "key": "c0122fcd6e37b4f1a69265f0ab809d45dd2bb72909df29df987856844e8f902f",
+    "function": [
+      "Function : expert_mma_entry"
+    ],
+    "hmma_count": 32,
+    "sha256": "aa4593af9d3c2b73e166c695b6c445cca2f16dc2eefcf95a972cc957e10f22f0",
+    "resource_lines": [
+      "REG:128 STACK:32 SHARED:44244 LOCAL:0 CONSTANT[2]:12 CONSTANT[0]:1408 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    ]
+  },
+  {
+    "key": "ec3220058242d8be194edaea02d6249e8296825552a19002db63b8667613e59e",
+    "function": [
+      "Function : expert_entry"
+    ],
+    "hmma_count": 0,
+    "sha256": "95f1d80b49179d0e61246dddb1458db43272056043d8ae099b2120c2fcc99ea0",
+    "resource_lines": [
+      "REG:255 STACK:0 SHARED:1108 LOCAL:0 CONSTANT[0]:1152 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    ]
+  }
+]

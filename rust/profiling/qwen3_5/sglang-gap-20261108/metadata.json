@@ -1,0 +1,33 @@
+{
+  "commit": "70e8e87259d4d0861081078ef76deb362a96cb52",
+  "rust_binary_sha256": "3b320ce44cd661161ec5b8f8790d4de1c4551d5f6f8804d8bc8c99d2c9e0a347",
+  "model": "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+  "cpu_affinity": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "native_reference": "../cuda-graph-20261108/summary.json",
+  "gpu": "name, driver_version, memory.total [MiB]\nNVIDIA RTX 6000D, 595.91.07, 85651 MiB\n",
+  "versions": {
+    "sglang": "0.5.9",
+    "torch": "2.9.1",
+    "triton": "3.5.1",
+    "flashinfer-python": "0.6.3"
+  },
+  "nsys": "NVIDIA Nsight Systems version 2025.6.3.541-256337736014v0",
+  "scope": "BF16 B1 32->8; graph traces plus eager role mapping; three paired native processes per MoE scheduling variant",
+  "scripts_sha256": {
+    "sglang_profile.py": "a786375ce4e805958ebd6a5e866db34902d87d944bde46f3b11d1d7c7ec810f2",
+    "run.py": "f646e3999b1a027ccc30743e294a529938196cfdf74537cba4e0357b07b0ffbe",
+    "sglang_serial_moe.py": "4f5f1795aedb1702474eca20346f4b1c875a433b790c66678efcc7dc4f61e898",
+    "overlap_control.py": "469445320b6e6c32eda734d7f180868feacf7169bfd2ed23bc34e8d8ed4977fb",
+    "analyze.py": "922fe2d1486123d17ef4945bbddd2430b4c7ea9ccec69e97593dde6dccfcdcbf",
+    "plot.py": "9d36aa043dd16f4d8cc0a839413d9c5ddfa6f0e38e63e7bf004bf8b0540af7f3"
+  }
+}

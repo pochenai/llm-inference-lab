@@ -1,0 +1,258 @@
+{
+  "prefill": {
+    "forwards": 1,
+    "kernel_instances": 2335,
+    "total_kernel_ms": 50.992554,
+    "kernel_ms_per_forward": 50.992554,
+    "kernels": [
+      {
+        "name": "expert_entry",
+        "total_ms": 41.204891,
+        "share_percent": 80.80570155399552,
+        "count": 80
+      },
+      {
+        "name": "linear_entry",
+        "total_ms": 5.013049,
+        "share_percent": 9.830943160838737,
+        "count": 391
+      },
+      {
+        "name": "full_entry",
+        "total_ms": 1.349444,
+        "share_percent": 2.646354995280291,
+        "count": 1408
+      },
+      {
+        "name": "delta_entry",
+        "total_ms": 1.218855,
+        "share_percent": 2.3902607427743274,
+        "count": 30
+      },
+      {
+        "name": "gqa_attention_entry",
+        "total_ms": 0.784525,
+        "share_percent": 1.5385089360301507,
+        "count": 10
+      },
+      {
+        "name": "conv_entry",
+        "total_ms": 0.356953,
+        "share_percent": 0.700010044603767,
+        "count": 30
+      },
+      {
+        "name": "gated_norm_entry",
+        "total_ms": 0.241243,
+        "share_percent": 0.47309456200213074,
+        "count": 30
+      },
+      {
+        "name": "moe_merge_entry",
+        "total_ms": 0.183963,
+        "share_percent": 0.3607644363135841,
+        "count": 40
+      },
+      {
+        "name": "norm_entry",
+        "total_ms": 0.15609,
+        "share_percent": 0.30610351464254953,
+        "count": 81
+      },
+      {
+        "name": "route_entry",
+        "total_ms": 0.140636,
+        "share_percent": 0.27579712912595045,
+        "count": 40
+      },
+      {
+        "name": "add_entry",
+        "total_ms": 0.112479,
+        "share_percent": 0.22057926339598524,
+        "count": 80
+      },
+      {
+        "name": "expert_swiglu_entry",
+        "total_ms": 0.074142,
+        "share_percent": 0.1453976986522385,
+        "count": 40
+      },
+      {
+        "name": "qk_entry",
+        "total_ms": 0.065245,
+        "share_percent": 0.1279500532567951,
+        "count": 20
+      },
+      {
+        "name": "swiglu_entry",
+        "total_ms": 0.053216,
+        "share_percent": 0.10436033464807432,
+        "count": 40
+      },
+      {
+        "name": "store_entry",
+        "total_ms": 0.029759,
+        "share_percent": 0.058359500879285243,
+        "count": 10
+      },
+      {
+        "name": "argmax_blocks_entry",
+        "total_ms": 0.002944,
+        "share_percent": 0.005773391934830329,
+        "count": 1
+      },
+      {
+        "name": "embedding_entry",
+        "total_ms": 0.001792,
+        "share_percent": 0.003514238569027157,
+        "count": 1
+      },
+      {
+        "name": "argmax_final_entry",
+        "total_ms": 0.00144,
+        "share_percent": 0.002823941707253965,
+        "count": 1
+      },
+      {
+        "name": "last_row_entry",
+        "total_ms": 0.000992,
+        "share_percent": 0.001945382064997176,
+        "count": 1
+      },
+      {
+        "name": "bind_entry",
+        "total_ms": 0.000896,
+        "share_percent": 0.0017571192845135784,
+        "count": 1
+      }
+    ]
+  },
+  "decode": {
+    "forwards": 7,
+    "kernel_instances": 15925,
+    "total_kernel_ms": 68.160469,
+    "kernel_ms_per_forward": 9.737209857142856,
+    "kernels": [
+      {
+        "name": "linear_entry",
+        "total_ms": 35.254791,
+        "share_percent": 51.723222444376084,
+        "count": 2737
+      },
+      {
+        "name": "expert_entry",
+        "total_ms": 16.845135,
+        "share_percent": 24.7139364607365,
+        "count": 560
+      },
+      {
+        "name": "full_entry",
+        "total_ms": 6.332019,
+        "share_percent": 9.289870056498584,
+        "count": 9436
+      },
+      {
+        "name": "gqa_attention_entry",
+        "total_ms": 2.348335,
+        "share_percent": 3.445303464681266,
+        "count": 70
+      },
+      {
+        "name": "delta_entry",
+        "total_ms": 1.210117,
+        "share_percent": 1.7753941804596445,
+        "count": 210
+      },
+      {
+        "name": "moe_merge_entry",
+        "total_ms": 1.114701,
+        "share_percent": 1.6354068807830535,
+        "count": 280
+      },
+      {
+        "name": "norm_entry",
+        "total_ms": 1.008333,
+        "share_percent": 1.479351616550643,
+        "count": 567
+      },
+      {
+        "name": "route_entry",
+        "total_ms": 0.953223,
+        "share_percent": 1.3984982996522515,
+        "count": 280
+      },
+      {
+        "name": "conv_entry",
+        "total_ms": 0.848877,
+        "share_percent": 1.2454095643033207,
+        "count": 210
+      },
+      {
+        "name": "add_entry",
+        "total_ms": 0.682641,
+        "share_percent": 1.0015203974021951,
+        "count": 560
+      },
+      {
+        "name": "gated_norm_entry",
+        "total_ms": 0.418647,
+        "share_percent": 0.6142079216033564,
+        "count": 210
+      },
+      {
+        "name": "expert_swiglu_entry",
+        "total_ms": 0.390201,
+        "share_percent": 0.5724740538390368,
+        "count": 280
+      },
+      {
+        "name": "swiglu_entry",
+        "total_ms": 0.337012,
+        "share_percent": 0.4944390860925561,
+        "count": 280
+      },
+      {
+        "name": "qk_entry",
+        "total_ms": 0.254363,
+        "share_percent": 0.37318258476185073,
+        "count": 140
+      },
+      {
+        "name": "store_entry",
+        "total_ms": 0.105723,
+        "share_percent": 0.15510896792684922,
+        "count": 70
+      },
+      {
+        "name": "argmax_blocks_entry",
+        "total_ms": 0.018912,
+        "share_percent": 0.02774628795467942,
+        "count": 7
+      },
+      {
+        "name": "embedding_entry",
+        "total_ms": 0.012191,
+        "share_percent": 0.017885733738129062,
+        "count": 7
+      },
+      {
+        "name": "argmax_final_entry",
+        "total_ms": 0.010336,
+        "share_percent": 0.015164214905856942,
+        "count": 7
+      },
+      {
+        "name": "bind_entry",
+        "total_ms": 0.00752,
+        "share_percent": 0.011032787934601801,
+        "count": 7
+      },
+      {
+        "name": "last_row_entry",
+        "total_ms": 0.007392,
+        "share_percent": 0.010844995799544748,
+        "count": 7
+      }
+    ]
+  }
+}

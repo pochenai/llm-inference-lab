@@ -1,0 +1,3 @@
+# Archived measurements and snapshots must retain their original bytes/EOLs.
+# Raw profiler output may contain trailing spaces and terminal progress lines.
+* -text -whitespace

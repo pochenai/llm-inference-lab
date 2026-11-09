@@ -1,0 +1,23 @@
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src/lib.rs (rust/target/release/deps/engine-f8870ca35359a86c)
+
+running 10 tests
+test runner::model::qwen3_5::config::tests::checkpoint_and_state_budget ... ok
+test runner::model::qwen3_5::config::tests::rejects_unsupported_configs ... ok
+test runner::model::qwen3_5::config::tests::rejects_unknown_config_tags_during_deserialization ... ok
+test runner::model::qwen3_5::tests::convolution_preserves_three_distinct_history_planes ... ok
+test runner::model::qwen3_5::tests::fp32_pooled_state_and_runner_match_standalone has been running for over 60 seconds
+test runner::model::qwen3_5::tests::pooled_state_and_runner_match_standalone has been running for over 60 seconds
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation has been running for over 60 seconds
+test runner::model::qwen3_5::tests::router_ties_use_lowest_indices_and_normalize_selected_scores has been running for over 60 seconds
+test runner::model::qwen3_5::workspace::tests::banks_reuse_storage_without_aliasing_hidden_or_other_mixers has been running for over 60 seconds
+test runner::model::qwen3_5::workspace::tests::gated_checkouts_survive_completion_and_escaped_views has been running for over 60 seconds
+test runner::model::qwen3_5::tests::fp32_pooled_state_and_runner_match_standalone ... ok
+test runner::model::qwen3_5::tests::pooled_state_and_runner_match_standalone ... ok
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation ... ok
+test runner::model::qwen3_5::tests::router_ties_use_lowest_indices_and_normalize_selected_scores ... ok
+test runner::model::qwen3_5::workspace::tests::gated_checkouts_survive_completion_and_escaped_views ... ok
+test runner::model::qwen3_5::workspace::tests::banks_reuse_storage_without_aliasing_hidden_or_other_mixers ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 133 filtered out; finished in 132.93s
+

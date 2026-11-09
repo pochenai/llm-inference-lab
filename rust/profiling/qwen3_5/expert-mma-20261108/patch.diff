@@ -1,0 +1,257 @@
+diff --git a/rust/engine/src/runner/model/qwen3_5/engine.rs b/rust/engine/src/runner/model/qwen3_5/engine.rs
+index 3fded07..6573777 100644
+--- a/rust/engine/src/runner/model/qwen3_5/engine.rs
++++ b/rust/engine/src/runner/model/qwen3_5/engine.rs
+@@ -950,20 +950,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+ 
+             {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.gate_up");
+-                kernels::expert(
+-                    (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
+-                    &*n,
+-                    layer.gate_up.clone(),
+-                    &*selected,
+-                    top as i32,
+-                )
+-                .generics(vec![
+-                    T::DTYPE.to_string(),
+-                    h.to_string(),
+-                    (2 * i).to_string(),
+-                    top.to_string(),
+-                ])
+-                .execute(exec)?;
++                expert_project(&mut gu, &n, layer.gate_up.clone(), &selected, top, exec)?;
+             }
+             let mut activated = scratch.activation(&[rows * top, i], exec)?;
+ 
+@@ -977,20 +964,14 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+ 
+             {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.down");
+-                kernels::expert(
+-                    (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
+-                    &*activated,
++                expert_project(
++                    &mut routed,
++                    &activated,
+                     layer.down.clone(),
+-                    &*selected,
++                    &selected,
+                     1,
+-                )
+-                .generics(vec![
+-                    T::DTYPE.to_string(),
+-                    i.to_string(),
+-                    h.to_string(),
+-                    top.to_string(),
+-                ])
+-                .execute(exec)?;
++                    exec,
++                )?;
+             }
+             let (shared_out, shared_gate) = {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.shared");
+@@ -1080,6 +1061,44 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+     }
+ }
+ 
++unsafe fn expert_project<T: DType>(
++    out: &mut Tensor<T>,
++    x: &Tensor<T>,
++    weight: Weight<T>,
++    selected: &Tensor<i32>,
++    input_repeat: usize,
++    exec: &ExecutionContext,
++) -> Result<()> {
++    let generics = vec![
++        T::DTYPE.to_string(),
++        x.shape()[1].to_string(),
++        out.shape()[1].to_string(),
++        selected.shape()[1].to_string(),
++    ];
++    if T::DTYPE == bf16::DTYPE {
++        kernels::expert_mma(
++            out.partition([1, EXPERT_OUTPUT_COLUMNS]),
++            x,
++            weight,
++            selected,
++            input_repeat as i32,
++        )
++        .generics(generics)
++        .execute(exec)?;
++    } else {
++        kernels::expert(
++            out.partition([1, EXPERT_OUTPUT_COLUMNS]),
++            x,
++            weight,
++            selected,
++            input_repeat as i32,
++        )
++        .generics(generics)
++        .execute(exec)?;
++    }
++    Ok(())
++}
++
+ unsafe fn normalize<T: DType + DeviceCopy>(
+     scratch: &mut Scratch<T>,
+     x: &Tensor<T>,
+diff --git a/rust/engine/src/runner/model/qwen3_5/kernels.rs b/rust/engine/src/runner/model/qwen3_5/kernels.rs
+index 144a818..23ccbb6 100644
+--- a/rust/engine/src/runner/model/qwen3_5/kernels.rs
++++ b/rust/engine/src/runner/model/qwen3_5/kernels.rs
+@@ -866,7 +866,49 @@ mod ops {
+         scores.store(result);
+     }
+ 
+-    /// shortcut: direct selected-expert reductions, replace with grouped MMA when tuning MoE.
++    /// Each picked expert owns one CTA row; pad the token dimension to an MMA tile.
++    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
++    pub(super) unsafe fn expert_mma<T: ElementType, const K: i32, const N: i32, const TOP: i32>(
++        out: &mut Tensor<T, { [1, EXPERT_OUTPUT_COLUMNS] }>,
++        x: &Tensor<T, { [-1, K] }>,
++        weight: &Tensor<T, { [-1, K] }>,
++        ids: &Tensor<i32, { [-1, TOP] }>,
++        input_repeat: i32,
++    ) {
++        let pid = get_tile_block_id();
++        let source = pointer_to_tile(ids.as_ptr()).offset(pid.0);
++        let (id, _token): (Tile<i32, { [] }>, Token) = load_ptr_tko(
++            source,
++            ordering::Weak,
++            None::<scope::TileBlock>,
++            None,
++            None,
++            None,
++            Latency::<1>,
++        );
++        let id: i32 = tile_to_scalar(id);
++        let row = pid.0 / input_repeat;
++        let columns_per_expert: i32 = N / EXPERT_OUTPUT_COLUMNS;
++        let column = id * columns_per_expert + pid.1;
++        let mut acc: Tile<f32, { [16, EXPERT_OUTPUT_COLUMNS] }> =
++            constant(0.0f32, shape![16, EXPERT_OUTPUT_COLUMNS]);
++        for block in 0..(K / EXPERT_REDUCTION_COLUMNS) {
++            let input = x
++                .partition(shape![1, EXPERT_REDUCTION_COLUMNS])
++                .load([row, block])
++                .broadcast(shape![16, EXPERT_REDUCTION_COLUMNS]);
++            let w = weight
++                .partition(shape![EXPERT_OUTPUT_COLUMNS, EXPERT_REDUCTION_COLUMNS])
++                .load([column, block]);
++            acc = mma(input, w.transpose(), acc);
++        }
++        let zero: Tile<i32, { [] }> = constant(0i32, shape![]);
++        let result: Tile<f32, { [1, EXPERT_OUTPUT_COLUMNS] }> = extract(acc, [zero, zero]);
++        let result: Tile<T, { [1, EXPERT_OUTPUT_COLUMNS] }> = convert_tile(result);
++        out.store(result);
++    }
++
++    /// SIMT fallback for storage types outside the BF16 performance path.
+     #[cutile::entry()]
+     pub(super) unsafe fn expert<T: ElementType, const K: i32, const N: i32, const TOP: i32>(
+         out: &mut Tensor<T, { [1, EXPERT_OUTPUT_COLUMNS] }>,
+diff --git a/rust/engine/src/runner/model/qwen3_5/tests.rs b/rust/engine/src/runner/model/qwen3_5/tests.rs
+index dd919a4..917f63f 100644
+--- a/rust/engine/src/runner/model/qwen3_5/tests.rs
++++ b/rust/engine/src/runner/model/qwen3_5/tests.rs
+@@ -784,3 +784,99 @@ async fn graph_state_kernels_match_eager_real_geometry() -> Result<()> {
+     );
+     Ok(())
+ }
++
++#[tokio::test]
++async fn bf16_expert_mma_matches_independent_cpu_and_simt() -> Result<()> {
++    use super::kernels;
++    use cutile::{
++        api,
++        core::bf16,
++        tensor::{PartitionMut, Reshape, ToHostVec},
++        tile_kernel::TileKernel,
++        DType,
++    };
++    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
++    let policy = cuda_async::device_context::global_policy(0)?;
++    let ids = vec![2i32, 0, 1, 2, 1, 0, 2, 0];
++    let selected = api::copy_host_vec_to_device(&Arc::new(ids.clone()))
++        .schedule(&policy)?
++        .await?
++        .reshape(&[1, 8])?;
++    // Integer/power-of-two operands make the independent FP32 sums exact.
++    for (k, n, repeat) in [(2048usize, 1024usize, 8usize), (512, 2048, 1)] {
++        let inputs = Arc::new(
++            (0..8 / repeat * k)
++                .map(|j| bf16::from_f32(((j * 5 + 3) % 13) as f32 / 16.0 - 0.375))
++                .collect::<Vec<_>>(),
++        );
++        let weights = Arc::new(
++            (0..3 * n * k)
++                .map(|j| bf16::from_f32(((j * 3 + 7) % 17) as f32 / 64.0 - 0.125))
++                .collect::<Vec<_>>(),
++        );
++        let x = api::copy_host_vec_to_device(&inputs)
++            .schedule(&policy)?
++            .await?
++            .reshape(&[8 / repeat, k])?;
++        let w = Arc::new(
++            api::copy_host_vec_to_device(&weights)
++                .schedule(&policy)?
++                .await?
++                .reshape(&[3 * n, k])?,
++        );
++        for mma in [false, true] {
++            let mut out = api::zeros::<bf16>(&[8, n]).schedule(&policy)?.await?;
++            let generics = vec![
++                bf16::DTYPE.to_string(),
++                k.to_string(),
++                n.to_string(),
++                "8".into(),
++            ];
++            // SAFETY: IDs select the three allocated experts; both layouts match K/N/TOP.
++            unsafe {
++                if mma {
++                    kernels::expert_mma(
++                        (&mut out).partition([1, 32]),
++                        &x,
++                        w.clone(),
++                        &selected,
++                        repeat as i32,
++                    )
++                    .generics(generics)
++                    .schedule(&policy)?
++                    .await?;
++                } else {
++                    kernels::expert(
++                        (&mut out).partition([1, 32]),
++                        &x,
++                        w.clone(),
++                        &selected,
++                        repeat as i32,
++                    )
++                    .generics(generics)
++                    .schedule(&policy)?
++                    .await?;
++                }
++            }
++            let actual = out.to_host_vec().schedule(&policy)?.await?;
++            for row in 0..8 {
++                for column in 0..n {
++                    let base = (ids[row] as usize * n + column) * k;
++                    let expected = bf16::from_f32(
++                        (0..k)
++                            .map(|j| {
++                                inputs[row / repeat * k + j].to_f32() * weights[base + j].to_f32()
++                            })
++                            .sum::<f32>(),
++                    );
++                    assert_eq!(
++                        actual[row * n + column].to_bits(),
++                        expected.to_bits(),
++                        "mma={mma}, K={k}, row={row}, column={column}"
++                    );
++                }
++            }
++        }
++    }
++    Ok(())
++}

@@ -1,0 +1,688 @@
+{
+  "baseline": {
+    "api": {
+      "cuLaunchKernel": {
+        "calls": 7476,
+        "total_ms": 38.550476
+      },
+      "cuStreamIsCapturing": {
+        "calls": 16,
+        "total_ms": 0.636347
+      },
+      "cuMemFreeAsync": {
+        "calls": 60,
+        "total_ms": 0.57778
+      },
+      "cuMemAllocAsync": {
+        "calls": 60,
+        "total_ms": 0.189871
+      },
+      "cuMemcpyDtoHAsync_v2": {
+        "calls": 16,
+        "total_ms": 0.178959
+      },
+      "cuMemcpyHtoDAsync_v2": {
+        "calls": 16,
+        "total_ms": 0.177626
+      },
+      "cuEventRecord": {
+        "calls": 60,
+        "total_ms": 0.162149
+      },
+      "cuEventCreate": {
+        "calls": 60,
+        "total_ms": 0.043899
+      },
+      "cuStreamWriteValue32_v2": {
+        "calls": 8,
+        "total_ms": 0.043743
+      },
+      "cuCtxSynchronize": {
+        "calls": 1,
+        "total_ms": 0.04326
+      },
+      "cuEventDestroy_v2": {
+        "calls": 60,
+        "total_ms": 0.028951
+      },
+      "cuProfilerStart": {
+        "calls": 1,
+        "total_ms": 0.014265
+      },
+      "cuProfilerStop": {
+        "calls": 1,
+        "total_ms": 0.001136
+      }
+    },
+    "phases": {
+      "prefill": {
+        "kernel_ms_per_forward": 49.779103,
+        "kernel_instances": 987,
+        "kernels": [
+          {
+            "name": "expert_entry",
+            "count": 80,
+            "total_ms": 41.16525,
+            "share_percent": 82.69584528270829
+          },
+          {
+            "name": "linear_entry",
+            "count": 391,
+            "total_ms": 5.046965,
+            "share_percent": 10.138722266650726
+          },
+          {
+            "name": "delta_entry",
+            "count": 30,
+            "total_ms": 1.208534,
+            "share_percent": 2.427793847550849
+          },
+          {
+            "name": "gqa_attention_entry",
+            "count": 10,
+            "total_ms": 0.776902,
+            "share_percent": 1.560699074870835
+          },
+          {
+            "name": "conv_entry",
+            "count": 30,
+            "total_ms": 0.358421,
+            "share_percent": 0.7200230184943268
+          },
+          {
+            "name": "gated_norm_entry",
+            "count": 30,
+            "total_ms": 0.241432,
+            "share_percent": 0.48500673063554395
+          },
+          {
+            "name": "moe_merge_entry",
+            "count": 40,
+            "total_ms": 0.193812,
+            "share_percent": 0.3893440988681536
+          },
+          {
+            "name": "norm_entry",
+            "count": 81,
+            "total_ms": 0.159132,
+            "share_percent": 0.3196763107603606
+          },
+          {
+            "name": "route_entry",
+            "count": 40,
+            "total_ms": 0.144094,
+            "share_percent": 0.2894668471627542
+          },
+          {
+            "name": "add_entry",
+            "count": 80,
+            "total_ms": 0.11843,
+            "share_percent": 0.23791107686291577
+          },
+          {
+            "name": "full_entry",
+            "count": 60,
+            "total_ms": 0.108252,
+            "share_percent": 0.2174647462008305
+          },
+          {
+            "name": "expert_swiglu_entry",
+            "count": 40,
+            "total_ms": 0.087131,
+            "share_percent": 0.17503529543310573
+          },
+          {
+            "name": "qk_entry",
+            "count": 20,
+            "total_ms": 0.067263,
+            "share_percent": 0.13512296515266659
+          },
+          {
+            "name": "swiglu_entry",
+            "count": 40,
+            "total_ms": 0.064351,
+            "share_percent": 0.12927312089171233
+          },
+          {
+            "name": "store_entry",
+            "count": 10,
+            "total_ms": 0.03075,
+            "share_percent": 0.061772909005612255
+          },
+          {
+            "name": "argmax_blocks_entry",
+            "count": 1,
+            "total_ms": 0.002912,
+            "share_percent": 0.00584984426095424
+          },
+          {
+            "name": "argmax_final_entry",
+            "count": 1,
+            "total_ms": 0.00176,
+            "share_percent": 0.003535620157719596
+          },
+          {
+            "name": "embedding_entry",
+            "count": 1,
+            "total_ms": 0.001664,
+            "share_percent": 0.0033427681491167084
+          },
+          {
+            "name": "last_row_entry",
+            "count": 1,
+            "total_ms": 0.001152,
+            "share_percent": 0.0023142241032346445
+          },
+          {
+            "name": "bind_entry",
+            "count": 1,
+            "total_ms": 0.000896,
+            "share_percent": 0.0017999520802936125
+          }
+        ]
+      },
+      "decode": {
+        "kernel_ms_per_forward": 8.847320714285715,
+        "kernel_instances": 6489,
+        "kernels": [
+          {
+            "name": "linear_entry",
+            "count": 2737,
+            "total_ms": 35.28007,
+            "share_percent": 56.966511814835954
+          },
+          {
+            "name": "expert_entry",
+            "count": 560,
+            "total_ms": 16.875155,
+            "share_percent": 27.248208880670816
+          },
+          {
+            "name": "gqa_attention_entry",
+            "count": 70,
+            "total_ms": 2.362963,
+            "share_percent": 3.8154618076868956
+          },
+          {
+            "name": "delta_entry",
+            "count": 210,
+            "total_ms": 1.211032,
+            "share_percent": 1.9554459142553973
+          },
+          {
+            "name": "moe_merge_entry",
+            "count": 280,
+            "total_ms": 1.089304,
+            "share_percent": 1.7588924621166586
+          },
+          {
+            "name": "norm_entry",
+            "count": 567,
+            "total_ms": 1.010162,
+            "share_percent": 1.6311023619822271
+          },
+          {
+            "name": "route_entry",
+            "count": 280,
+            "total_ms": 0.970913,
+            "share_percent": 1.5677272433325051
+          },
+          {
+            "name": "conv_entry",
+            "count": 210,
+            "total_ms": 0.848193,
+            "share_percent": 1.3695720149013637
+          },
+          {
+            "name": "add_entry",
+            "count": 560,
+            "total_ms": 0.665545,
+            "share_percent": 1.0746514138380392
+          },
+          {
+            "name": "gated_norm_entry",
+            "count": 210,
+            "total_ms": 0.427762,
+            "share_percent": 0.6907046677327414
+          },
+          {
+            "name": "expert_swiglu_entry",
+            "count": 280,
+            "total_ms": 0.411732,
+            "share_percent": 0.6648211254270764
+          },
+          {
+            "name": "swiglu_entry",
+            "count": 280,
+            "total_ms": 0.352823,
+            "share_percent": 0.5697011258210617
+          },
+          {
+            "name": "qk_entry",
+            "count": 140,
+            "total_ms": 0.25801,
+            "share_percent": 0.4166071584706556
+          },
+          {
+            "name": "store_entry",
+            "count": 70,
+            "total_ms": 0.107007,
+            "share_percent": 0.1727835440737547
+          },
+          {
+            "name": "argmax_blocks_entry",
+            "count": 7,
+            "total_ms": 0.021344,
+            "share_percent": 0.03446402538815424
+          },
+          {
+            "name": "embedding_entry",
+            "count": 7,
+            "total_ms": 0.012383,
+            "share_percent": 0.01999475385970361
+          },
+          {
+            "name": "argmax_final_entry",
+            "count": 7,
+            "total_ms": 0.011904,
+            "share_percent": 0.019221315508835646
+          },
+          {
+            "name": "last_row_entry",
+            "count": 7,
+            "total_ms": 0.007487,
+            "share_percent": 0.012089212803650242
+          },
+          {
+            "name": "bind_entry",
+            "count": 7,
+            "total_ms": 0.007456,
+            "share_percent": 0.012039157294512649
+          }
+        ]
+      }
+    }
+  },
+  "candidate": {
+    "api": {
+      "cuLaunchKernel": {
+        "calls": 994,
+        "total_ms": 10.54794
+      },
+      "cuGraphLaunch": {
+        "calls": 7,
+        "total_ms": 2.147942
+      },
+      "cuMemFreeAsync": {
+        "calls": 60,
+        "total_ms": 0.497839
+      },
+      "cuMemAllocAsync": {
+        "calls": 60,
+        "total_ms": 0.424097
+      },
+      "cuStreamIsCapturing": {
+        "calls": 37,
+        "total_ms": 0.325289
+      },
+      "cuMemcpyHtoDAsync_v2": {
+        "calls": 23,
+        "total_ms": 0.289257
+      },
+      "cuEventRecord": {
+        "calls": 60,
+        "total_ms": 0.276886
+      },
+      "cuMemcpyDtoHAsync_v2": {
+        "calls": 16,
+        "total_ms": 0.205422
+      },
+      "cuEventCreate": {
+        "calls": 60,
+        "total_ms": 0.11319
+      },
+      "cuStreamWriteValue32_v2": {
+        "calls": 8,
+        "total_ms": 0.061606
+      },
+      "cuEventDestroy_v2": {
+        "calls": 60,
+        "total_ms": 0.056491
+      },
+      "cuCtxSynchronize": {
+        "calls": 1,
+        "total_ms": 0.028194
+      },
+      "cuProfilerStart": {
+        "calls": 1,
+        "total_ms": 0.011169
+      },
+      "cuProfilerStop": {
+        "calls": 1,
+        "total_ms": 0.00144
+      }
+    },
+    "phases": {
+      "prefill": {
+        "kernel_ms_per_forward": 49.807336,
+        "kernel_instances": 987,
+        "kernels": [
+          {
+            "name": "expert_entry",
+            "count": 80,
+            "total_ms": 41.184662,
+            "share_percent": 82.68794380008599
+          },
+          {
+            "name": "linear_entry",
+            "count": 391,
+            "total_ms": 5.051522,
+            "share_percent": 10.14212444528252
+          },
+          {
+            "name": "delta_entry",
+            "count": 30,
+            "total_ms": 1.209339,
+            "share_percent": 2.4280338944447863
+          },
+          {
+            "name": "gqa_attention_entry",
+            "count": 10,
+            "total_ms": 0.778185,
+            "share_percent": 1.5623903274007669
+          },
+          {
+            "name": "conv_entry",
+            "count": 30,
+            "total_ms": 0.358067,
+            "share_percent": 0.7189041389404967
+          },
+          {
+            "name": "gated_norm_entry",
+            "count": 30,
+            "total_ms": 0.241559,
+            "share_percent": 0.4849867898977773
+          },
+          {
+            "name": "moe_merge_entry",
+            "count": 40,
+            "total_ms": 0.194365,
+            "share_percent": 0.39023367963305644
+          },
+          {
+            "name": "norm_entry",
+            "count": 81,
+            "total_ms": 0.159355,
+            "share_percent": 0.31994282930530554
+          },
+          {
+            "name": "route_entry",
+            "count": 40,
+            "total_ms": 0.144669,
+            "share_percent": 0.2904572129695915
+          },
+          {
+            "name": "add_entry",
+            "count": 80,
+            "total_ms": 0.117979,
+            "share_percent": 0.23687072924357971
+          },
+          {
+            "name": "full_entry",
+            "count": 60,
+            "total_ms": 0.108349,
+            "share_percent": 0.21753622799661482
+          },
+          {
+            "name": "expert_swiglu_entry",
+            "count": 40,
+            "total_ms": 0.087516,
+            "share_percent": 0.1757090561920437
+          },
+          {
+            "name": "qk_entry",
+            "count": 20,
+            "total_ms": 0.067614,
+            "share_percent": 0.1357510869483162
+          },
+          {
+            "name": "swiglu_entry",
+            "count": 40,
+            "total_ms": 0.065308,
+            "share_percent": 0.13112124687817073
+          },
+          {
+            "name": "store_entry",
+            "count": 10,
+            "total_ms": 0.030559,
+            "share_percent": 0.06135441574309455
+          },
+          {
+            "name": "argmax_blocks_entry",
+            "count": 1,
+            "total_ms": 0.002944,
+            "share_percent": 0.005910775874461545
+          },
+          {
+            "name": "embedding_entry",
+            "count": 1,
+            "total_ms": 0.001664,
+            "share_percent": 0.00334087332034783
+          },
+          {
+            "name": "argmax_final_entry",
+            "count": 1,
+            "total_ms": 0.0016,
+            "share_percent": 0.003212378192642144
+          },
+          {
+            "name": "last_row_entry",
+            "count": 1,
+            "total_ms": 0.001216,
+            "share_percent": 0.0024414074264080296
+          },
+          {
+            "name": "bind_entry",
+            "count": 1,
+            "total_ms": 0.000864,
+            "share_percent": 0.0017346842240267579
+          }
+        ]
+      },
+      "decode": {
+        "kernel_ms_per_forward": 8.660080285714285,
+        "kernel_instances": 6489,
+        "kernels": [
+          {
+            "name": "linear_entry",
+            "count": 2737,
+            "total_ms": 34.708494,
+            "share_percent": 57.25531544890659
+          },
+          {
+            "name": "expert_entry",
+            "count": 560,
+            "total_ms": 16.631758,
+            "share_percent": 27.435836045201956
+          },
+          {
+            "name": "gqa_graph_entry",
+            "count": 70,
+            "total_ms": 2.40306,
+            "share_percent": 3.964100497781594
+          },
+          {
+            "name": "delta_graph_entry",
+            "count": 210,
+            "total_ms": 1.228695,
+            "share_percent": 2.0268617767021033
+          },
+          {
+            "name": "moe_merge_entry",
+            "count": 280,
+            "total_ms": 1.056158,
+            "share_percent": 1.7422438280925208
+          },
+          {
+            "name": "conv_graph_entry",
+            "count": 210,
+            "total_ms": 0.940191,
+            "share_percent": 1.5509440509640937
+          },
+          {
+            "name": "norm_entry",
+            "count": 567,
+            "total_ms": 0.89075,
+            "share_percent": 1.469385915623811
+          },
+          {
+            "name": "route_entry",
+            "count": 280,
+            "total_ms": 0.889028,
+            "share_percent": 1.4665452953075557
+          },
+          {
+            "name": "add_entry",
+            "count": 560,
+            "total_ms": 0.559314,
+            "share_percent": 0.9226473354041158
+          },
+          {
+            "name": "gated_norm_entry",
+            "count": 210,
+            "total_ms": 0.351029,
+            "share_percent": 0.57905929674489
+          },
+          {
+            "name": "expert_swiglu_entry",
+            "count": 280,
+            "total_ms": 0.314491,
+            "share_percent": 0.5187860185129923
+          },
+          {
+            "name": "swiglu_entry",
+            "count": 280,
+            "total_ms": 0.275798,
+            "share_percent": 0.4549578408725409
+          },
+          {
+            "name": "qk_graph_entry",
+            "count": 140,
+            "total_ms": 0.228027,
+            "share_percent": 0.37615454637322565
+          },
+          {
+            "name": "cache_decode_entry",
+            "count": 70,
+            "total_ms": 0.087675,
+            "share_percent": 0.14462914415079162
+          },
+          {
+            "name": "embedding_entry",
+            "count": 7,
+            "total_ms": 0.016863,
+            "share_percent": 0.027817294072595367
+          },
+          {
+            "name": "argmax_blocks_entry",
+            "count": 7,
+            "total_ms": 0.016768,
+            "share_percent": 0.027660581569666078
+          },
+          {
+            "name": "argmax_final_entry",
+            "count": 7,
+            "total_ms": 0.009024,
+            "share_percent": 0.014886038172988236
+          },
+          {
+            "name": "bind_entry",
+            "count": 7,
+            "total_ms": 0.007839,
+            "share_percent": 0.012931255899607133
+          },
+          {
+            "name": "last_row_entry",
+            "count": 7,
+            "total_ms": 0.0056,
+            "share_percent": 0.009237789646357948
+          }
+        ]
+      }
+    },
+    "nvtx_counts": {
+      "qwen3_5.argmax.blocks": 1,
+      "qwen3_5.argmax.final": 1,
+      "qwen3_5.decode.graph_replay": 7,
+      "qwen3_5.delta.conv": 30,
+      "qwen3_5.delta.gated_norm": 30,
+      "qwen3_5.delta.recurrence": 30,
+      "qwen3_5.embedding": 1,
+      "qwen3_5.gqa.attention": 10,
+      "qwen3_5.gqa.k_rope": 10,
+      "qwen3_5.gqa.kv_store": 10,
+      "qwen3_5.gqa.q_rope": 10,
+      "qwen3_5.head": 1,
+      "qwen3_5.host_validation": 8,
+      "qwen3_5.input.upload": 1,
+      "qwen3_5.layer.0": 1,
+      "qwen3_5.layer.1": 1,
+      "qwen3_5.layer.10": 1,
+      "qwen3_5.layer.11": 1,
+      "qwen3_5.layer.12": 1,
+      "qwen3_5.layer.13": 1,
+      "qwen3_5.layer.14": 1,
+      "qwen3_5.layer.15": 1,
+      "qwen3_5.layer.16": 1,
+      "qwen3_5.layer.17": 1,
+      "qwen3_5.layer.18": 1,
+      "qwen3_5.layer.19": 1,
+      "qwen3_5.layer.2": 1,
+      "qwen3_5.layer.20": 1,
+      "qwen3_5.layer.21": 1,
+      "qwen3_5.layer.22": 1,
+      "qwen3_5.layer.23": 1,
+      "qwen3_5.layer.24": 1,
+      "qwen3_5.layer.25": 1,
+      "qwen3_5.layer.26": 1,
+      "qwen3_5.layer.27": 1,
+      "qwen3_5.layer.28": 1,
+      "qwen3_5.layer.29": 1,
+      "qwen3_5.layer.3": 1,
+      "qwen3_5.layer.30": 1,
+      "qwen3_5.layer.31": 1,
+      "qwen3_5.layer.32": 1,
+      "qwen3_5.layer.33": 1,
+      "qwen3_5.layer.34": 1,
+      "qwen3_5.layer.35": 1,
+      "qwen3_5.layer.36": 1,
+      "qwen3_5.layer.37": 1,
+      "qwen3_5.layer.38": 1,
+      "qwen3_5.layer.39": 1,
+      "qwen3_5.layer.4": 1,
+      "qwen3_5.layer.5": 1,
+      "qwen3_5.layer.6": 1,
+      "qwen3_5.layer.7": 1,
+      "qwen3_5.layer.8": 1,
+      "qwen3_5.layer.9": 1,
+      "qwen3_5.linear": 391,
+      "qwen3_5.mixer.delta": 30,
+      "qwen3_5.mixer.gqa": 10,
+      "qwen3_5.moe": 40,
+      "qwen3_5.moe.expert.down": 40,
+      "qwen3_5.moe.expert.gate_up": 40,
+      "qwen3_5.moe.expert.swiglu": 40,
+      "qwen3_5.moe.merge": 40,
+      "qwen3_5.moe.route": 40,
+      "qwen3_5.moe.router": 40,
+      "qwen3_5.moe.shared": 40,
+      "qwen3_5.moe.shared.swiglu": 40,
+      "qwen3_5.prefill.submit": 1,
+      "qwen3_5.readback.enqueue": 8,
+      "qwen3_5.residual.add": 80,
+      "qwen3_5.rms_norm": 81,
+      "qwen3_5.state.allocate": 1,
+      "qwen3_5.workspace.checkout": 1
+    }
+  }
+}

@@ -1,0 +1,118 @@
+{
+  "processes": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "prefill_ms": 55.708338000000005,
+      "decode_ms": 10.922739285714286,
+      "total_ms": 132.167513,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 0,
+      "prefill_ms": 54.444126000000004,
+      "decode_ms": 10.481263571428572,
+      "total_ms": 127.88782400000001,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 1,
+      "prefill_ms": 55.026568,
+      "decode_ms": 10.184919142857144,
+      "total_ms": 126.32100200000002,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "prefill_ms": 55.419649,
+      "decode_ms": 10.827076714285713,
+      "total_ms": 131.20918600000002,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "prefill_ms": 55.550423,
+      "decode_ms": 10.857155428571428,
+      "total_ms": 131.595125,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 2,
+      "prefill_ms": 53.976995,
+      "decode_ms": 10.033177285714286,
+      "total_ms": 124.86686399999999,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    }
+  ],
+  "median": {
+    "baseline": {
+      "prefill_ms": 55.550423,
+      "decode_ms": 10.857155428571428,
+      "total_ms": 131.595125
+    },
+    "candidate": {
+      "prefill_ms": 54.444126000000004,
+      "decode_ms": 10.184919142857144,
+      "total_ms": 126.32100200000002
+    }
+  }
+}

@@ -1,0 +1,20 @@
+   Compiling engine v0.0.1 (/root/autodl-tmp/now/llm-inference-lab/rust/engine)
+    Finished `release` profile [optimized] target(s) in 35.97s
+     Running unittests src/lib.rs (rust/target/release/deps/engine-f8870ca35359a86c)
+
+running 1 test
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation ... reference max=0.5686466, rms=0.116848335, token=3636, expected=3636
+chunk=1 max=0, token=3636
+chunk=2 max=0, token=3636
+chunk=3 max=0, token=3636
+chunk=4 max=0, token=3636
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out; finished in 108.72s
+
+     Running unittests src/main.rs (rust/target/release/deps/engine-3f0dbf0c995685e0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

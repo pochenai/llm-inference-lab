@@ -1,0 +1,65 @@
+[
+  {
+    "engine": "baseline",
+    "repetition": 0,
+    "prefill_ms": 52.882165666666666,
+    "decode_ms": 12.404264999999999,
+    "total_ms": 140.96462866666667
+  },
+  {
+    "engine": "baseline",
+    "repetition": 1,
+    "prefill_ms": 52.960794666666665,
+    "decode_ms": 12.169235,
+    "total_ms": 138.846047
+  },
+  {
+    "engine": "baseline",
+    "repetition": 2,
+    "prefill_ms": 52.81860266666666,
+    "decode_ms": 12.846176000000002,
+    "total_ms": 141.643066
+  },
+  {
+    "engine": "candidate",
+    "repetition": 0,
+    "prefill_ms": 55.378837,
+    "decode_ms": 10.648268,
+    "total_ms": 131.10278433333335
+  },
+  {
+    "engine": "candidate",
+    "repetition": 1,
+    "prefill_ms": 55.34329433333333,
+    "decode_ms": 10.654448,
+    "total_ms": 131.42735233333332
+  },
+  {
+    "engine": "candidate",
+    "repetition": 2,
+    "prefill_ms": 55.362093,
+    "decode_ms": 10.685198999999999,
+    "total_ms": 130.93095499999998
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 0,
+    "prefill_ms": 69.12009061003725,
+    "decode_ms": 7.04873725771904,
+    "total_ms": 119.29775091509025
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 1,
+    "prefill_ms": 69.74013165260355,
+    "decode_ms": 7.0597282610833645,
+    "total_ms": 119.2442971902589
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 2,
+    "prefill_ms": 68.3027155076464,
+    "decode_ms": 7.015550974756479,
+    "total_ms": 117.60496689627568
+  }
+]

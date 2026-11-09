@@ -1,0 +1,19 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions has been running for over 60 seconds
+round=0, ids=[1, 7], pooled graph/eager max=0
+round=0, ids=[9, 3, 12], pooled graph/eager max=0
+round=0, ids=[1, 7, 9], pooled graph/eager max=0
+round=0, ids=[9, 3, 12, 8], pooled graph/eager max=0
+round=0, ids=[1, 7, 9, 3], pooled graph/eager max=0
+round=0, ids=[9, 3, 12, 8, 1], pooled graph/eager max=0
+round=1, ids=[1, 7], pooled graph/eager max=0
+round=1, ids=[9, 3, 12], pooled graph/eager max=0
+round=1, ids=[1, 7, 9], pooled graph/eager max=0
+round=1, ids=[9, 3, 12, 8], pooled graph/eager max=0
+round=1, ids=[1, 7, 9, 3], pooled graph/eager max=0
+round=1, ids=[9, 3, 12, 8, 1], pooled graph/eager max=0
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 146 filtered out; finished in 122.82s
+

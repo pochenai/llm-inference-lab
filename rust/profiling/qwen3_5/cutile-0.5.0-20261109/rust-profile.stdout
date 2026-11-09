@@ -1,0 +1,11 @@
+{"batch_size":1,"cpu_affinity":"Cpus_allowed_list:\t24-31","cuda_graph":false,"dtype":"bf16","event":"loaded","gpu_feedback":false,"input_tokens":32,"logits_validation":true,"output_tokens":8,"weight_bytes":69321574912}
+{"batch_size":1,"decode_step_seconds":[21.511102129,6.935359255,7.346742811,0.036002267,7.515806383,0.038066249,0.039829748],"event":"sample","forward_count":8,"generated_ids":[9707,9707,9707,9707,9707,9707,9707,9707],"input_tokens":32,"iteration":0,"kv_released":true,"prefill_seconds":28.291346212,"warmup":true}
+{"batch_size":1,"decode_step_seconds":[0.041157297,0.037312959,0.038791995,0.034106428,0.036743906,0.037472997,0.039050888],"event":"sample","forward_count":8,"generated_ids":[9707,9707,9707,9707,9707,9707,9707,9707],"input_tokens":32,"iteration":1,"kv_released":true,"prefill_seconds":0.060781572,"warmup":true}
+{"batch_size":1,"decode_step_seconds":[0.05030103,0.04550405,0.045030815,0.042815127,0.042580284,0.042139776,0.042274623],"event":"sample","forward_count":8,"generated_ids":[9707,9707,9707,9707,9707,9707,9707,9707],"input_tokens":32,"iteration":2,"kv_released":true,"prefill_seconds":0.062536208,"warmup":false}
+Capture range started in the application.
+Capture range ended in the application.
+Generating '/tmp/nsys-report-c757.qdstrm'
+[1/1] [0%                          ] rust-profile.nsys-repProcessing events...
+[1/1] [0%                          ] rust-profile.nsys-rep[1/1] [==========49%               ] rust-profile.nsys-rep[1/1] [========================99% ] rust-profile.nsys-rep[1/1] [6%                          ] rust-profile.nsys-rep[1/1] [==18%                       ] rust-profile.nsys-rep[1/1] [13%                         ] rust-profile.nsys-rep[1/1] [11%                         ] rust-profile.nsys-rep[1/1] [9%                          ] rust-profile.nsys-rep[1/1] [=17%                        ] rust-profile.nsys-rep[1/1] [====25%                     ] rust-profile.nsys-rep[1/1] [======34%                   ] rust-profile.nsys-rep[1/1] [========42%                 ] rust-profile.nsys-rep[1/1] [===========50%              ] rust-profile.nsys-rep[1/1] [========================100%] rust-profile.nsys-rep[1/1] [========================100%] rust-profile.nsys-rep
+Generated:
+	/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/rust-profile.nsys-rep

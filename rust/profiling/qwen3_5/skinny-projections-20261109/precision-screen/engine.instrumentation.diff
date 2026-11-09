@@ -1,0 +1,28 @@
+--- engine.rs
++++ engine.instrumented.rs
+@@ -1145,6 +1145,16 @@
+     let bias = scratch.activation(&[1], exec)?;
+     project(out, x, w, &bias, exec)
+ }
++#[cfg(test)]
++pub(super) static SKINNY_DIAGNOSTIC_ROLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(7);
++fn skinny_diagnostic_enabled(n: i32) -> bool {
++    #[cfg(test)] {
++        let role = match n { 1 => 1, 32 => 2, 256 => 4, _ => 0 };
++        SKINNY_DIAGNOSTIC_ROLES.load(std::sync::atomic::Ordering::Relaxed) & role != 0
++    }
++    #[cfg(not(test))] { n <= 256 }
++}
++
+ unsafe fn project<T: DType, O: DType>(
+     mut out: ScratchTensor<T, O>,
+     x: &Tensor<T>,
+@@ -1154,7 +1164,7 @@
+ ) -> Result<ScratchTensor<T, O>> {
+     let _range = ScopedRange::new(c"qwen3_5.linear");
+     // Keep the reduction tree independent of token count for chunked prefill.
+-    if T::DTYPE == bf16::DTYPE && O::DTYPE == bf16::DTYPE && w.shape()[0] <= 256 {
++    if T::DTYPE == bf16::DTYPE && O::DTYPE == bf16::DTYPE && skinny_diagnostic_enabled(w.shape()[0]) {
+         kernels::linear_vector((&mut out).partition([1, 4]), x, w)
+             .generics(vec![
+                 T::DTYPE.to_string(),

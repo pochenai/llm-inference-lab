@@ -1,0 +1,15 @@
+real BF16 common-history logits validation
+release Qwen3.5 regression suite
+r0-baseline
+r0-candidate
+r0-sglang-graph
+r1-candidate
+r1-sglang-graph
+r1-baseline
+r2-sglang-graph
+r2-baseline
+r2-candidate
+native complete
+profile-baseline
+profile-candidate
+complete

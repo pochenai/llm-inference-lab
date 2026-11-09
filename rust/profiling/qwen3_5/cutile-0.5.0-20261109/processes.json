@@ -1,0 +1,65 @@
+[
+  {
+    "engine": "rust",
+    "repetition": 0,
+    "prefill_ms": 59.36070433333333,
+    "decode_ms": 31.752672000000004,
+    "total_ms": 279.55259566666666
+  },
+  {
+    "engine": "rust",
+    "repetition": 1,
+    "prefill_ms": 59.07053233333333,
+    "decode_ms": 29.592734,
+    "total_ms": 264.98299199999997
+  },
+  {
+    "engine": "rust",
+    "repetition": 2,
+    "prefill_ms": 59.164326,
+    "decode_ms": 28.149585000000002,
+    "total_ms": 259.4867433333334
+  },
+  {
+    "engine": "sglang",
+    "repetition": 0,
+    "prefill_ms": 94.37697567045689,
+    "decode_ms": 67.57582817226648,
+    "total_ms": 566.9894587869445
+  },
+  {
+    "engine": "sglang",
+    "repetition": 1,
+    "prefill_ms": 95.25010036304593,
+    "decode_ms": 67.64785712584853,
+    "total_ms": 540.0793474788467
+  },
+  {
+    "engine": "sglang",
+    "repetition": 2,
+    "prefill_ms": 73.19818964848916,
+    "decode_ms": 49.64742297306657,
+    "total_ms": 427.1908860343198
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 0,
+    "prefill_ms": 95.73389651874702,
+    "decode_ms": 7.292649243026972,
+    "total_ms": 146.98208992679915
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 1,
+    "prefill_ms": 95.20571477090319,
+    "decode_ms": 7.291995920240879,
+    "total_ms": 146.48701421295604
+  },
+  {
+    "engine": "sglang-graph",
+    "repetition": 2,
+    "prefill_ms": 68.7414868734777,
+    "decode_ms": 7.042185869067907,
+    "total_ms": 118.36299439892173
+  }
+]

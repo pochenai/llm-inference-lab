@@ -1,0 +1,61 @@
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Capture range started in the application.
+Capture range ended in the application.
+Generating '/tmp/nsys-report-dfb2.qdstrm'
+[1/1] [0%                          ] sglang-eager.nsys-repProcessing events...
+[1/1] [0%                          ] sglang-eager.nsys-rep[1/1] [==========49%               ] sglang-eager.nsys-rep[1/1] [========================99% ] sglang-eager.nsys-rep[1/1] [7%                          ] sglang-eager.nsys-rep[1/1] [======34%                   ] sglang-eager.nsys-rep[1/1] [===========52%              ] sglang-eager.nsys-rep[1/1] [========================100%] sglang-eager.nsys-rep[1/1] [========================100%] sglang-eager.nsys-rep
+max_total_num_tokens=128
+Warmup ...
+Prefill. latency: 1.89864 s, throughput:     16.85 token/s
+Decode 0. Batch size: 1, latency: 0.27521 s, throughput:      3.63 token/s
+Decode 1. Batch size: 1, latency: 0.05326 s, throughput:     18.78 token/s
+Decode 2. Batch size: 1, latency: 0.05267 s, throughput:     18.99 token/s
+Decode 3. Batch size: 1, latency: 0.05213 s, throughput:     19.18 token/s
+Decode 4. Batch size: 1, latency: 0.05185 s, throughput:     19.29 token/s
+Decode.  median latency: 0.05213 s, median throughput:     19.18 token/s
+Total. latency:  2.487 s, throughput:     16.08 token/s
+Prefill. latency: 0.07144 s, throughput:    447.95 token/s
+Decode 0. Batch size: 1, latency: 0.05233 s, throughput:     19.11 token/s
+Decode 1. Batch size: 1, latency: 0.05238 s, throughput:     19.09 token/s
+Decode 2. Batch size: 1, latency: 0.05172 s, throughput:     19.33 token/s
+Decode 3. Batch size: 1, latency: 0.05126 s, throughput:     19.51 token/s
+Decode 4. Batch size: 1, latency: 0.05133 s, throughput:     19.48 token/s
+Decode.  median latency: 0.05178 s, median throughput:     19.31 token/s
+Total. latency:  0.435 s, throughput:     91.87 token/s
+Prefill. latency: 0.07250 s, throughput:    441.39 token/s
+Decode 0. Batch size: 1, latency: 0.05259 s, throughput:     19.02 token/s
+Decode 1. Batch size: 1, latency: 0.05197 s, throughput:     19.24 token/s
+Decode 2. Batch size: 1, latency: 0.05184 s, throughput:     19.29 token/s
+Decode 3. Batch size: 1, latency: 0.05163 s, throughput:     19.37 token/s
+Decode 4. Batch size: 1, latency: 0.05145 s, throughput:     19.44 token/s
+Decode.  median latency: 0.05197 s, median throughput:     19.24 token/s
+Total. latency:  0.437 s, throughput:     91.45 token/s
+Benchmark ...
+Prefill. latency: 0.07202 s, throughput:    444.32 token/s
+Decode 0. Batch size: 1, latency: 0.05222 s, throughput:     19.15 token/s
+Decode 1. Batch size: 1, latency: 0.05133 s, throughput:     19.48 token/s
+Decode 2. Batch size: 1, latency: 0.05132 s, throughput:     19.48 token/s
+Decode 3. Batch size: 1, latency: 0.05157 s, throughput:     19.39 token/s
+Decode 4. Batch size: 1, latency: 0.05148 s, throughput:     19.42 token/s
+Decode.  median latency: 0.05157 s, median throughput:     19.39 token/s
+Total. latency:  0.435 s, throughput:     91.91 token/s
+Prefill. latency: 0.07193 s, throughput:    444.90 token/s
+Decode 0. Batch size: 1, latency: 0.05229 s, throughput:     19.12 token/s
+Decode 1. Batch size: 1, latency: 0.05148 s, throughput:     19.42 token/s
+Decode 2. Batch size: 1, latency: 0.05190 s, throughput:     19.27 token/s
+Decode 3. Batch size: 1, latency: 0.05171 s, throughput:     19.34 token/s
+Decode 4. Batch size: 1, latency: 0.05172 s, throughput:     19.33 token/s
+Decode.  median latency: 0.05190 s, median throughput:     19.27 token/s
+Total. latency:  0.436 s, throughput:     91.70 token/s
+Prefill. latency: 0.08676 s, throughput:    368.81 token/s
+Decode 0. Batch size: 1, latency: 0.06183 s, throughput:     16.17 token/s
+Decode 1. Batch size: 1, latency: 0.06112 s, throughput:     16.36 token/s
+Decode 2. Batch size: 1, latency: 0.06074 s, throughput:     16.46 token/s
+Decode 3. Batch size: 1, latency: 0.06089 s, throughput:     16.42 token/s
+Decode 4. Batch size: 1, latency: 0.06246 s, throughput:     16.01 token/s
+Decode.  median latency: 0.06112 s, median throughput:     16.36 token/s
+Total. latency:  0.516 s, throughput:     77.51 token/s
+Generated:
+	/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/sglang-gap-20261108/sglang-eager.nsys-rep

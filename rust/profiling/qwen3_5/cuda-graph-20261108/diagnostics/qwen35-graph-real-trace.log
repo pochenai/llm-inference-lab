@@ -1,0 +1,166 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions has been running for over 60 seconds
+round=0, ids=[1, 7], pooled graph/eager max=0
+round=0, ids=[9, 3, 12], pooled graph/eager max=0
+round=0, ids=[1, 7, 9], pooled graph/eager max=0
+round=0, ids=[9, 3, 12, 8], pooled graph/eager max=0.18523407
+TRACE layer=10 stage=1 error=0.00012207031
+TRACE layer=10 stage=2 error=0.00048828125
+TRACE layer=10 stage=3 error=0.0078125
+TRACE layer=10 stage=4 error=0.0009765625
+TRACE layer=11 stage=0 error=0.015625
+TRACE layer=11 stage=1 error=0.00048828125
+TRACE layer=11 stage=2 error=0.0009765625
+TRACE layer=11 stage=3 error=0.015625
+TRACE layer=11 stage=4 error=0.00390625
+TRACE layer=12 stage=0 error=0.03125
+TRACE layer=12 stage=1 error=0.00036621094
+TRACE layer=12 stage=2 error=0.00390625
+TRACE layer=12 stage=3 error=0.0625
+TRACE layer=12 stage=4 error=0.00390625
+TRACE layer=13 stage=0 error=0.0625
+TRACE layer=13 stage=1 error=0.0026855469
+TRACE layer=13 stage=2 error=0.00390625
+TRACE layer=13 stage=3 error=0.0625
+TRACE layer=13 stage=4 error=0.00390625
+TRACE layer=14 stage=0 error=0.0625
+TRACE layer=14 stage=1 error=0.00390625
+TRACE layer=14 stage=2 error=0.00390625
+TRACE layer=14 stage=3 error=0.03125
+TRACE layer=14 stage=4 error=0.00390625
+TRACE layer=15 stage=0 error=0.125
+TRACE layer=15 stage=1 error=0.00390625
+TRACE layer=15 stage=2 error=0.0078125
+TRACE layer=15 stage=3 error=0.09375
+TRACE layer=15 stage=4 error=0.0078125
+TRACE layer=16 stage=0 error=0.1875
+TRACE layer=16 stage=1 error=0.00390625
+TRACE layer=16 stage=2 error=0.0078125
+TRACE layer=16 stage=3 error=0.0625
+TRACE layer=16 stage=4 error=0.0078125
+TRACE layer=17 stage=0 error=0.125
+TRACE layer=17 stage=1 error=0.0009765625
+TRACE layer=17 stage=2 error=0.0078125
+TRACE layer=17 stage=3 error=0.09375
+TRACE layer=17 stage=4 error=0.0078125
+TRACE layer=18 stage=0 error=0.125
+TRACE layer=18 stage=1 error=0.001953125
+TRACE layer=18 stage=2 error=0.0078125
+TRACE layer=18 stage=3 error=0.0625
+TRACE layer=18 stage=4 error=0.0078125
+TRACE layer=19 stage=0 error=0.125
+TRACE layer=19 stage=1 error=0.00048828125
+TRACE layer=19 stage=2 error=0.0078125
+TRACE layer=19 stage=3 error=0.0625
+TRACE layer=19 stage=4 error=0.0078125
+TRACE layer=20 stage=0 error=0.1875
+TRACE layer=20 stage=1 error=0.001953125
+TRACE layer=20 stage=2 error=0.0078125
+TRACE layer=20 stage=3 error=0.0625
+TRACE layer=20 stage=4 error=0.0078125
+TRACE layer=21 stage=0 error=0.125
+TRACE layer=21 stage=1 error=0.00048828125
+TRACE layer=21 stage=2 error=0.0078125
+TRACE layer=21 stage=3 error=0.0625
+TRACE layer=21 stage=4 error=0.0078125
+TRACE layer=22 stage=0 error=0.125
+TRACE layer=22 stage=1 error=0.001953125
+TRACE layer=22 stage=2 error=0.0078125
+TRACE layer=22 stage=3 error=0.0625
+TRACE layer=22 stage=4 error=0.0078125
+TRACE layer=23 stage=0 error=0.125
+TRACE layer=23 stage=1 error=0.00048828125
+TRACE layer=23 stage=2 error=0.0078125
+TRACE layer=23 stage=3 error=0.0625
+TRACE layer=23 stage=4 error=0.0078125
+TRACE layer=24 stage=0 error=0.0625
+TRACE layer=24 stage=1 error=0.001953125
+TRACE layer=24 stage=2 error=0.0078125
+TRACE layer=24 stage=3 error=0.0625
+TRACE layer=24 stage=4 error=0.0078125
+TRACE layer=25 stage=0 error=0.0625
+TRACE layer=25 stage=1 error=0.01171875
+TRACE layer=25 stage=2 error=0.0078125
+TRACE layer=25 stage=3 error=0.0625
+TRACE layer=25 stage=4 error=0.008300781
+TRACE layer=26 stage=0 error=0.125
+TRACE layer=26 stage=1 error=0.0234375
+TRACE layer=26 stage=2 error=0.03125
+TRACE layer=26 stage=3 error=0.1171875
+TRACE layer=26 stage=4 error=0.0129852295
+TRACE layer=27 stage=0 error=0.125
+TRACE layer=27 stage=1 error=0.005859375
+TRACE layer=27 stage=2 error=0.015625
+TRACE layer=27 stage=3 error=0.16796875
+TRACE layer=27 stage=4 error=0.0146484375
+TRACE layer=28 stage=0 error=0.140625
+TRACE layer=28 stage=1 error=0.0035705566
+TRACE layer=28 stage=2 error=0.0146484375
+TRACE layer=28 stage=3 error=0.1640625
+TRACE layer=28 stage=4 error=0.017578125
+TRACE layer=29 stage=0 error=0.1328125
+TRACE layer=29 stage=1 error=0.015625
+TRACE layer=29 stage=2 error=0.015625
+TRACE layer=29 stage=3 error=0.171875
+TRACE layer=29 stage=4 error=0.015625
+TRACE layer=30 stage=0 error=0.125
+TRACE layer=30 stage=1 error=0.0078125
+TRACE layer=30 stage=2 error=0.015625
+TRACE layer=30 stage=3 error=0.1640625
+TRACE layer=30 stage=4 error=0.030029297
+TRACE layer=31 stage=0 error=0.1673584
+TRACE layer=31 stage=1 error=0.041992188
+TRACE layer=31 stage=2 error=0.02947998
+TRACE layer=31 stage=3 error=0.35986328
+TRACE layer=31 stage=4 error=0.033935547
+TRACE layer=32 stage=0 error=0.25
+TRACE layer=32 stage=1 error=0.0057373047
+TRACE layer=32 stage=2 error=0.03173828
+TRACE layer=32 stage=3 error=0.34472656
+TRACE layer=32 stage=4 error=0.046875
+TRACE layer=33 stage=0 error=0.25
+TRACE layer=33 stage=1 error=0.01171875
+TRACE layer=33 stage=2 error=0.03125
+TRACE layer=33 stage=3 error=0.2890625
+TRACE layer=33 stage=4 error=0.029296875
+TRACE layer=34 stage=0 error=0.1875
+TRACE layer=34 stage=1 error=0.0078125
+TRACE layer=34 stage=2 error=0.026123047
+TRACE layer=34 stage=3 error=0.23828125
+TRACE layer=34 stage=4 error=0.09375
+TRACE layer=35 stage=0 error=0.3125
+TRACE layer=35 stage=1 error=0.095703125
+TRACE layer=35 stage=2 error=0.03125
+TRACE layer=35 stage=3 error=0.23706055
+TRACE layer=35 stage=4 error=0.03125
+TRACE layer=36 stage=0 error=0.1875
+TRACE layer=36 stage=1 error=0.021484375
+TRACE layer=36 stage=2 error=0.03125
+TRACE layer=36 stage=3 error=0.21582031
+TRACE layer=36 stage=4 error=0.0625
+TRACE layer=37 stage=0 error=0.25
+TRACE layer=37 stage=1 error=0.015625
+TRACE layer=37 stage=2 error=0.09375
+TRACE layer=37 stage=3 error=0.1875
+TRACE layer=37 stage=4 error=0.0625
+TRACE layer=38 stage=0 error=0.1875
+TRACE layer=38 stage=1 error=0.015625
+TRACE layer=38 stage=2 error=0.09375
+TRACE layer=38 stage=3 error=0.25
+TRACE layer=38 stage=4 error=0.0625
+TRACE layer=39 stage=0 error=0.125
+TRACE layer=39 stage=1 error=0.015625
+TRACE layer=39 stage=2 error=0.040771484
+TRACE layer=39 stage=3 error=0.125
+TRACE layer=39 stage=4 error=0.0625
+Error: round=0, ids=[9, 3, 12, 8], graph/eager error=0.18523407
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions ... FAILED
+
+failures:
+
+failures:
+    runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 145 filtered out; finished in 112.76s
+

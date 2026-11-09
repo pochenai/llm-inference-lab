@@ -1,0 +1,14 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::reference_chunking_and_state_validation ... reference max=0.6661885, rms=0.12629366, token=3636, expected=3636
+chunk=1 max=0.31143212, token=3636
+Error: chunk=1 error=0.31143212
+FAILED
+
+failures:
+
+failures:
+    runner::model::qwen3_5::tests::reference_chunking_and_state_validation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 148 filtered out; finished in 74.00s
+

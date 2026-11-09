@@ -1,0 +1,30 @@
+[
+  [
+    "taskset",
+    "-c",
+    "24-31",
+    "nsys",
+    "profile",
+    "--trace=cuda,nvtx",
+    "--cuda-graph-trace=node",
+    "--sample=none",
+    "--cpuctxsw=none",
+    "--capture-range=cudaProfilerApi",
+    "--capture-range-end=stop",
+    "--force-overwrite=true",
+    "--output=/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/post-frozen-profile-20261109/rust-graph",
+    "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/post-frozen-profile-20261109/candidate",
+    "--model-dir",
+    "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+    "--tokens",
+    "32",
+    "--output-tokens",
+    "8",
+    "--warmup",
+    "2",
+    "--iterations",
+    "1",
+    "--profile",
+    "--cuda-graph"
+  ]
+]

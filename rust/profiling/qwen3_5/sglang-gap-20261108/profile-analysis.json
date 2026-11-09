@@ -1,0 +1,811 @@
+{
+  "rust_replay_cpu": [
+    {
+      "metadata_preparation_ms": 1.194646,
+      "post_upload_launch_preparation_ms": 1.149136,
+      "driver_graph_launch_ms": 0.447246,
+      "replay_submit_range_ms": 2.87804
+    },
+    {
+      "metadata_preparation_ms": 0.177492,
+      "post_upload_launch_preparation_ms": 1.036089,
+      "driver_graph_launch_ms": 0.376815,
+      "replay_submit_range_ms": 1.648174
+    },
+    {
+      "metadata_preparation_ms": 0.166803,
+      "post_upload_launch_preparation_ms": 0.922404,
+      "driver_graph_launch_ms": 0.328033,
+      "replay_submit_range_ms": 1.480281
+    },
+    {
+      "metadata_preparation_ms": 0.166466,
+      "post_upload_launch_preparation_ms": 0.854987,
+      "driver_graph_launch_ms": 0.344888,
+      "replay_submit_range_ms": 1.41739
+    },
+    {
+      "metadata_preparation_ms": 0.171372,
+      "post_upload_launch_preparation_ms": 0.80031,
+      "driver_graph_launch_ms": 0.306055,
+      "replay_submit_range_ms": 1.327992
+    },
+    {
+      "metadata_preparation_ms": 0.163452,
+      "post_upload_launch_preparation_ms": 0.783416,
+      "driver_graph_launch_ms": 0.301874,
+      "replay_submit_range_ms": 1.303369
+    },
+    {
+      "metadata_preparation_ms": 0.161898,
+      "post_upload_launch_preparation_ms": 0.794476,
+      "driver_graph_launch_ms": 0.295445,
+      "replay_submit_range_ms": 1.300164
+    }
+  ],
+  "rust_validation_ms": [
+    0.312539,
+    0.311804,
+    0.312289,
+    0.312493,
+    0.325299,
+    0.31163,
+    0.311534
+  ],
+  "rust_post_readback_tail_ms": [
+    0.755636,
+    0.565016,
+    0.537072,
+    0.524716,
+    0.536192,
+    0.498852,
+    0.499392
+  ],
+  "rust_copies_cohort": [
+    {
+      "kind": 1,
+      "count": 23,
+      "bytes": 4904,
+      "gpu_ms": 0.007488
+    },
+    {
+      "kind": 2,
+      "count": 16,
+      "bytes": 7946272,
+      "gpu_ms": 0.283432
+    }
+  ],
+  "rust-graph": {
+    "per_step": [
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.676986,
+        "kernel_union_ms": 8.676986,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 11.707799,
+        "span_non_kernel_ms": 3.030813
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.665972,
+        "kernel_union_ms": 8.665972,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.490224,
+        "span_non_kernel_ms": 1.824252
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.66357,
+        "kernel_union_ms": 8.66357,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.310186,
+        "span_non_kernel_ms": 1.646616
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.666554,
+        "kernel_union_ms": 8.666554,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.259305,
+        "span_non_kernel_ms": 1.592751
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.667638,
+        "kernel_union_ms": 8.667638,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.177382,
+        "span_non_kernel_ms": 1.509744
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.664473,
+        "kernel_union_ms": 8.664473,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.146725,
+        "span_non_kernel_ms": 1.482252
+      },
+      {
+        "kernels": 927,
+        "kernel_sum_ms": 8.664184,
+        "kernel_union_ms": 8.664184,
+        "overlap_ms": 0.0,
+        "kernel_span_ms": 10.141574,
+        "span_non_kernel_ms": 1.47739
+      }
+    ],
+    "mean": {
+      "kernels": 927,
+      "kernel_sum_ms": 8.667053857142857,
+      "kernel_union_ms": 8.667053857142857,
+      "overlap_ms": 0.0,
+      "kernel_span_ms": 10.461885,
+      "span_non_kernel_ms": 1.7948311428571428
+    },
+    "families": {
+      "other": {
+        "ms_per_step": 0.9825837142857143,
+        "kernels_per_step": 446.0
+      },
+      "dense_projections": {
+        "ms_per_step": 4.963381714285714,
+        "kernels_per_step": 391.0
+      },
+      "routed_expert_gemm": {
+        "ms_per_step": 2.376080857142857,
+        "kernels_per_step": 80.0
+      },
+      "gqa_attention": {
+        "ms_per_step": 0.3450075714285714,
+        "kernels_per_step": 10.0
+      }
+    },
+    "kernels": [
+      {
+        "name": "linear_entry",
+        "count_per_step": 391.0,
+        "ms_per_step": 4.963381714285714
+      },
+      {
+        "name": "expert_entry",
+        "count_per_step": 80.0,
+        "ms_per_step": 2.376080857142857
+      },
+      {
+        "name": "gqa_graph_entry",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.3450075714285714
+      },
+      {
+        "name": "delta_graph_entry",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.17521971428571428
+      },
+      {
+        "name": "moe_merge_entry",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.15098942857142858
+      },
+      {
+        "name": "conv_graph_entry",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.13420857142857143
+      },
+      {
+        "name": "norm_entry",
+        "count_per_step": 81.0,
+        "ms_per_step": 0.12732857142857143
+      },
+      {
+        "name": "route_entry",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.126989
+      },
+      {
+        "name": "add_entry",
+        "count_per_step": 80.0,
+        "ms_per_step": 0.07994785714285714
+      },
+      {
+        "name": "gated_norm_entry",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.05026885714285714
+      },
+      {
+        "name": "expert_swiglu_entry",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.045029714285714284
+      },
+      {
+        "name": "swiglu_entry",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.03948485714285715
+      },
+      {
+        "name": "qk_graph_entry",
+        "count_per_step": 20.0,
+        "ms_per_step": 0.03265
+      },
+      {
+        "name": "cache_decode_entry",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.012403
+      },
+      {
+        "name": "argmax_blocks_entry",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0024594285714285716
+      },
+      {
+        "name": "embedding_entry",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.002386285714285714
+      },
+      {
+        "name": "argmax_final_entry",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0012847142857142857
+      },
+      {
+        "name": "bind_entry",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0011245714285714288
+      },
+      {
+        "name": "last_row_entry",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0008091428571428571
+      }
+    ]
+  },
+  "sglang-graph": {
+    "per_step": [
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.250992,
+        "kernel_union_ms": 6.286086,
+        "overlap_ms": 0.964906,
+        "kernel_span_ms": 8.110721,
+        "span_non_kernel_ms": 1.824635
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.223527,
+        "kernel_union_ms": 6.27123,
+        "overlap_ms": 0.952297,
+        "kernel_span_ms": 7.684782,
+        "span_non_kernel_ms": 1.413552
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.229101,
+        "kernel_union_ms": 6.280574,
+        "overlap_ms": 0.948527,
+        "kernel_span_ms": 7.611276,
+        "span_non_kernel_ms": 1.330702
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.222953,
+        "kernel_union_ms": 6.273469,
+        "overlap_ms": 0.949484,
+        "kernel_span_ms": 7.586666,
+        "span_non_kernel_ms": 1.313197
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.213097,
+        "kernel_union_ms": 6.26806,
+        "overlap_ms": 0.945037,
+        "kernel_span_ms": 7.586666,
+        "span_non_kernel_ms": 1.318606
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.204329,
+        "kernel_union_ms": 6.266973,
+        "overlap_ms": 0.937356,
+        "kernel_span_ms": 7.571977,
+        "span_non_kernel_ms": 1.305004
+      },
+      {
+        "kernels": 1100,
+        "kernel_sum_ms": 7.223006,
+        "kernel_union_ms": 6.275925,
+        "overlap_ms": 0.947081,
+        "kernel_span_ms": 7.622764,
+        "span_non_kernel_ms": 1.346839
+      }
+    ],
+    "mean": {
+      "kernels": 1100,
+      "kernel_sum_ms": 7.223857857142857,
+      "kernel_union_ms": 6.274616714285714,
+      "overlap_ms": 0.9492411428571429,
+      "kernel_span_ms": 7.6821217142857146,
+      "span_non_kernel_ms": 1.407505
+    },
+    "families": {
+      "other": {
+        "ms_per_step": 1.209540142857143,
+        "kernels_per_step": 629.0
+      },
+      "dense_projections": {
+        "ms_per_step": 4.172431571428572,
+        "kernels_per_step": 371.0
+      },
+      "routed_expert_gemm": {
+        "ms_per_step": 1.7718492857142856,
+        "kernels_per_step": 80.0
+      },
+      "gqa_attention": {
+        "ms_per_step": 0.07003685714285715,
+        "kernels_per_step": 20.0
+      }
+    },
+    "kernels": [
+      {
+        "name": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+        "count_per_step": 151.0,
+        "ms_per_step": 3.3046828571428573
+      },
+      {
+        "name": "fused_moe_kernel",
+        "count_per_step": 80.0,
+        "ms_per_step": 1.7718492857142856
+      },
+      {
+        "name": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+        "count_per_step": 140.0,
+        "ms_per_step": 0.5078172857142857
+      },
+      {
+        "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.21138128571428572
+      },
+      {
+        "name": "void flashinfer::norm::FusedAddRMSNormKernel<(unsigned int)8, __nv_bfloat16>(T2 *, T2 *, T2 *, unsigned int, unsigned int, unsigned int, float, float)",
+        "count_per_step": 80.0,
+        "ms_per_step": 0.16790114285714286
+      },
+      {
+        "name": "fused_sigmoid_gating_delta_rule_update_kernel",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.16245257142857142
+      },
+      {
+        "name": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, (bool)0, (bool)1, (bool)0, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.14855014285714288
+      },
+      {
+        "name": "void topkGatingSoftmax<__nv_bfloat16, (int)8, (int)256, (int)4, (int)16>(const T1 *, const bool *, float *, int, int *, int, int, int, bool, float, const float *)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.14059685714285713
+      },
+      {
+        "name": "void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &silu<float>>(T1 *, const T1 *, int)",
+        "count_per_step": 80.0,
+        "ms_per_step": 0.1264
+      },
+      {
+        "name": "void moe_align_block_size_kernel<int>(const T1 *, int *, int *, int *, int, int, unsigned long, int *, bool, int, int)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.099123
+      },
+      {
+        "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.09411728571428571
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 2)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+        "count_per_step": 50.0,
+        "ms_per_step": 0.071473
+      },
+      {
+        "name": "_causal_conv1d_update_kernel",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.06634314285714285
+      },
+      {
+        "name": "_fwd_grouped_kernel_stage1",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.052637
+      },
+      {
+        "name": "void count_and_sort_expert_tokens_kernel<int>(const T1 *, int *, int *, unsigned long)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.047251857142857144
+      },
+      {
+        "name": "void flashinfer::norm::RMSNormKernel<(unsigned int)8, __nv_bfloat16>(T2 *, T2 *, T2 *, unsigned int, unsigned int, unsigned int, float, float)",
+        "count_per_step": 21.0,
+        "ms_per_step": 0.03798214285714285
+      },
+      {
+        "name": "_layer_norm_fwd_1pass_kernel",
+        "count_per_step": 30.0,
+        "ms_per_step": 0.035536285714285715
+      },
+      {
+        "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 12)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+        "count_per_step": 20.0,
+        "ms_per_step": 0.033610428571428576
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.03265928571428572
+      },
+      {
+        "name": "triton_per_fused_copy__mul_sum_0",
+        "count_per_step": 40.0,
+        "ms_per_step": 0.030666428571428574
+      },
+      {
+        "name": "_fwd_kernel_stage2",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.01739985714285714
+      },
+      {
+        "name": "_triton_mrope_forward_fused",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.014981
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.01025442857142857
+      },
+      {
+        "name": "void <unnamed>::store_kvcache<(long)1024, (int)2, (bool)1, long>(<unnamed>::StoreKVCacheParams)",
+        "count_per_step": 10.0,
+        "ms_per_step": 0.010203857142857143
+      },
+      {
+        "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, (int)4, (int)4>>(T3)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.006116571428571429
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 3)]::operator ()() const::[lambda(int) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+        "count_per_step": 4.0,
+        "ms_per_step": 0.0037214285714285717
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.002469
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(long) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+        "count_per_step": 2.0,
+        "ms_per_step": 0.0022264285714285715
+      },
+      {
+        "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_put_kernel_impl<at::native::OpaqueType<(int)4>>(at::TensorIterator &, c10::ArrayRef<long>, c10::ArrayRef<long>)::[lambda(char *, const char *, long) (instance 1)]>(at::TensorIteratorBase &, c10::ArrayRef<long>, c10::ArrayRef<long>, const T1 &, bool)::[lambda(int) (instance 1)]>(long, T3)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0020755714285714284
+      },
+      {
+        "name": "void at::native::<unnamed>::indexSelectSmallIndex<c10::BFloat16, long, unsigned int, (int)2, (int)2, (int)-2>(at::cuda::detail::TensorInfo<T1, T3>, at::cuda::detail::TensorInfo<const T1, T3>, at::cuda::detail::TensorInfo<const T2, T3>, int, int, T3, long)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0019154285714285714
+      },
+      {
+        "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_kernel_impl<at::native::OpaqueType<(int)4>>(at::TensorIteratorBase &, c10::ArrayRef<long>, c10::ArrayRef<long>)::[lambda(char *, const char *, long) (instance 1)]>(at::TensorIteratorBase &, c10::ArrayRef<long>, c10::ArrayRef<long>, const T1 &, bool)::[lambda(int) (instance 1)]>(long, T3)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0016777142857142859
+      },
+      {
+        "name": "void at_cuda_detail::cub::DeviceScanKernel<at_cuda_detail::cub::DeviceScanPolicy<long, std::plus<long>>::Policy900, const long *, long *, at_cuda_detail::cub::ScanTileState<long, (bool)1>, std::plus<long>, at_cuda_detail::cub::NullType, unsigned int, long, (bool)0>(T2, T3, T4, int, T5, T6, T7)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.001577142857142857
+      },
+      {
+        "name": "create_flashinfer_kv_indices_triton",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0014857142857142857
+      },
+      {
+        "name": "get_num_kv_splits_triton",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0012205714285714287
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctorOnSelf_add<int>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0011382857142857143
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<(int)2, at::native::CUDAFunctorOnSelf_add<long>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.00096
+      },
+      {
+        "name": "triton_poi_fused_clamp_sub_0",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.0007405714285714285
+      },
+      {
+        "name": "void at_cuda_detail::cub::DeviceScanInitKernel<at_cuda_detail::cub::ScanTileState<long, (bool)1>>(T1, int)",
+        "count_per_step": 1.0,
+        "ms_per_step": 0.000663
+      }
+    ]
+  },
+  "sglang_eager_dense_roles": {
+    "linear_attn.in_proj_qkv": {
+      "kernels_per_step": 30.0,
+      "ms_per_step": 0.8693547142857143,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "linear_attn.in_proj_z": {
+      "kernels_per_step": 30.0,
+      "ms_per_step": 0.466319,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "linear_attn.in_proj_b": {
+      "kernels_per_step": 30.0,
+      "ms_per_step": 0.07804114285714285,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "linear_attn.in_proj_a": {
+      "kernels_per_step": 30.0,
+      "ms_per_step": 0.076705,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "linear_attn.out_proj": {
+      "kernels_per_step": 30.0,
+      "ms_per_step": 0.4862127142857143,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "mlp.shared_expert.gate_up_proj": {
+      "kernels_per_step": 40.0,
+      "ms_per_step": 0.2611645714285714,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "mlp.shared_expert.down_proj": {
+      "kernels_per_step": 40.0,
+      "ms_per_step": 0.18255128571428572,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "mlp.shared_expert_gate": {
+      "kernels_per_step": 80.0,
+      "ms_per_step": 0.24974757142857143,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, (bool)0, (bool)1, (bool)0, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13)",
+        "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+      ]
+    },
+    "mlp.gate": {
+      "kernels_per_step": 40.0,
+      "ms_per_step": 0.11626942857142857,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "qkv_proj": {
+      "kernels_per_step": 10.0,
+      "ms_per_step": 0.3182857142857143,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "o_proj": {
+      "kernels_per_step": 10.0,
+      "ms_per_step": 0.16309542857142859,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    },
+    "unhooked": {
+      "kernels_per_step": 1.0,
+      "ms_per_step": 0.76036,
+      "kernel_names": [
+        "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+      ]
+    }
+  },
+  "sglang_graph_dense_roles": {
+    "linear_attn.in_proj_qkv": {
+      "ms_per_step": 0.8624921428571428,
+      "kernels_per_step": 30.0
+    },
+    "linear_attn.in_proj_z": {
+      "ms_per_step": 0.4597235714285714,
+      "kernels_per_step": 30.0
+    },
+    "linear_attn.in_proj_b": {
+      "ms_per_step": 0.07646914285714286,
+      "kernels_per_step": 30.0
+    },
+    "linear_attn.in_proj_a": {
+      "ms_per_step": 0.07502071428571429,
+      "kernels_per_step": 30.0
+    },
+    "linear_attn.out_proj": {
+      "ms_per_step": 0.47166014285714286,
+      "kernels_per_step": 30.0
+    },
+    "mlp.gate": {
+      "ms_per_step": 0.16324442857142857,
+      "kernels_per_step": 40.0
+    },
+    "mlp.shared_expert.gate_up_proj": {
+      "ms_per_step": 0.27641585714285716,
+      "kernels_per_step": 40.0
+    },
+    "mlp.shared_expert.down_proj": {
+      "ms_per_step": 0.193083,
+      "kernels_per_step": 40.0
+    },
+    "mlp.shared_expert_gate": {
+      "ms_per_step": 0.35993142857142857,
+      "kernels_per_step": 80.0
+    },
+    "qkv_proj": {
+      "ms_per_step": 0.31641214285714286,
+      "kernels_per_step": 10.0
+    },
+    "o_proj": {
+      "ms_per_step": 0.1574202857142857,
+      "kernels_per_step": 10.0
+    },
+    "lm_head": {
+      "ms_per_step": 0.7605587142857143,
+      "kernels_per_step": 1.0
+    }
+  },
+  "sglang_role_mapping": {
+    "unique_keys": 11,
+    "kernels_per_step": 371,
+    "all_seven_graph_key_counts_match": true
+  },
+  "rust_graph_dense_roles": {
+    "linear_attn.in_proj_qkv": {
+      "ms_per_step": 0.8410137142857144,
+      "kernels_per_step": 30.0,
+      "N": 8192,
+      "K": 2048
+    },
+    "linear_attn.in_proj_a": {
+      "ms_per_step": 0.21373014285714287,
+      "kernels_per_step": 30.0,
+      "N": 32,
+      "K": 2048
+    },
+    "linear_attn.in_proj_b": {
+      "ms_per_step": 0.21154928571428572,
+      "kernels_per_step": 30.0,
+      "N": 32,
+      "K": 2048
+    },
+    "linear_attn.in_proj_z": {
+      "ms_per_step": 0.4614274285714286,
+      "kernels_per_step": 30.0,
+      "N": 4096,
+      "K": 2048
+    },
+    "linear_attn.out_proj": {
+      "ms_per_step": 0.5448218571428571,
+      "kernels_per_step": 30.0,
+      "N": 2048,
+      "K": 4096
+    },
+    "mlp.gate": {
+      "ms_per_step": 0.2887095714285714,
+      "kernels_per_step": 40.0,
+      "N": 256,
+      "K": 2048
+    },
+    "mlp.shared_expert.gate_proj": {
+      "ms_per_step": 0.2918361428571428,
+      "kernels_per_step": 40.0,
+      "N": 512,
+      "K": 2048
+    },
+    "mlp.shared_expert.up_proj": {
+      "ms_per_step": 0.2922064285714286,
+      "kernels_per_step": 40.0,
+      "N": 512,
+      "K": 2048
+    },
+    "mlp.shared_expert.down_proj": {
+      "ms_per_step": 0.162267,
+      "kernels_per_step": 40.0,
+      "N": 2048,
+      "K": 512
+    },
+    "mlp.shared_expert_gate": {
+      "ms_per_step": 0.2636344285714286,
+      "kernels_per_step": 40.0,
+      "N": 1,
+      "K": 2048
+    },
+    "q_proj": {
+      "ms_per_step": 0.2839125714285714,
+      "kernels_per_step": 10.0,
+      "N": 8192,
+      "K": 2048
+    },
+    "k_proj": {
+      "ms_per_step": 0.0754082857142857,
+      "kernels_per_step": 10.0,
+      "N": 512,
+      "K": 2048
+    },
+    "v_proj": {
+      "ms_per_step": 0.077415,
+      "kernels_per_step": 10.0,
+      "N": 512,
+      "K": 2048
+    },
+    "o_proj": {
+      "ms_per_step": 0.1910277142857143,
+      "kernels_per_step": 10.0,
+      "N": 2048,
+      "K": 4096
+    },
+    "lm_head": {
+      "ms_per_step": 0.7644221428571428,
+      "kernels_per_step": 1.0,
+      "N": 248320,
+      "K": 2048
+    }
+  },
+  "native_overlap_control": {
+    "processes": [
+      {
+        "variant": "default",
+        "repetition": 0,
+        "decode_ms": 7.021417375653982
+      },
+      {
+        "variant": "default",
+        "repetition": 1,
+        "decode_ms": 7.064311765134335
+      },
+      {
+        "variant": "default",
+        "repetition": 2,
+        "decode_ms": 7.061095908284187
+      },
+      {
+        "variant": "serial",
+        "repetition": 0,
+        "decode_ms": 7.96554097905755
+      },
+      {
+        "variant": "serial",
+        "repetition": 1,
+        "decode_ms": 7.7223870903253555
+      },
+      {
+        "variant": "serial",
+        "repetition": 2,
+        "decode_ms": 7.714397739619017
+      }
+    ],
+    "medians": {
+      "default": 7.061095908284187,
+      "serial": 7.7223870903253555
+    }
+  }
+}

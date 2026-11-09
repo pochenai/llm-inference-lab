@@ -1,0 +1,64 @@
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+[2026-11-08 19:16:03 TP0] Init torch distributed begin.
+[2026-11-08 19:16:04 TP0] Init torch distributed ends. elapsed=0.39 s, mem usage=0.10 GB
+[2026-11-08 19:16:04 TP0] Ignore import error when loading sglang.srt.models.glm_ocr: No module named 'transformers.models.glm_ocr'
+[2026-11-08 19:16:04 TP0] Ignore import error when loading sglang.srt.models.glm_ocr_nextn: No module named 'transformers.models.glm_ocr'
+[2026-11-08 19:16:04 TP0] Ignore import error when loading sglang.srt.models.glmasr: cannot import name 'GlmAsrConfig' from 'transformers' (/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/transformers/__init__.py)
+[2026-11-08 19:16:05 TP0] Load weight begin. avail mem=82.40 GB
+[2026-11-08 19:16:05 TP0] Multimodal attention backend not set. Use triton_attn.
+[2026-11-08 19:16:05 TP0] Using triton_attn as multimodal attention backend.
+`torch_dtype` is deprecated! Use `dtype` instead!
+[2026-11-08 19:16:05 TP0] using attn output gate!
+Loading safetensors checkpoint shards:   0% Completed | 0/14 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/14 [00:02<00:32,  2.53s/it]
+Loading safetensors checkpoint shards:  14% Completed | 2/14 [00:05<00:31,  2.64s/it]
+Loading safetensors checkpoint shards:  21% Completed | 3/14 [00:07<00:28,  2.59s/it]
+Loading safetensors checkpoint shards:  29% Completed | 4/14 [00:10<00:25,  2.54s/it]
+Loading safetensors checkpoint shards:  36% Completed | 5/14 [00:12<00:22,  2.51s/it]
+Loading safetensors checkpoint shards:  43% Completed | 6/14 [00:15<00:20,  2.50s/it]
+Loading safetensors checkpoint shards:  50% Completed | 7/14 [00:17<00:17,  2.50s/it]
+Loading safetensors checkpoint shards:  57% Completed | 8/14 [00:20<00:15,  2.54s/it]
+Loading safetensors checkpoint shards:  64% Completed | 9/14 [00:22<00:12,  2.44s/it]
+Loading safetensors checkpoint shards:  71% Completed | 10/14 [00:24<00:09,  2.36s/it]
+Loading safetensors checkpoint shards:  79% Completed | 11/14 [00:26<00:06,  2.32s/it]
+Loading safetensors checkpoint shards:  86% Completed | 12/14 [00:29<00:04,  2.30s/it]
+Loading safetensors checkpoint shards:  93% Completed | 13/14 [00:31<00:02,  2.27s/it]
+Loading safetensors checkpoint shards: 100% Completed | 14/14 [00:33<00:00,  2.16s/it]
+Loading safetensors checkpoint shards: 100% Completed | 14/14 [00:33<00:00,  2.38s/it]
+
+[2026-11-08 19:16:38 TP0] Load weight end. elapsed=33.58 s, type=Qwen3_5MoeForConditionalGeneration, dtype=torch.bfloat16, avail mem=16.91 GB, mem usage=65.49 GB.
+[2026-11-08 19:16:38 TP0] Using KV cache dtype: torch.bfloat16
+[2026-11-08 19:16:38 TP0] Mamba Cache is allocated. max_mamba_cache_size: 4, conv_state size: 0.01GB, ssm_state size: 0.29GB 
+[2026-11-08 19:16:38 TP0] KV Cache is allocated. #tokens: 128, K size: 0.00 GB, V size: 0.00 GB
+[2026-11-08 19:16:38 TP0] Memory pool end. avail mem=16.62 GB
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/sglang_adapter.py", line 118, in <module>
+[rank0]:     main()
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/sglang_adapter.py", line 114, in main
+[rank0]:     bench.main(bench.ServerArgs.from_cli_args(args), bench.BenchArgs.from_cli_args(args))
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 772, in main
+[rank0]:     work_func(server_args, port_args, bench_args, 0, 0)
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 664, in latency_test
+[rank0]:     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
+[rank0]:                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/bench_one_batch.py", line 253, in load_model
+[rank0]:     model_runner = ModelRunner(
+[rank0]:                    ^^^^^^^^^^^^
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 413, in __init__
+[rank0]:     self.initialize(min_per_gpu_memory)
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 607, in initialize
+[rank0]:     self.init_attention_backend()
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 1737, in init_attention_backend
+[rank0]:     self.attn_backend = self._get_attention_backend()
+[rank0]:                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 1781, in _get_attention_backend
+[rank0]:     attn_backend = self._get_attention_backend_from_str(
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 1799, in _get_attention_backend_from_str
+[rank0]:     return attn_backend_wrapper(self, full_attention_backend)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/layers/attention/attention_registry.py", line 204, in attn_backend_wrapper
+[rank0]:     runner.server_args.attention_backend == "triton"
+[rank0]: AssertionError: triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend.
+[rank0]:[W1108 19:16:39.636945336 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

@@ -1,0 +1,15 @@
+
+running 1 test
+conv: mismatches=0, max=0
+delta: mismatches=1, max=0.0000076293945
+state: mismatches=37603, max=0.000000014901161
+Error: graph changes recurrent arithmetic
+test runner::model::qwen3_5::tests::graph_state_kernels_match_eager_real_geometry ... FAILED
+
+failures:
+
+failures:
+    runner::model::qwen3_5::tests::graph_state_kernels_match_eager_real_geometry
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 146 filtered out; finished in 8.57s
+

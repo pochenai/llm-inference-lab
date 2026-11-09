@@ -1,0 +1,23 @@
+[
+  "nsys",
+  "profile",
+  "--trace=cuda,nvtx",
+  "--sample=none",
+  "--cpuctxsw=none",
+  "--capture-range=cudaProfilerApi",
+  "--capture-range-end=stop",
+  "--force-overwrite=true",
+  "--output=/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/rust-profile",
+  "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/qwen3_5-profile",
+  "--model-dir",
+  "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+  "--tokens",
+  "32",
+  "--output-tokens",
+  "8",
+  "--warmup",
+  "2",
+  "--iterations",
+  "1",
+  "--profile"
+]

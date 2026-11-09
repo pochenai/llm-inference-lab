@@ -1,0 +1,55 @@
+{
+  "commit": "70e8e87",
+  "native_reference_decode_ms": {
+    "rust": 10.654448,
+    "sglang": 7.04873725771904
+  },
+  "trace_families_ms": {
+    "rust-graph": {
+      "other": {
+        "ms_per_step": 0.9825837142857143,
+        "kernels_per_step": 446.0
+      },
+      "dense_projections": {
+        "ms_per_step": 4.963381714285714,
+        "kernels_per_step": 391.0
+      },
+      "routed_expert_gemm": {
+        "ms_per_step": 2.376080857142857,
+        "kernels_per_step": 80.0
+      },
+      "gqa_attention": {
+        "ms_per_step": 0.3450075714285714,
+        "kernels_per_step": 10.0
+      }
+    },
+    "sglang-graph": {
+      "other": {
+        "ms_per_step": 1.209540142857143,
+        "kernels_per_step": 629.0
+      },
+      "dense_projections": {
+        "ms_per_step": 4.172431571428572,
+        "kernels_per_step": 371.0
+      },
+      "routed_expert_gemm": {
+        "ms_per_step": 1.7718492857142856,
+        "kernels_per_step": 80.0
+      },
+      "gqa_attention": {
+        "ms_per_step": 0.07003685714285715,
+        "kernels_per_step": 20.0
+      }
+    }
+  },
+  "sglang_native_moe_overlap_control": {
+    "default_ms": 7.061095908284187,
+    "serial_moe_ms": 7.7223870903253555,
+    "serial_slowdown_percent": 9.365276872465799,
+    "difference_ms": 0.6612911820411682
+  },
+  "rust_replay_prepare_median_ms": 0.854987,
+  "rust_post_readback_tail_median_ms": 0.536192,
+  "rust_validation_median_ms": 0.312289,
+  "inference_changes_after_commit": false
+}

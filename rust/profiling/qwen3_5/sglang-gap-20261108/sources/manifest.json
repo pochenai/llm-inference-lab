@@ -1,0 +1,42 @@
+{
+  "engine.rs": {
+    "original": "rust/engine/src/runner/model/qwen3_5/engine.rs",
+    "sha256": "be105747b6f42438f65da9d70403f7b04e7ed367b3d12ffcd281f3d9bf7d690d"
+  },
+  "workspace.rs": {
+    "original": "rust/engine/src/runner/model/qwen3_5/workspace.rs",
+    "sha256": "981b079b418f395d304a7e0aa4de5089a6a582376beb02e77e754c111c0a514a"
+  },
+  "graph.rs": {
+    "original": "rust/engine/src/runner/model/qwen3_5/graph.rs",
+    "sha256": "014c332e4d480cd9a12dba80768c6d0fdfe49910a5fa5427ca3229afc344e911"
+  },
+  "kernels.rs": {
+    "original": "rust/engine/src/runner/model/qwen3_5/kernels.rs",
+    "sha256": "28ff643990fda78852a0905254a3a39f1a2fbe0f4663aba7e22397260c75235d"
+  },
+  "shared-kernels.rs": {
+    "original": "rust/engine/src/runner/model/qwen2/kernels.rs",
+    "sha256": "4fe27e83c6fa6b7029363c87a1295dc5622c3ba1e9a4e56c82e4ec169f4f8bb8"
+  },
+  "sglang-qwen3_5.py": {
+    "original": "rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/models/qwen3_5.py",
+    "sha256": "8efa54213a5565059bd342e66d9a08c3c6d783b6f661bff1d4a0f6b5889006bc"
+  },
+  "sglang-qwen2_moe.py": {
+    "original": "rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/models/qwen2_moe.py",
+    "sha256": "5f9da5a8cfb89e5832bd9e480b212d8a8a5d967e653dfd5dd8b55cd7da2a8df9"
+  },
+  "sglang-moe-kernels.py": {
+    "original": "rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py",
+    "sha256": "5a709f134c04806bbb1fd7c8ae18b00ae9a2c515353769785734dbdeed6f6de9"
+  },
+  "cuda-async-graph.rs": {
+    "original": "/root/autodl-tmp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cuda-async-0.5.0/src/cuda_graph.rs",
+    "sha256": "7eac76a255ebac5281c414d4ab6fbe0ad59b42652c410bc335fdfa240ec6547d"
+  },
+  "cutile-tensor.rs": {
+    "original": "/root/autodl-tmp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cutile-0.5.0/src/tensor.rs",
+    "sha256": "2541c7830973b3e60a4bd0befa597560ca82fc554966e61aceefa3de3be96896"
+  }
+}

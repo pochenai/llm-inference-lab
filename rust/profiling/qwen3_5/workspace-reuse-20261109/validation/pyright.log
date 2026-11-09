@@ -1,0 +1,6 @@
+  × Failed to download `torch==2.14.0+cpu`
+  ╰─▶ Network connectivity is disabled, but the
+      requested data wasn't found in the cache for:
+      `https://download-r2.pytorch.org/whl/cpu/torch-2.14.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl`
+
+hint: `torch` (v2.14.0+cpu) was included because `llm-inference-lab` (v0.1.0) depends on `torch`

@@ -1,0 +1,13 @@
+
+running 1 test
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions has been running for over 60 seconds
+Error: round=0, ids=[9, 3, 12, 8], graph/eager error=0.18523407
+test runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions ... FAILED
+
+failures:
+
+failures:
+    runner::model::qwen3_5::tests::decode_graph_matches_eager_logits_across_sessions
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 145 filtered out; finished in 109.21s
+

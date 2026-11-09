@@ -1,0 +1,35 @@
+{
+  "captured_at_utc": "2026-11-08T14:06:21Z",
+  "base_commit": "6d5ab1f44210967a1cd3c83a75bb6cc5ed365eba",
+  "cpu_affinity": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "model": "/root/autodl-tmp/now/models/Qwen3.5-35B-A3B",
+  "dtype": "bf16",
+  "ssm_state_dtype": "float32",
+  "binaries": {
+    "baseline": "df32a06acb58f9363e851a4a160bfe12d4dd7916c73ce5ad8134ba2eff02bf0e",
+    "candidate": "2bdb30e15cbb5ee26ffb0fed8af054769162eb115d1654f08e7095e9667958e0"
+  },
+  "model_config_sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+  "gpu": "name, driver_version, memory.total [MiB]\nNVIDIA RTX 6000D, 595.91.07, 85651 MiB\n",
+  "source_sha256": {
+    "engine.rs": "028c66d049b3b245c73e2cc0fa2ed15ca27a92ab6fc10c20f5598d42b0202224",
+    "workspace.rs": "981b079b418f395d304a7e0aa4de5089a6a582376beb02e77e754c111c0a514a",
+    "state.rs": "72fdf154ac59c80308529479c00d8349b3567a4cd0ac907b8be8b975c8406fef",
+    "mod.rs": "9b7da1d170622b5ef96b7aeaf3489d71c14f0ed03ab096705654bfd6194a924a",
+    "graph.rs": "014c332e4d480cd9a12dba80768c6d0fdfe49910a5fa5427ca3229afc344e911",
+    "kernels.rs": "28ff643990fda78852a0905254a3a39f1a2fbe0f4663aba7e22397260c75235d",
+    "tests.rs": "868a5baa7577e739da2853c163d37da978a91e1902ce6e916138a09d3147353f",
+    "qwen3_5.rs": "2270e6aa4dab26cc32d82d117e613158c6507c474cd07244f0f1af1df9c78f68"
+  },
+  "review_status": "approved and committed as 70e8e87; frozen measurement snapshots preserved",
+  "validation_control": "14 release tests passed; all twelve real-BF16 pooled eager/graph logits comparisons have maximum difference zero"
+}

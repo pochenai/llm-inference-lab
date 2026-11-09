@@ -1,0 +1,16 @@
+   Compiling engine v0.0.1 (/root/autodl-tmp/now/llm-inference-lab/rust/engine)
+    Finished `release` profile [optimized] target(s) in 37.18s
+     Running unittests src/lib.rs (rust/target/release/deps/engine-f8870ca35359a86c)
+
+running 2 tests
+test runner::model::qwen3_5::weights::tests::frozen_capture_owns_weights_after_host_graph_and_weight_drop ... ok
+test runner::model::qwen3_5::weights::tests::frozen_weight_rejects_another_context_on_the_same_device ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 1.11s
+
+     Running unittests src/main.rs (rust/target/release/deps/engine-3f0dbf0c995685e0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

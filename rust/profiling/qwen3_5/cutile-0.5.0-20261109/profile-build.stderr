@@ -1,0 +1,8 @@
+   Compiling cuda-bindings v0.5.0
+   Compiling cuda-core v0.5.0
+   Compiling cutile-compiler v0.5.0
+   Compiling cuda-async v0.5.0
+   Compiling cutile-macro v0.5.0
+   Compiling cutile v0.5.0
+   Compiling engine v0.0.1 (/root/autodl-tmp/now/llm-inference-lab/rust/engine)
+    Finished `bench` profile [optimized] target(s) in 41.98s

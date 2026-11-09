@@ -1,0 +1,147 @@
+diff --git a/rust/engine/src/runner/model/qwen3_5/engine.rs b/rust/engine/src/runner/model/qwen3_5/engine.rs
+index 70104e1..9b806d8 100644
+--- a/rust/engine/src/runner/model/qwen3_5/engine.rs
++++ b/rust/engine/src/runner/model/qwen3_5/engine.rs
+@@ -1153,22 +1153,33 @@ unsafe fn project<T: DType, O: DType>(
+     exec: &ExecutionContext,
+ ) -> Result<ScratchTensor<T, O>> {
+     let _range = ScopedRange::new(c"qwen3_5.linear");
+-    shared::linear(
+-        (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
+-        x,
+-        w,
+-        bias,
+-    )
+-    .generics(vec![
+-        T::DTYPE.to_string(),
+-        O::DTYPE.to_string(),
+-        x.shape()[1].to_string(),
+-        "false".into(),
+-        LINEAR_TILE_ROWS.to_string(),
+-        LINEAR_TILE_COLUMNS.to_string(),
+-        LINEAR_TILE_REDUCTION.to_string(),
+-    ])
+-    .execute(exec)?;
++    // Keep the reduction tree independent of token count for chunked prefill.
++    if T::DTYPE == bf16::DTYPE && O::DTYPE == bf16::DTYPE && w.shape()[0] <= 256 {
++        kernels::linear_vector((&mut out).partition([1, 4]), x, w)
++            .generics(vec![
++                T::DTYPE.to_string(),
++                O::DTYPE.to_string(),
++                x.shape()[1].to_string(),
++            ])
++            .execute(exec)?;
++    } else {
++        shared::linear(
++            (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
++            x,
++            w,
++            bias,
++        )
++        .generics(vec![
++            T::DTYPE.to_string(),
++            O::DTYPE.to_string(),
++            x.shape()[1].to_string(),
++            "false".into(),
++            LINEAR_TILE_ROWS.to_string(),
++            LINEAR_TILE_COLUMNS.to_string(),
++            LINEAR_TILE_REDUCTION.to_string(),
++        ])
++        .execute(exec)?;
++    }
+     Ok(out)
+ }
+ unsafe fn add<T: DType>(
+diff --git a/rust/engine/src/runner/model/qwen3_5/kernels.rs b/rust/engine/src/runner/model/qwen3_5/kernels.rs
+index fccb64a..b71231b 100644
+--- a/rust/engine/src/runner/model/qwen3_5/kernels.rs
++++ b/rust/engine/src/runner/model/qwen3_5/kernels.rs
+@@ -884,6 +884,18 @@ mod ops {
+         result.reshape(shape![1, VECTOR_OUTPUT_COLUMNS])
+     }
+ 
++    #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
++    pub(super) fn linear_vector<T: ElementType, O: ElementType, const K: i32>(
++        out: &mut Tensor<O, { [1, VECTOR_OUTPUT_COLUMNS] }>,
++        x: &Tensor<T, { [-1, K] }>,
++        w: &Tensor<T, { [-1, K] }>,
++    ) {
++        let p = get_tile_block_id();
++        let result: Tile<O, { [1, VECTOR_OUTPUT_COLUMNS] }> =
++            convert_tile(vector_projection::<T, K>(x, w, p.0, p.1));
++        out.store(result);
++    }
++
+     /// Shared expert: avoid padded token rows and intermediate gate/up stores.
+     #[cutile::entry(optimization_hints = (sm_120 = (occupancy = 2,),))]
+     pub(super) fn shared_gate_up_vector<T: ElementType, const K: i32>(
+diff --git a/rust/engine/src/runner/model/qwen3_5/tests.rs b/rust/engine/src/runner/model/qwen3_5/tests.rs
+index 2e833c4..af37b91 100644
+--- a/rust/engine/src/runner/model/qwen3_5/tests.rs
++++ b/rust/engine/src/runner/model/qwen3_5/tests.rs
+@@ -962,3 +962,65 @@ async fn bf16_shared_vector_matches_unfused_rounding_and_masked_tails() -> Resul
+     }
+     Ok(())
+ }
++
++#[tokio::test]
++async fn bf16_skinny_vector_matches_cpu_with_scalar_and_masked_outputs() -> Result<()> {
++    use super::kernels;
++    use cutile::{
++        api,
++        core::bf16,
++        tensor::{PartitionMut, Reshape, ToHostVec},
++        tile_kernel::TileKernel,
++        DType,
++    };
++    let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
++    let policy = cuda_async::device_context::global_policy(0)?;
++    let k = 2048usize;
++    let inputs = Arc::new(
++        (0..3 * k)
++            .map(|j| bf16::from_f32(((j * 5 + 3) % 13) as f32 / 16.0 - 0.375))
++            .collect::<Vec<_>>(),
++    );
++    let x = api::copy_host_vec_to_device(&inputs)
++        .schedule(&policy)?
++        .await?
++        .reshape(&[3, k])?;
++    for n in [1usize, 32, 33, 256] {
++        let weights = Arc::new(
++            (0..n * k)
++                .map(|j| bf16::from_f32(((j * 3 + 7) % 17) as f32 / 64.0 - 0.125))
++                .collect::<Vec<_>>(),
++        );
++        let w = Arc::new(
++            api::copy_host_vec_to_device(&weights)
++                .schedule(&policy)?
++                .await?
++                .reshape(&[n, k])?,
++        );
++        let mut out = api::zeros::<bf16>(&[3, n]).schedule(&policy)?.await?;
++        kernels::linear_vector((&mut out).partition([1, 4]), &x, w)
++            .generics(vec![
++                bf16::DTYPE.to_string(),
++                bf16::DTYPE.to_string(),
++                k.to_string(),
++            ])
++            .schedule(&policy)?
++            .await?;
++        let actual = out.to_host_vec().schedule(&policy)?.await?;
++        for row in 0..3 {
++            for column in 0..n {
++                let expected = bf16::from_f32(
++                    (0..k)
++                        .map(|j| inputs[row * k + j].to_f32() * weights[column * k + j].to_f32())
++                        .sum::<f32>(),
++                );
++                assert_eq!(
++                    actual[row * n + column].to_bits(),
++                    expected.to_bits(),
++                    "N={n}, row={row}, column={column}"
++                );
++            }
++        }
++    }
++    Ok(())
++}

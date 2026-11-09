@@ -1,0 +1,26 @@
+{
+  "engines": {
+    "baseline": {
+      "prefill_ms": 60.75274433333334,
+      "decode_ms": 31.594351,
+      "total_ms": 279.42995833333333
+    },
+    "candidate": {
+      "prefill_ms": 52.959337000000005,
+      "decode_ms": 12.811257,
+      "total_ms": 142.06658199999998
+    },
+    "sglang-graph": {
+      "prefill_ms": 68.65050597116351,
+      "decode_ms": 7.058967836201191,
+      "total_ms": 118.07575169950724
+    }
+  },
+  "prefill_reduction_percent": 12.828074548489665,
+  "decode_reduction_percent": 59.45079865701308,
+  "decode_speedup": 2.4661398175058076,
+  "graph_decode_gap": 1.8148909723456714,
+  "scratch_resident_bytes": 10729868,
+  "measured_scratch_allocations": 0,
+  "all_rust_ids_equal": true
+}

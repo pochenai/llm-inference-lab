@@ -1,0 +1,17 @@
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+Traceback (most recent call last):
+  File "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/sglang_adapter.py", line 118, in <module>
+    main()
+  File "/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/cutile-0.5.0-20261109/sglang_adapter.py", line 114, in main
+    bench.main(bench.ServerArgs.from_cli_args(args), bench.BenchArgs.from_cli_args(args))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/server_args.py", line 5078, in from_cli_args
+    return cls(**{attr: getattr(args, attr) for attr in attrs})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 331, in __init__
+  File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/server_args.py", line 776, in __post_init__
+    self._handle_encoder_disaggregation()
+  File "/root/autodl-tmp/now/llm-inference-lab/rust/engine/artifacts/sglang-0.5.9-venv/lib/python3.12/site-packages/sglang/srt/server_args.py", line 2586, in _handle_encoder_disaggregation
+    raise ValueError(
+ValueError: requires at least one encoder urls to be set via --encoder-urls

@@ -1,5 +1,134 @@
 # Qwen3.5 BF16 performance iterations
 
+## Machine handoff checkpoint — 2026-11-09 (Asia/Shanghai)
+
+PAUSED at the user's request: the source machine no longer has a GPU. No GPU
+experiment is active. Resume only after the replacement machine is ready.
+All production optimizations are committed through `827f7f9`; the rejected
+expert tile16 experiment is fully reverted. The remaining changes at this
+checkpoint are handoff documentation, ignore rules and archived evidence.
+
+### Result and scope
+
+Native BF16 Qwen3.5-35B-A3B, one RTX6000D (156SM), B1,32 repeated token9707
+inputs,8 fixed outputs. Decode uses CUDA Graphs in both Rust/SGLang; prefill is
+eager. Each Rust optimization has3 rotated independent processes/variant,
+2 warmups+3 measured samples. CPU affinity24-31 was local to the OLD GPU.
+Rust retains full-logit D2H/finite checks and host token feedback. The SGLang
+adapter uses GPU sampling; these boundaries must remain explicit.
+
+| Historical snapshot | Prefill ms | Decode ms/token | E2E8 outputs ms |
+| --- | ---: | ---: | ---: |
+| Rust graph starting point `70e8e87` | 55.362 | 10.654 | 131.103 |
+| Latest Rust `827f7f9` | 32.499 | 7.705 | 86.433 |
+| Earlier SGLang0.5.9 graph reference | 69.120 | 7.049 | 119.244 |
+
+E2e is below the earlier SGLang reference; decode is still about9.3% slower.
+The parity objective is NOT complete. These snapshots are from different rounds;
+unlocked clocks/host load mean cross-round differences are not isolated gains.
+Use each iteration's paired table below for its claimed improvement. A fresh
+same-period SGLang comparison has NOT been performed after the last changes.
+No large-batch/long-context/serving-throughput or broad text-quality claim.
+
+### Completed and committed
+
+| Commit | Completed optimization | Evidence directory under `rust/profiling/qwen3_5/` |
+| --- | --- | --- |
+| `58b3fbe` | Reuse scratch Tensor storage identities for graph resource deduplication | `replay-storage-20261108/` |
+| `6ca209d` | BF16 routed-expert MMA/Tensor Cores, confirmed HMMA SASS | `expert-mma-20261108/` |
+| `aa1fb74` | Shared gate/up/SwiGLU fusion with consistent reduction across token counts | `shared-gate-up-20261109/consistent-vector/` |
+| `d66bf6c` | Scalar/MoE router vector projections; keep GDN a/b MMA | `router-vectors-20261109/` |
+| `0c5dcc0` | Pack GDN a/b weights and reuse one unchanged MMA projection | `packed-ab-20261109/` |
+| `06aa36e` | Factory-only immutable weight ownership for captured graphs | `frozen-weights-20261109/` |
+| `a0cd88f` | 32-token blocked GQA with causal/slot/tail masks | `blocked-gqa-20261109/` |
+| `827f7f9` | Vectorizable complete CPU finite scan; preserve all validation | `finite-scan-20261109/` |
+
+GPU changes passed the21-test Qwen3.5 suite (including opt-in tiny/ownership/
+context checks) and real35B BF16 reference/chunking gates. The final CPU-only
+scan change passed its new contract cases, a model reference/chunking smoke
+check and all-target check. No numerical threshold was widened. Last real GPU
+reference: ID3636, max0.48618/RMS0.10955, chunk1/2/3/4 all max0. FP32 performance
+was deliberately excluded; existing FP32 correctness controls were used when
+shared layouts changed.
+
+### Rejected or deliberately skipped
+
+- B1-only shared-vector dispatch: real chunking max0.31143 exceeded0.02. Rejected;
+  the committed consistent-all-token-count version passes the original gate.
+- Vector GDN a/b: changed reference ID3636->16. Isolated in a single-weight-load
+  diagnostic; committed scalar/router optimization excludes a/b.
+- Expert output tile16: numerical gates pass, but the one-process screen regresses
+  to69.405ms prefill/8.331ms decode/127.722ms E2E. Reverted; no optimization commit.
+- Resident weight service: skipped by the user's threshold; warm-filesystem startup
+  through weights/pool load was47.380s, below1min (forward JIT excluded).
+- NCU hardware counters: unavailable on the old host (`ERR_NVGPUCTRPERM`). HMMA
+  proof uses checksum-validated JIT cubins and SASS, not achieved utilization.
+- Memcheck: round-robin async-free warnings also occur with the old GQA oracle.
+  Explicit stream completion in the operator oracle yields0 errors. No production
+  fence was added; keep all old/new/fenced logs and separate Gate lifetime evidence.
+
+### Not completed; resume in this order
+
+- [ ] Rebuild and establish fresh Rust/SGLang baselines on the NEW hardware.
+- [ ] Integrate shared/routed MoE CUDA Graph branch overlap. Only the small CUDA
+  dependency-insertion prototype is implemented/tested; production inference
+  remains serial. Probe source/log: `moe-parallel-20261109/probe/`.
+- [ ] Preserve module, scratch checkout, session/KV and escaped-output ownership;
+  add Gate-based ordering/lifetime tests before accepting parallel execution.
+- [ ] Re-profile remaining e2e costs and repeat paired measurements/commits until
+  decode matches or beats SGLang. After parity, skip targets below1%e2e.
+- [ ] Run final same-period cross-engine comparison and record exact boundaries.
+
+Design notes are proposals, not completed code: `parallel-design.md` and
+`frozen-weights-plan.md` (the latter records the design already implemented in
+`weights.rs`). The validated CUDA13.2 child-node probe uses
+`cuStreamGetCaptureInfo_v3`, `cuGraphAddChildGraphNode` and
+`cuStreamUpdateCaptureDependencies_v2`; it does not access SDK private fields.
+
+### Moving to the replacement machine
+
+The Qwen3.5 evidence directory is now included in Git: reports, raw JSON/logs,
+commands, source snapshots/diffs, plots, small GPU-code evidence and `.nsys-rep`
+traces. Derived SQLite exports/sidecars remain ignored and can be regenerated
+without a GPU using the installed Nsight Systems version:
+
+```bash
+nsys export --type=sqlite --output=/path/to/report.sqlite /path/to/report.nsys-rep
+```
+
+Repeated host executables (~609MiB), temporary `jit-store/`,
+model weights, virtual environments and build directories stay ignored.
+Rebuild executables from commits; their archived hashes identify old runs.
+Push/copy the Git commits separately; this session has not published to a remote.
+
+Small reference logits are archived in
+`rust/profiling/qwen3_5/validation-references/` with SHA256 manifest. The full
+35B model is NOT in Git. Tiny model weights must be copied or regenerated with
+`rust/engine/examples/qwen3_5_reference.py` / the example guide. Do not copy an
+old Python venv blindly; recreate SGLang0.5.9 and its recorded dependency setup.
+The relevant Qwen2 Tensor Core precedent is copied to
+`rust/profiling/qwen3_5/reference-notes/qwen2-tensor-core-precedent.md`.
+Historical scripts contain OLD absolute paths; adjust paths for reruns and keep
+old results immutable. Avoid copying secret environment files.
+
+From the repository root, after installing a supported CUDA/Rust environment
+and the locked cuTile/cuda-core/cuda-async0.5.0 dependencies:
+
+```bash
+env -u LD_LIBRARY_PATH CUDA_HOME=/path/to/cuda cargo check --manifest-path rust/Cargo.toml -p engine --all-targets
+env -u LD_LIBRARY_PATH CUDA_HOME=/path/to/cuda QWEN35_TEST_MODEL=/absolute/path/to/tiny QWEN35_TEST_REFERENCE=/absolute/path/to/repo/rust/profiling/qwen3_5/validation-references/tiny-reference.f32 cargo test --release --manifest-path rust/Cargo.toml -p engine qwen3_5 -- --include-ignored --test-threads=1
+env -u LD_LIBRARY_PATH CUDA_HOME=/path/to/cuda QWEN35_TEST_MODEL=/absolute/path/to/Qwen3.5-35B-A3B QWEN35_TEST_REFERENCE=/absolute/path/to/repo/rust/profiling/qwen3_5/validation-references/real-reference.f32 cargo test --release --manifest-path rust/Cargo.toml -p engine reference_chunking_and_state_validation -- --ignored --nocapture --test-threads=1
+env -u LD_LIBRARY_PATH CUDA_HOME=/path/to/cuda cargo bench --manifest-path rust/Cargo.toml -p engine --bench qwen3_5 -- --model-dir /absolute/path/to/Qwen3.5-35B-A3B --tokens 32 --output-tokens 8 --warmup 2 --iterations 3 --cuda-graph
+```
+
+Use `--offline` only if dependency caches were transferred. Re-evaluate GPU
+architecture support, SM count, tile choices, CUDA paths and NUMA CPU affinity;
+24-31 and SM120 hints are old-host settings. Run GPU jobs sequentially, and keep
+profiling separate from native timing. SGLang commands/config are preserved in
+`cuda-graph-20261108/commands.json` and `sglang-gap-20261108/`.
+
+---
+
 Target: Qwen3.5-35B-A3B on one RTX 6000D, matching SGLang CUDA Graph mode.
 Each successful optimization is validated, benchmarked and committed separately.
 Full logits validation and host token feedback remain enabled for comparisons.
@@ -26,7 +155,7 @@ Profile timings must not be compared directly with native timings.
 - [x] Optimize scalar and MoE router projections while preserving GDN a/b MMA.
 - [x] Pack GDN a/b weights and reuse one MMA projection, preserving accumulation.
 - [x] Remove remaining immutable-weight replay bookkeeping with typed ownership.
-- [ ] Re-profile GQA and host validation after the large GEMM changes; only
+- [x] Re-profile GQA and host validation after the large GEMM changes; only
   optimize material end-to-end costs while decode parity remains outstanding.
 - [ ] Overlap shared and routed expert work with explicit stream dependencies.
 - [ ] Re-profile remaining gaps and repeat until native decode matches or beats
@@ -46,8 +175,9 @@ Profile timings must not be compared directly with native timings.
   `rust/profiling/qwen2/decode-b4-4k-20261101-110247/RESULTS.md`.
   Its BM=4 generic MMA compiled to SIMT; BM=16 emitted
   `HMMA.16816.F32.BF16`, confirmed by NCU/SASS, with unchanged grid and
-  occupancy. Qwen3.5 dense projections already use BM=16; routed experts
-  currently use explicit FP32 multiply/reduce. Check the actual specialization
+  occupancy. At the initial profile, Qwen3.5 dense projections used BM=16
+  while routed experts still used explicit FP32 multiply/reduce; the committed
+  expert optimization has since replaced that BF16 path with MMA. Check the actual specialization
   rather than assuming an MMA API call guarantees tensor cores.
 
 ## Iteration results
@@ -327,4 +457,23 @@ Decode -2.37%, e2e -1.54%; every paired process improves decode/e2e. All
 observations retained; first-pair prefill variance is visible and not entirely
 attributed to the scan. IDs/ownership/warm allocation/capture checks pass.
 Raw confirmation: `rust/profiling/qwen3_5/finite-scan-20261109/`.
-Commit: this update accompanies the full-scan reduction.
+Commit: `827f7f9`.
+
+### 9. Expert MMA output tile screen (rejected, restored)
+
+A minimal CUDA13.2 driver reproducer validates adding a child graph to a
+capturing alternate stream, setting dependencies and joining back to main;
+results match. Probe: `rust/profiling/qwen3_5/moe-parallel-20261109/probe/`.
+Full-model overlap remains pending.
+
+First screen a smaller change: BF16 expert MMA output columns32->16, preserving
+K64/M16 and the existing SIMT/f32 tile32. More CTAs may improve this larger GPU;
+Qwen2 N16 was slower on the older36-SM GPU, so measure instead of assuming.
+Qualify CPU/SIMT oracle and real BF16 first-ID/chunking before native screening.
+
+Tile16 oracle and real BF16 reference passed (max0.47784/RMS0.08379/ID3636,
+all chunks max0). On156-SM GPU, one-process screen regresses to69.405ms prefill,
+8.331ms/decode,127.722ms/e2e. Rejected before confirmation; production tile32
+restored, no optimization commit. Artifacts: `rust/profiling/qwen3_5/expert-tile16-20261109/`.
+Next: implement private shared/routed CUDA Graph branch overlap using the
+validated child-node dependency insertion; preserve checkout/module ownership.

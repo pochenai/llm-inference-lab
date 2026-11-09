@@ -1,0 +1,118 @@
+{
+  "processes": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "prefill_ms": 33.14949,
+      "decode_ms": 8.062029428571428,
+      "total_ms": 89.551699,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 0,
+      "prefill_ms": 32.457672,
+      "decode_ms": 7.8879024285714285,
+      "total_ms": 87.672989,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 1,
+      "prefill_ms": 30.520877,
+      "decode_ms": 7.639064142857143,
+      "total_ms": 83.994326,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "prefill_ms": 33.341345000000004,
+      "decode_ms": 8.089966285714286,
+      "total_ms": 89.971109,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "prefill_ms": 33.242470000000004,
+      "decode_ms": 8.093893285714286,
+      "total_ms": 89.899723,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    },
+    {
+      "variant": "candidate",
+      "repetition": 2,
+      "prefill_ms": 31.912958,
+      "decode_ms": 7.491702,
+      "total_ms": 84.202428,
+      "generated_ids": [
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707,
+        9707
+      ]
+    }
+  ],
+  "median": {
+    "baseline": {
+      "prefill_ms": 33.242470000000004,
+      "decode_ms": 8.089966285714286,
+      "total_ms": 89.899723
+    },
+    "candidate": {
+      "prefill_ms": 31.912958,
+      "decode_ms": 7.639064142857143,
+      "total_ms": 84.202428
+    }
+  }
+}

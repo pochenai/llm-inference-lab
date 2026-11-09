@@ -1,0 +1,10 @@
+--- tests.rs
++++ tests.instrumented.rs
+@@ -796,6 +796,7 @@
+         DType,
+     };
+     let _gpu = crate::runner::GPU_TEST_LOCK.lock().await;
++    cutile::jit_cache::enable(Arc::new(cutile::jit_cache::FileSystemJitStore::new("/root/autodl-tmp/now/llm-inference-lab/rust/profiling/qwen3_5/expert-mma-20261108/compute/jit-store")?));
+     let policy = cuda_async::device_context::global_policy(0)?;
+     let ids = vec![2i32, 0, 1, 2, 1, 0, 2, 0];
+     let selected = api::copy_host_vec_to_device(&Arc::new(ids.clone()))

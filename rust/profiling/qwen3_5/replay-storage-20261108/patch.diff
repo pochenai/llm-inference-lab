@@ -1,0 +1,673 @@
+diff --git a/rust/engine/src/runner/model/qwen3_5/engine.rs b/rust/engine/src/runner/model/qwen3_5/engine.rs
+index cb3968a..3fded07 100644
+--- a/rust/engine/src/runner/model/qwen3_5/engine.rs
++++ b/rust/engine/src/runner/model/qwen3_5/engine.rs
+@@ -71,7 +71,7 @@ use super::{
+     },
+     kernels,
+     state::{retained_pointer, AttentionView, Qwen3_5Context, Qwen3_5ExecutionView},
+-    workspace::{Scratch, WorkspaceMetrics, WorkspacePool},
++    workspace::{Scratch, ScratchTensor, WorkspaceMetrics, WorkspacePool},
+     Qwen3_5StatePool,
+ };
+ use crate::runner::{
+@@ -609,6 +609,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+         state: Execution<'_, '_, T>,
+         exec: &ExecutionContext,
+     ) -> Result<ComputeOutput> {
++        scratch.retain(exec)?;
+         scratch.reset();
+         let (mut eager, graph) = match state {
+             Execution::Eager(view) => (Some(view), None),
+@@ -639,7 +640,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+         for (index, layer) in self.layers.iter().enumerate() {
+             let _layer = ScopedRange::new(&self.layer_ranges[index]);
+             scratch.layer(matches!(layer.mixer, Mixer::Delta(_)));
+-            let n = normalize(scratch, &x, layer.input_norm.clone(), c.rms_norm_eps, exec)?;
++            let n = normalize(scratch, &*x, layer.input_norm.clone(), c.rms_norm_eps, exec)?;
+             let mixed = match &layer.mixer {
+                 Mixer::Delta(w) => {
+                     let _mixer = ScopedRange::new(c"qwen3_5.mixer.delta");
+@@ -648,7 +649,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                     } else {
+                         None
+                     };
+-                    let qkv = linear(scratch, &n, w.qkv.clone(), exec)?;
++                    let qkv = linear(scratch, &*n, w.qkv.clone(), exec)?;
+                     let mut convolved =
+                         scratch.activation(&[rows, qkv.shape()[1] as usize], exec)?;
+ 
+@@ -662,22 +663,22 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                                 out,
+                                 &data.metadata,
+                                 index as i32,
+-                                &qkv,
++                                &*qkv,
+                                 w.conv.clone(),
+                             )
+                             .generics(generics)
+                             .grid(grid)
+                             .execute(exec)?;
+                         } else {
+-                            kernels::conv(out, delta.as_ref().unwrap().conv, &qkv, w.conv.clone())
++                            kernels::conv(out, delta.as_ref().unwrap().conv, &*qkv, w.conv.clone())
+                                 .generics(generics)
+                                 .grid(grid)
+                                 .execute(exec)?;
+                         }
+                     }
+-                    let a = linear(scratch, &n, w.a.clone(), exec)?;
+-                    let b = linear(scratch, &n, w.b.clone(), exec)?;
+-                    let z = linear(scratch, &n, w.z.clone(), exec)?;
++                    let a = linear(scratch, &*n, w.a.clone(), exec)?;
++                    let b = linear(scratch, &*n, w.b.clone(), exec)?;
++                    let z = linear(scratch, &*n, w.z.clone(), exec)?;
+                     let vh = c.linear_num_value_heads;
+                     let mut core = scratch.activation(&[rows, vh * GDN_VALUE_HEAD_DIM], exec)?;
+ 
+@@ -701,9 +702,9 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                                 out,
+                                 &data.metadata,
+                                 index as i32,
+-                                &convolved,
+-                                &a,
+-                                &b,
++                                &*convolved,
++                                &*a,
++                                &*b,
+                                 w.a_log.clone(),
+                                 w.dt.clone(),
+                             )
+@@ -714,9 +715,9 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                             kernels::delta(
+                                 out,
+                                 delta.as_ref().unwrap().recurrent,
+-                                &convolved,
+-                                &a,
+-                                &b,
++                                &*convolved,
++                                &*a,
++                                &*b,
+                                 w.a_log.clone(),
+                                 w.dt.clone(),
+                             )
+@@ -733,8 +734,8 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         let _range = ScopedRange::new(c"qwen3_5.delta.gated_norm");
+                         kernels::gated_norm(
+                             (&mut gated).partition([1, GDN_VALUE_HEAD_DIM]),
+-                            &core,
+-                            &z,
++                            &*core,
++                            &*z,
+                             w.norm.clone(),
+                             c.rms_norm_eps,
+                         )
+@@ -743,16 +744,16 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                     }
+                     linear(
+                         scratch,
+-                        &gated.reshape(&[rows, vh * GDN_VALUE_HEAD_DIM])?,
++                        &*gated.reshape(&[rows, vh * GDN_VALUE_HEAD_DIM])?,
+                         w.out.clone(),
+                         exec,
+                     )?
+                 }
+                 Mixer::Attention(w) => {
+                     let _mixer = ScopedRange::new(c"qwen3_5.mixer.gqa");
+-                    let qg = linear(scratch, &n, w.q.clone(), exec)?;
+-                    let raw_k = linear(scratch, &n, w.k.clone(), exec)?;
+-                    let raw_v = linear(scratch, &n, w.v.clone(), exec)?;
++                    let qg = linear(scratch, &*n, w.q.clone(), exec)?;
++                    let raw_k = linear(scratch, &*n, w.k.clone(), exec)?;
++                    let raw_v = linear(scratch, &*n, w.v.clone(), exec)?;
+                     let mut q = scratch
+                         .activation(&[rows, c.num_attention_heads * ATTENTION_HEAD_DIM], exec)?;
+ 
+@@ -769,7 +770,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         if let Some(data) = graph {
+                             kernels::qk_graph(
+                                 out,
+-                                &qg,
++                                &*qg,
+                                 w.q_norm.clone(),
+                                 self.frequencies.clone(),
+                                 c.rms_norm_eps,
+@@ -782,7 +783,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         } else {
+                             kernels::qk(
+                                 out,
+-                                &qg,
++                                &*qg,
+                                 w.q_norm.clone(),
+                                 self.frequencies.clone(),
+                                 c.rms_norm_eps,
+@@ -810,7 +811,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         if let Some(data) = graph {
+                             kernels::qk_graph(
+                                 out,
+-                                &raw_k,
++                                &*raw_k,
+                                 w.k_norm.clone(),
+                                 self.frequencies.clone(),
+                                 c.rms_norm_eps,
+@@ -823,7 +824,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         } else {
+                             kernels::qk(
+                                 out,
+-                                &raw_k,
++                                &*raw_k,
+                                 w.k_norm.clone(),
+                                 self.frequencies.clone(),
+                                 c.rms_norm_eps,
+@@ -852,8 +853,8 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                             kernels::cache_decode(
+                                 k.device_pointer(),
+                                 v.device_pointer(),
+-                                &rotated_k,
+-                                &raw_v,
++                                &*rotated_k,
++                                &*raw_v,
+                                 &data.cache.table,
+                                 &data.metadata,
+                             )
+@@ -871,7 +872,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                             eager
+                                 .as_deref_mut()
+                                 .unwrap()
+-                                .attention(index, &rotated_k, &raw_v)?
++                                .attention(index, &*rotated_k, &*raw_v)?
+                         }
+                     };
+                     {
+@@ -879,10 +880,10 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         if let Some(data) = graph {
+                             kernels::gqa_graph(
+                                 (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
+-                                &q,
++                                &*q,
+                                 cache.k,
+                                 cache.v,
+-                                &qg,
++                                &*qg,
+                                 &data.metadata,
+                                 cache.table,
+                             )
+@@ -891,10 +892,10 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         } else {
+                             kernels::gqa_attention(
+                                 (&mut attended).partition([1, ATTENTION_HEAD_DIM]),
+-                                &q,
++                                &*q,
+                                 cache.k,
+                                 cache.v,
+-                                &qg,
++                                &*qg,
+                                 start_pos as i32,
+                                 cache.table,
+                                 cache.table_offset as i32,
+@@ -909,21 +910,21 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                         }
+                         attention_index += 1;
+                     }
+-                    linear(scratch, &attended, w.out.clone(), exec)?
++                    linear(scratch, &*attended, w.out.clone(), exec)?
+                 }
+             };
+-            add(&mut residual, &x, &mixed, exec)?;
++            add(&mut residual, &*x, &*mixed, exec)?;
+             let _moe = ScopedRange::new(c"qwen3_5.moe");
+             let n = normalize(
+                 scratch,
+-                &residual,
++                &*residual,
+                 layer.post_norm.clone(),
+                 c.rms_norm_eps,
+                 exec,
+             )?;
+             let logits = {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.router");
+-                linear(scratch, &n, layer.router.clone(), exec)?
++                linear(scratch, &*n, layer.router.clone(), exec)?
+             };
+             let top = c.num_experts_per_tok;
+             let i = c.moe_intermediate_size;
+@@ -935,7 +936,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                 kernels::route(
+                     (&mut selected).partition([1, top]),
+                     (&mut scores).partition([1, top]),
+-                    &logits,
++                    &*logits,
+                 )
+                 .generics(vec![
+                     T::DTYPE.to_string(),
+@@ -951,9 +952,9 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.gate_up");
+                 kernels::expert(
+                     (&mut gu).partition([1, EXPERT_OUTPUT_COLUMNS]),
+-                    &n,
++                    &*n,
+                     layer.gate_up.clone(),
+-                    &selected,
++                    &*selected,
+                     top as i32,
+                 )
+                 .generics(vec![
+@@ -968,7 +969,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+ 
+             {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.swiglu");
+-                kernels::expert_swiglu((&mut activated).partition([1, POINTWISE_COLUMNS]), &gu)
++                kernels::expert_swiglu((&mut activated).partition([1, POINTWISE_COLUMNS]), &*gu)
+                     .generics(vec![T::DTYPE.to_string(), i.to_string()])
+                     .execute(exec)?;
+             }
+@@ -978,9 +979,9 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.expert.down");
+                 kernels::expert(
+                     (&mut routed).partition([1, EXPERT_OUTPUT_COLUMNS]),
+-                    &activated,
++                    &*activated,
+                     layer.down.clone(),
+-                    &selected,
++                    &*selected,
+                     1,
+                 )
+                 .generics(vec![
+@@ -993,22 +994,22 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+             }
+             let (shared_out, shared_gate) = {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.shared");
+-                let gate = linear(scratch, &n, layer.shared_gate.clone(), exec)?;
+-                let up = linear(scratch, &n, layer.shared_up.clone(), exec)?;
++                let gate = linear(scratch, &*n, layer.shared_gate.clone(), exec)?;
++                let up = linear(scratch, &*n, layer.shared_up.clone(), exec)?;
+                 let mut shared_act =
+                     scratch.activation(&[rows, c.shared_expert_intermediate_size], exec)?;
+                 {
+                     let _range = ScopedRange::new(c"qwen3_5.moe.shared.swiglu");
+                     shared::swiglu(
+                         (&mut shared_act).partition([1, SHARED_POINTWISE_COLUMNS]),
+-                        &gate,
+-                        &up,
++                        &*gate,
++                        &*up,
+                     )
+                     .generics(vec![T::DTYPE.to_string()])
+                     .execute(exec)?;
+                 }
+-                let shared_out = linear(scratch, &shared_act, layer.shared_down.clone(), exec)?;
+-                let shared_gate = linear(scratch, &n, layer.shared_router.clone(), exec)?;
++                let shared_out = linear(scratch, &*shared_act, layer.shared_down.clone(), exec)?;
++                let shared_gate = linear(scratch, &*n, layer.shared_router.clone(), exec)?;
+                 (shared_out, shared_gate)
+             };
+             let mut merged = scratch.activation(&[rows, h], exec)?;
+@@ -1017,25 +1018,25 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+                 let _range = ScopedRange::new(c"qwen3_5.moe.merge");
+                 kernels::moe_merge(
+                     (&mut merged).partition([1, POINTWISE_COLUMNS]),
+-                    &routed,
+-                    &scores,
+-                    &shared_out,
+-                    &shared_gate,
++                    &*routed,
++                    &*scores,
++                    &*shared_out,
++                    &*shared_gate,
+                 )
+                 .generics(vec![T::DTYPE.to_string(), top.to_string()])
+                 .execute(exec)?;
+             }
+-            add(&mut x, &residual, &merged, exec)?;
++            add(&mut x, &*residual, &*merged, exec)?;
+         }
+         let _head = ScopedRange::new(c"qwen3_5.head");
+         scratch.head();
+         let mut last = scratch.activation(&[1, h], exec)?;
+ 
+-        kernels::last_row((&mut last).partition([1, POINTWISE_COLUMNS]), &x)
++        kernels::last_row((&mut last).partition([1, POINTWISE_COLUMNS]), &*x)
+             .generics(vec![T::DTYPE.to_string()])
+             .execute(exec)?;
+-        let n = normalize(scratch, &last, self.norm.clone(), c.rms_norm_eps, exec)?;
+-        let logits = linear_f32(scratch, &n, self.lm_head.clone(), exec)?;
++        let n = normalize(scratch, &*last, self.norm.clone(), c.rms_norm_eps, exec)?;
++        let logits = linear_f32(scratch, &*n, self.lm_head.clone(), exec)?;
+         let blocks = c.vocab_size.div_ceil(shared::ARGMAX_TILE);
+         let mut maxima = scratch.float(&[1, blocks], exec)?;
+         let mut indices = scratch.integer(&[1, blocks], exec)?;
+@@ -1045,7 +1046,7 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+             shared::argmax_blocks(
+                 (&mut maxima).partition([1, 1]),
+                 (&mut indices).partition([1, 1]),
+-                &logits,
++                &*logits,
+                 c.vocab_size as i32,
+             )
+             .generics(vec![shared::ARGMAX_TILE.to_string()])
+@@ -1055,14 +1056,14 @@ impl<T: WeightElement + ElementType> Qwen3_5Engine<T> {
+             let _range = ScopedRange::new(c"qwen3_5.argmax.final");
+             shared::argmax_final(
+                 (&mut token).partition([1]),
+-                &maxima,
+-                &indices,
++                &*maxima,
++                &*indices,
+                 blocks as i32,
+             )
+             .generics(vec![shared::ARGMAX_FINAL_TILE.to_string()])
+             .execute(exec)?;
+         }
+-        Ok((logits, token))
++        Ok((logits.escape(), token.escape()))
+     }
+ 
+     unsafe fn enqueue_readback(
+@@ -1085,7 +1086,7 @@ unsafe fn normalize<T: DType + DeviceCopy>(
+     w: Norm,
+     eps: f32,
+     exec: &ExecutionContext,
+-) -> Result<Tensor<T>> {
++) -> Result<ScratchTensor<T, T>> {
+     let _range = ScopedRange::new(c"qwen3_5.rms_norm");
+     let rows = x.shape()[0] as usize;
+     let d = x.shape()[1] as usize;
+@@ -1100,7 +1101,7 @@ unsafe fn linear<T: DType + DeviceCopy>(
+     x: &Tensor<T>,
+     w: Weight<T>,
+     exec: &ExecutionContext,
+-) -> Result<Tensor<T>> {
++) -> Result<ScratchTensor<T, T>> {
+     let out = scratch.activation(&[x.shape()[0] as usize, w.shape()[0] as usize], exec)?;
+     let bias = scratch.activation(&[1], exec)?;
+     project(out, x, w, &bias, exec)
+@@ -1110,18 +1111,18 @@ unsafe fn linear_f32<T: DType + DeviceCopy>(
+     x: &Tensor<T>,
+     w: Weight<T>,
+     exec: &ExecutionContext,
+-) -> Result<Tensor<f32>> {
++) -> Result<ScratchTensor<T, f32>> {
+     let out = scratch.float(&[x.shape()[0] as usize, w.shape()[0] as usize], exec)?;
+     let bias = scratch.activation(&[1], exec)?;
+     project(out, x, w, &bias, exec)
+ }
+ unsafe fn project<T: DType, O: DType>(
+-    mut out: Tensor<O>,
++    mut out: ScratchTensor<T, O>,
+     x: &Tensor<T>,
+     w: Weight<T>,
+     bias: &Tensor<T>,
+     exec: &ExecutionContext,
+-) -> Result<Tensor<O>> {
++) -> Result<ScratchTensor<T, O>> {
+     let _range = ScopedRange::new(c"qwen3_5.linear");
+     shared::linear(
+         (&mut out).partition([LINEAR_TILE_ROWS, LINEAR_TILE_COLUMNS]),
+diff --git a/rust/engine/src/runner/model/qwen3_5/workspace.rs b/rust/engine/src/runner/model/qwen3_5/workspace.rs
+index 9647212..689ba5e 100644
+--- a/rust/engine/src/runner/model/qwen3_5/workspace.rs
++++ b/rust/engine/src/runner/model/qwen3_5/workspace.rs
+@@ -8,7 +8,7 @@ use cuda_async::{
+ use cutile::{
+     api,
+     cuda_core::{Context, DType, DeviceCopy},
+-    tensor::Tensor,
++    tensor::{Reshape, Tensor},
+ };
+ 
+ const MAX_IDLE: usize = 2;
+@@ -24,9 +24,9 @@ pub struct WorkspaceMetrics {
+ }
+ 
+ struct Bank<T: DType> {
+-    activations: Vec<Arc<Tensor<T>>>,
+-    floats: Vec<Arc<Tensor<f32>>>,
+-    integers: Vec<Arc<Tensor<i32>>>,
++    activations: Vec<Arc<Slot<T>>>,
++    floats: Vec<Arc<Slot<f32>>>,
++    integers: Vec<Arc<Slot<i32>>>,
+ }
+ 
+ struct Workspace<T: DType> {
+@@ -148,21 +148,21 @@ impl<T: DType + DeviceCopy> Scratch<T> {
+         &mut self,
+         shape: &[usize],
+         exec: &ExecutionContext,
+-    ) -> Result<Tensor<T>> {
++    ) -> Result<ScratchTensor<T, T>> {
+         self.get(shape, exec, 0, |bank| &mut bank.activations)
+     }
+     pub(super) unsafe fn float(
+         &mut self,
+         shape: &[usize],
+         exec: &ExecutionContext,
+-    ) -> Result<Tensor<f32>> {
++    ) -> Result<ScratchTensor<T, f32>> {
+         self.get(shape, exec, 1, |bank| &mut bank.floats)
+     }
+     pub(super) unsafe fn integer(
+         &mut self,
+         shape: &[usize],
+         exec: &ExecutionContext,
+-    ) -> Result<Tensor<i32>> {
++    ) -> Result<ScratchTensor<T, i32>> {
+         self.get(shape, exec, 2, |bank| &mut bank.integers)
+     }
+ 
+@@ -171,8 +171,8 @@ impl<T: DType + DeviceCopy> Scratch<T> {
+         shape: &[usize],
+         exec: &ExecutionContext,
+         kind: usize,
+-        select: impl FnOnce(&mut Bank<T>) -> &mut Vec<Arc<Tensor<O>>>,
+-    ) -> Result<Tensor<O>> {
++        select: impl FnOnce(&mut Bank<T>) -> &mut Vec<Arc<Slot<O>>>,
++    ) -> Result<ScratchTensor<T, O>> {
+         let index = self.cursors[kind];
+         self.cursors[kind] += 1;
+         let tensor = {
+@@ -183,22 +183,18 @@ impl<T: DType + DeviceCopy> Scratch<T> {
+                 let _range = crate::profiling::ScopedRange::new(c"qwen3_5.workspace.allocate");
+                 // Initialize on a miss; later producers overwrite scratch. Scalar
+                 // bias slots are read-only and retain their initial zero.
+-                let tensor = Arc::new(api::zeros::<O>(shape).execute(exec)?);
++                let tensor = api::zeros::<O>(shape).execute(exec)?;
+                 let bytes = tensor.num_bytes();
+-                buffers.push(tensor);
++                buffers.push(Arc::new(Slot {
++                    shape: shape.to_vec(),
++                    tensor: Mutex::new(Some(tensor)),
++                }));
+                 bytes
+             } else {
+                 0
+             };
+             let tensor = buffers[index].clone();
+-            ensure!(
+-                tensor
+-                    .shape()
+-                    .iter()
+-                    .map(|&n| n as usize)
+-                    .eq(shape.iter().copied()),
+-                "scratch layout changed"
+-            );
++            ensure!(tensor.shape == shape, "scratch layout changed");
+             workspace.bytes += added;
+             if added != 0 {
+                 let mut state = self.lease.pool.state.lock().unwrap();
+@@ -207,36 +203,95 @@ impl<T: DType + DeviceCopy> Scratch<T> {
+             }
+             tensor
+         };
+-        // SAFETY: each slot is disjoint within a layer. Reusing a bank between
+-        // layers is ordered on this submission's stream. Owners retain the
+-        // exclusive checkout, backing memory and actual context until completion.
+-        Ok(Tensor::from_foreign(
+-            Arc::new(Owner {
+-                tensor: tensor.clone(),
+-                _lease: self.lease.clone(),
+-            }),
+-            tensor.shape().to_vec(),
+-            tensor.strides().to_vec(),
+-        ))
++        let value = tensor
++            .tensor
++            .lock()
++            .unwrap()
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("scratch slot is still borrowed"))?;
++        Ok(ScratchTensor {
++            tensor: Some(value),
++            slot: tensor,
++            _lease: self.lease.clone(),
++        })
++    }
++
++    pub(super) fn retain(&self, exec: &ExecutionContext) -> Result<()> {
++        exec.retain(self.lease.clone())?;
++        Ok(())
+     }
+ }
+ 
+-struct Owner<T: DType, O: DType> {
+-    tensor: Arc<Tensor<O>>,
++struct Slot<O: DType> {
++    shape: Vec<usize>,
++    tensor: Mutex<Option<Tensor<O>>>,
++}
++
++/// Moves the sole user-visible tensor owner out of a slot until its last CPU use.
++/// Graph descriptors retain its storage without creating another mutable alias.
++pub(super) struct ScratchTensor<T: DType, O: DType> {
++    tensor: Option<Tensor<O>>,
++    slot: Arc<Slot<O>>,
+     _lease: Arc<Lease<T>>,
+ }
+ 
+-// SAFETY: the backing tensor keeps its pointer, extent and context stable;
+-// the lease prevents reuse by another submission while any view survives.
+-unsafe impl<T: DType, O: DType> DeviceAllocation for Owner<T, O> {
++impl<T: DType, O: DType> std::ops::Deref for ScratchTensor<T, O> {
++    type Target = Tensor<O>;
++    fn deref(&self) -> &Self::Target {
++        self.tensor.as_ref().unwrap()
++    }
++}
++impl<T: DType, O: DType> std::ops::DerefMut for ScratchTensor<T, O> {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        self.tensor.as_mut().unwrap()
++    }
++}
++impl<T: DType, O: DType> ScratchTensor<T, O> {
++    pub(super) fn reshape(mut self, shape: &[usize]) -> Result<Self> {
++        // Validate before taking so an invalid reshape still returns its slot.
++        ensure!(
++            shape.iter().product::<usize>() == self.size(),
++            "scratch reshape size mismatch"
++        );
++        self.tensor = Some(self.tensor.take().unwrap().reshape(shape)?);
++        Ok(self)
++    }
++
++    pub(super) unsafe fn escape(self) -> Tensor<O> {
++        let shape = self.shape().to_vec();
++        let strides = self.strides().to_vec();
++        // SAFETY: this owner holds both the unique slot and workspace checkout.
++        // It returns the original tensor only after every escaped view has gone.
++        Tensor::from_foreign(Arc::new(self), shape, strides)
++    }
++}
++impl<T: DType, O: DType> Drop for ScratchTensor<T, O> {
++    fn drop(&mut self) {
++        if let Some(tensor) = self.tensor.take() {
++            let tensor = if tensor.shape().iter().map(|&n| n as usize).eq(self
++                .slot
++                .shape
++                .iter()
++                .copied())
++            {
++                tensor
++            } else {
++                tensor.reshape(&self.slot.shape).unwrap()
++            };
++            *self.slot.tensor.lock().unwrap() = Some(tensor);
++        }
++    }
++}
++// SAFETY: the unique tensor and checkout own a stable allocation and context.
++unsafe impl<T: DType, O: DType> DeviceAllocation for ScratchTensor<T, O> {
+     fn device_ptr(&self) -> u64 {
+-        self.tensor.device_pointer().cu_deviceptr()
++        self.device_pointer().cu_deviceptr()
+     }
+     fn len_bytes(&self) -> usize {
+-        self.tensor.num_bytes()
++        self.num_bytes()
+     }
+     fn context(&self) -> Arc<Context> {
+-        self.tensor.context().clone()
++        Tensor::context(self).clone()
+     }
+ }
+ 
+@@ -289,11 +344,12 @@ mod tests {
+                         hidden.device_pointer().cu_deviceptr()
+                     );
+                     scratch.reset();
++                    assert!(scratch.activation(&[8], exec).is_err());
++                    let hidden_ptr = hidden.device_pointer().cu_deviceptr();
++                    drop((hidden, residual));
++                    scratch.reset();
+                     let reused_hidden = scratch.activation(&[8], exec)?;
+-                    assert_eq!(
+-                        reused_hidden.device_pointer().cu_deviceptr(),
+-                        hidden.device_pointer().cu_deviceptr()
+-                    );
++                    assert_eq!(reused_hidden.device_pointer().cu_deviceptr(), hidden_ptr);
+                     Ok(())
+                 })()
+             })
+@@ -318,7 +374,11 @@ mod tests {
+             value(unsafe {
+                 (|| -> Result<Vec<Tensor<f32>>> {
+                     (0..2)
+-                        .map(|_| pool.acquire(1, exec)?.activation(&[8], exec))
++                        .map(|_| {
++                            pool.acquire(1, exec)?
++                                .activation(&[8], exec)
++                                .map(|t| t.escape())
++                        })
+                         .collect()
+                 })()
+             })
+@@ -335,8 +395,13 @@ mod tests {
+         let first_expired = first_gate.expired.clone();
+         let retained = pool.clone();
+         let first = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
+-            unsafe { retained.acquire(1, exec)?.activation(&[8], exec) }
+-                .map_err(|e| ModelError::Execution(e.to_string()))
++            unsafe {
++                retained
++                    .acquire(1, exec)?
++                    .activation(&[8], exec)
++                    .map(|t| t.escape())
++            }
++            .map_err(|e| ModelError::Execution(e.to_string()))
+         })
+         .await?;
+         let first_tensor = first.output?;
+@@ -346,8 +411,13 @@ mod tests {
+         let second_expired = second_gate.expired.clone();
+         let retained = pool.clone();
+         let second = SubmittedGpuWorkWithCompletion::submit(&policy, move |exec| {
+-            unsafe { retained.acquire(1, exec)?.activation(&[8], exec) }
+-                .map_err(|e| ModelError::Execution(e.to_string()))
++            unsafe {
++                retained
++                    .acquire(1, exec)?
++                    .activation(&[8], exec)
++                    .map(|t| t.escape())
++            }
++            .map_err(|e| ModelError::Execution(e.to_string()))
+         })
+         .await?;
+         let second_tensor = second.output?;
